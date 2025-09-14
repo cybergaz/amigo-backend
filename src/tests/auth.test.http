@@ -10,12 +10,47 @@ POST http://localhost:5000/api/auth/verify-signup-otp HTTP/1.1
 Content-Type: application/json
 
 {
-  "name": "Test User",
+  "name": "Erfan Aalam",
+  "otp": 123456,
+  "phone": "+91 8930647364",
+  "role": "user"
+}
+
+### 
+
+POST http://localhost:5000/api/auth/verify-signup-otp HTTP/1.1
+Content-Type: application/json
+
+{
+  "name": "random user 2",
+  "otp": 123456,
+  "phone": "1234567890",
+  "role": "user"
+}
+
+### 
+
+POST http://localhost:5000/api/auth/verify-signup-otp HTTP/1.1
+Content-Type: application/json
+
+{
+  "name": "Krishna",
+  "otp": 123456,
+  "phone": "8534946840",
+  "role": "user"
+}
+
+### 
+
+POST http://localhost:5000/api/auth/verify-signup-otp HTTP/1.1
+Content-Type: application/json
+
+{
+  "name": "random user",
   "otp": 123456,
   "phone": "9999999999",
   "role": "user"
 }
-
 
 ### 
 
@@ -30,5 +65,70 @@ Content-Type: application/json
 
 {
   "otp": 123456,
+  "phone": "+91 8930647364"
+}
+
+### 
+
+POST http://localhost:5000/api/auth/verify-login-otp HTTP/1.1
+Content-Type: application/json
+
+{
+  "otp": 123456,
+  "phone": "8534946840"
+}
+
+
+### 
+
+POST http://localhost:5000/api/auth/verify-login-otp HTTP/1.1
+Content-Type: application/json
+
+{
+  "otp": 123456,
   "phone": "9999999999"
 }
+
+
+
+### 
+
+POST http://localhost:5000/api/auth/verify-login-otp HTTP/1.1
+Content-Type: application/json
+
+{
+  "otp": 123456,
+  "phone": "1234567890"
+}
+
+
+###
+
+POST http://localhost:5000/api/chat/create-chat/6846756674 HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ODMxOTA1NjYzNywicm9sZSI6InVzZXIiLCJpYXQiOjE3NTc4ODM5NDMsImV4cCI6MTc1Nzk3MDM0M30.dDO7Jjah20G2uJzcDZdhxI1E5kYUKETeO-0QME3Bq1s
+
+###
+
+POST http://localhost:5000/api/chat/create-chat/8319056637 HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Njg0Njc1NjY3NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTc4ODQwMzksImV4cCI6MTc1Nzk3MDQzOX0._Qm87XS-YAUjVPiQnQ3yHR5ZZHw5hlnYIrGXogePenw
+
+###
+
+POST http://localhost:5000/api/chat/create-chat/7439393064 HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Nzc0MDAxNDg3MCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTc4ODYzNTUsImV4cCI6MTc1Nzk3Mjc1NX0.7Q0Wh4c5FSe6Kgr3j0P_AOJfqEi72yVW0K2VQF5-Lho
+
+
+###
+
+POST http://localhost:5000/api/chat/create-chat/7740014870 HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6NzQzOTM5MzA2NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTc4ODY1NzMsImV4cCI6MTc1Nzk3Mjk3M30.vx4pBcEPPK2DB55JaSj3Nd0loW7jKqZP7CFO1-_diTE
+
+###
+
+GET  http://localhost:5000/api/chat/get-chat-list HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6NzQzOTM5MzA2NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTc4ODY1NzMsImV4cCI6MTc1Nzk3Mjk3M30.vx4pBcEPPK2DB55JaSj3Nd0loW7jKqZP7CFO1-_diTE
