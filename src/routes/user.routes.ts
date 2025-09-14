@@ -1,15 +1,28 @@
 import { Elysia, t } from "elysia";
 import { get_user_details, update_user_details } from "@/services/user.services";
 import { get_all_users } from "@/services/user.services";
+import { app_middleware } from "@/middleware";
 
 const user_routes = new Elysia({ prefix: "/user" })
   .state({ id: 0, role: "" })
+  .guard({
+    beforeHandle({ cookie, set, store, headers }) {
+      const state_result = app_middleware({ cookie, headers });
+
+      set.status = state_result.code;
+      if (!state_result.data) return state_result
+
+      store.id = state_result.data.id;
+      store.role = state_result.data.role;
+    }
+  })
+
   .get("/get-user", async ({ set, store }) => {
     const user_Details = await get_user_details(969408548814);
     set.status = user_Details.code;
     return user_Details;
   })
-  
+
   .post(
     "/update-user",
     async ({ set, store, body }) => {
@@ -28,15 +41,15 @@ const user_routes = new Elysia({ prefix: "/user" })
   )
 
   .get("/all-users", async ({ set }) => {
-    try{
-        const users = await get_all_users();
-        set.status = users.code
-        return users;
-    }catch(error){
-        set.status = 500
-        return {
-            success: false,
-        }
+    try {
+      const users = await get_all_users();
+      set.status = users.code
+      return users;
+    } catch (error) {
+      set.status = 500
+      return {
+        success: false,
+      }
     }
   })
 
