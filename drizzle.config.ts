@@ -5,7 +5,7 @@ export default defineConfig({
   dialect: "postgresql",
   schema: "./src/models/**/*.ts",
   dbCredentials: {
-    url: process.env.DB_URL!, // put your Neon DB string in .env
+    url: process.env.DB_URL!,
   },
 });
 
