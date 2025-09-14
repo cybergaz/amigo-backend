@@ -13,6 +13,7 @@
     "drizzle-orm": "^0.44.5",
     "elysia": "latest",
     "jsonwebtoken": "^9.0.2",
+    "nanoid": "^5.1.5",
     "postgres": "^3.4.7"
   },
   "devDependencies": {

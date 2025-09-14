@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import { customAlphabet } from "nanoid";
 
 function extractCountryCode(phone: string): string | null {
   // Remove spaces and non-digit/non-plus characters
@@ -17,7 +18,8 @@ function extractCountryCode(phone: string): string | null {
 }
 
 const create_unique_id = () => {
-  return Math.floor(Math.random() * 1e12);
+  const nanoid = customAlphabet("0123456789", 10);
+  return Number(nanoid());
 };
 
 const hash_password = async (password: string): Promise<string> => {
