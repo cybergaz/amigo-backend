@@ -3,7 +3,6 @@ import "dotenv/config";
 import cors from "@elysiajs/cors";
 import "@/config/db";
 import auth_routes from "./routes/auth.routes";
-import users_routes from "./routes/users.route";
 import user_routes from "./routes/user.routes";
 
 const SERVER_PORT = process.env.SERVER_PORT;
@@ -14,7 +13,6 @@ const app = new Elysia({ prefix: "/api" })
   .use(cors({ origin: "*", credentials: true, }))
   .use(auth_routes)
   .use(user_routes)
-  .use(users_routes)
   .listen(SERVER_PORT);
 
 console.log(
