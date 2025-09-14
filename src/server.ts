@@ -18,5 +18,5 @@ const app = new Elysia({ prefix: "/api" })
   .listen(SERVER_PORT);
 
 console.log(
-  `Elysia is running at ${app.server?.hostname}:${app.server?.port} carfully`
+  `Elysia is running at ${app.server?.hostname}:${app.server?.port}`
 );
