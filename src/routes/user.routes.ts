@@ -18,7 +18,7 @@ const user_routes = new Elysia({ prefix: "/user" })
   })
 
   .get("/get-user", async ({ set, store }) => {
-    const user_Details = await get_user_details(969408548814);
+    const user_Details = await get_user_details(store.id);
     set.status = user_Details.code;
     return user_Details;
   })
