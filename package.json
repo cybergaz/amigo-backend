@@ -12,6 +12,7 @@
     "dotenv": "^17.2.2",
     "drizzle-orm": "^0.44.5",
     "elysia": "latest",
+    "ioredis": "^5.7.0",
     "jsonwebtoken": "^9.0.2",
     "nanoid": "^5.1.5",
     "postgres": "^3.4.7"

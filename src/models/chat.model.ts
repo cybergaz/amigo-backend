@@ -11,6 +11,7 @@ export const conversation_model = pgTable("conversations", {
   metadata: jsonb(),
   last_message_at: timestamp(),
   created_at: timestamp().defaultNow().notNull(),
+  deleted: boolean().default(false).notNull(),
 });
 
 export const conversation_member_model = pgTable("conversation_members", {

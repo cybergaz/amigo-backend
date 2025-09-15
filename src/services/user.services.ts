@@ -118,6 +118,7 @@ export const find_user_by_phone = async (phone: string) => {
       data: existing_user,
     };
   } catch (error) {
+    console.log("error ->", error)
     return { success: false, code: 500, message: "ERROR : find_user_by_phone" };
   }
 };
