@@ -22,6 +22,20 @@
       "when": 1757870736386,
       "tag": "0002_lively_wonder_man",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1757880509202,
+      "tag": "0003_tranquil_black_panther",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1757882451836,
+      "tag": "0004_sparkling_the_fallen",
+      "breakpoints": true
     }
   ]
 }

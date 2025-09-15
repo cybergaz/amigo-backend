@@ -28,11 +28,10 @@ const hash_password = async (password: string): Promise<string> => {
   return hashed_password;
 };
 
-const generate_jwt = (id: number, role: string, is_profile_complete?: boolean) => {
+const generate_jwt = (id: number, role: string) => {
   return jwt.sign({
     id,
     role,
-    is_profile_complete: is_profile_complete || false
   },
     process.env.ACCESS_KEY || "heymama", {
     expiresIn: "1d",
@@ -45,4 +44,8 @@ const generate_refresh_jwt = (id: number, role: string) => {
   });
 };
 
-export { extractCountryCode, create_unique_id, hash_password, generate_jwt, generate_refresh_jwt };
+const compare_password = async (password: string, hashed_password: string) => {
+  return await bcrypt.compare(password, hashed_password);
+};
+
+export { extractCountryCode, create_unique_id, hash_password, generate_jwt, generate_refresh_jwt,compare_password };
