@@ -1,0 +1,135 @@
+### Get Supported File Types
+
+GET http://localhost:5000/api/media/supported-types HTTP/1.1
+Authorization: Bearer YOUR_ACCESS_TOKEN_HERE
+
+
+### Generic File Upload
+
+POST http://localhost:5000/api/media/upload HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Njg0Njc1NjY3NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTgxODEyOTIsImV4cCI6MTc1ODI2NzY5Mn0.4rTXl-uzdThXsy-a-Sm3sCn_rwSWpHAiDcz_-7fgf1I
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="example.pdf"
+Content-Type: application/pdf
+
+< /home/gaz/Downloads/certificate.pdf
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+
+### Image Upload
+
+POST http://localhost:5000/api/media/upload/image HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Njg0Njc1NjY3NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTgxODEyOTIsImV4cCI6MTc1ODI2NzY5Mn0.4rTXl-uzdThXsy-a-Sm3sCn_rwSWpHAiDcz_-7fgf1I
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="image.jpg"
+Content-Type: image/jpeg
+
+< /home/gaz/Downloads/2025-08-27\ 00-11-30.png
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+
+### Audio Upload
+
+POST http://localhost:5000/api/media/upload/audio HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+Authorization: Bearer YOUR_ACCESS_TOKEN_HERE
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="audio.mp3"
+Content-Type: audio/mpeg
+
+< ./path/to/your/audio.mp3
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+
+### Video Upload
+
+POST http://localhost:5000/api/media/upload/video HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+Authorization: Bearer YOUR_ACCESS_TOKEN_HERE
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="video.mp4"
+Content-Type: video/mp4
+
+< ./path/to/your/video.mp4
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+
+### Document Upload
+
+POST http://localhost:5000/api/media/upload/document HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+Authorization: Bearer YOUR_ACCESS_TOKEN_HERE
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="document.pdf"
+Content-Type: application/pdf
+
+< ./path/to/your/document.pdf
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+
+### Delete File
+
+DELETE http://localhost:5000/api/media/delete HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer YOUR_ACCESS_TOKEN_HERE
+
+{
+  "key": "images/123/1234567890_filename.jpg"
+}
+
+
+### Test Error Cases
+
+
+### Upload without authentication
+
+POST http://localhost:5000/api/media/upload/image HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="image.jpg"
+Content-Type: image/jpeg
+
+< ./path/to/your/image.jpg
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+
+### Upload invalid file type to image endpoint
+
+POST http://localhost:5000/api/media/upload/image HTTP/1.1
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+Authorization: Bearer YOUR_ACCESS_TOKEN_HERE
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="file"; filename="document.pdf"
+Content-Type: application/pdf
+
+< ./path/to/your/document.pdf
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+
+### Upload without file
+
+POST http://localhost:5000/api/media/upload/image HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer YOUR_ACCESS_TOKEN_HERE
+
+{}
+
+
+### Try to delete unauthorized file
+
+DELETE http://localhost:5000/api/media/delete HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer YOUR_ACCESS_TOKEN_HERE
+
+{
+  "key": "images/999/1234567890_filename.jpg"
+}

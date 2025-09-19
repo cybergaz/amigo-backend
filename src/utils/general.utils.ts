@@ -1,24 +1,15 @@
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { customAlphabet } from "nanoid";
-
-function extractCountryCode(phone: string): string | null {
-  // Remove spaces and non-digit/non-plus characters
-  const normalized = phone.replace(/[^\d+]/g, "");
-
-  // If number starts with +
-  if (normalized.startsWith("+")) {
-    const match = normalized.match(/^\+(\d{1,3})/); // capture 1–3 digit country code
-    return match ? match[1] : null;
-  }
-
-  // If no +, assume default country code (e.g. "91" for India)
-  // You can change "91" to your preferred default
-  return "91";
-}
+import { parsePhoneNumberFromString } from "libphonenumber-js";
 
 const create_unique_id = () => {
   const nanoid = customAlphabet("0123456789", 10);
+  return Number(nanoid());
+};
+
+const create_otp = () => {
+  const nanoid = customAlphabet("0123456789", 6);
   return Number(nanoid());
 };
 
@@ -27,6 +18,7 @@ const hash_password = async (password: string): Promise<string> => {
   const hashed_password = await bcrypt.hash(password, SALT);
   return hashed_password;
 };
+
 
 const generate_jwt = (id: number, role: string) => {
   return jwt.sign({
@@ -48,4 +40,26 @@ const compare_password = async (password: string, hashed_password: string) => {
   return await bcrypt.compare(password, hashed_password);
 };
 
-export { extractCountryCode, create_unique_id, hash_password, generate_jwt, generate_refresh_jwt,compare_password };
+
+function parse_phone(input: string) {
+  const phone = parsePhoneNumberFromString(input);
+
+  if (!phone) return {
+    code: "",
+    phone: input,
+    concatinated: input.replace(" ", ""),
+  };
+
+  return {
+    code: phone.countryCallingCode, // e.g. "91"
+    phone: phone.nationalNumber,     // e.g. "7777777777"
+    concatinated: `+${phone.countryCallingCode || ""}${phone.nationalNumber}`.replace(" ", "") // e.g. "+917777777777"
+  };
+}
+
+const create_dm_key = (user1: number, user2: number) => {
+  return [user1, user2].sort().join("_");
+}
+
+
+export { parse_phone, create_unique_id, create_otp, hash_password, generate_jwt, generate_refresh_jwt, compare_password, create_dm_key };

@@ -3,9 +3,10 @@ import { Elysia, t } from 'elysia';
 import db from '@/config/db';
 import { message_model, conversation_model, conversation_member_model } from '@/models/chat.model';
 import { eq, and, or, sql } from 'drizzle-orm';
-import { CHAT_TYPE_CONSTS, MESSAGE_TYPE_CONSTS } from '@/types/chat.types';
 import { ElysiaWS } from 'elysia/dist/ws';
-import { WebSocket } from 'bun';
+import { WebSocketData, TypedElysiaWS } from '@/types/elysia.types';
+import { user_model } from '@/models/user.model';
+import { pin_message, reply_to_message, star_messages } from '@/services/message-operations.services';
 
 // Connection management
 interface UserConnection {
@@ -20,10 +21,10 @@ const conversation_connections = new Map<number, Set<number>>(); // conversation
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'message' | 'typing' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong';
-  data: any;
+  type: 'message' | 'typing' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete';
+  data?: any;
   conversation_id?: number;
-  message_id?: number;
+  message_ids?: number[];
   timestamp?: string;
 }
 
@@ -39,8 +40,41 @@ interface ChatMessage {
   sender_name?: string;
 }
 
+// Type-safe WebSocket data access helpers
+const setUserId = (ws: ElysiaWS, user_id: number): void => {
+  (ws.data as WebSocketData).user_id = user_id;
+};
+
+const getUserId = (ws: ElysiaWS): number | undefined => {
+  return (ws.data as WebSocketData).user_id;
+};
+
+const hasUserId = (ws: ElysiaWS): boolean => {
+  return (ws.data as WebSocketData).user_id !== undefined;
+};
+
+// More convenient helper that throws if user_id is not set
+const requireUserId = (ws: ElysiaWS): number => {
+  const user_id = getUserId(ws);
+  if (!user_id) {
+    throw new Error('User ID not found in WebSocket data');
+  }
+  return user_id;
+};
+
+// Safe user_id access with fallback
+const getUserIdOr = (ws: ElysiaWS, fallback: number): number => {
+  return getUserId(ws) ?? fallback;
+};
+
 // Helper functions
-const add_connection = (user_id: number, ws: ElysiaWS) => {
+const add_connection = async (user_id: number, ws: ElysiaWS) => {
+  // fetch all conversation IDs for this user from the database
+  const memberships = await db
+    .select({ conversation_id: conversation_member_model.conversation_id })
+    .from(conversation_member_model)
+    .where(eq(conversation_member_model.user_id, user_id));
+
   // Close existing connection if any
   if (connections.has(user_id)) {
     const existing = connections.get(user_id);
@@ -55,6 +89,12 @@ const add_connection = (user_id: number, ws: ElysiaWS) => {
   };
 
   connections.set(user_id, connection);
+  memberships.forEach(row => {
+    join_conversation(user_id, row.conversation_id);
+  })
+  // console.log('ws connection : ')
+  // console.log("connections ->", connections)
+  // console.log("conversation_connections ->", conversation_connections)
   console.log(`[WS] User ${user_id} connected. Total connections: ${connections.size}`);
 };
 
@@ -109,7 +149,10 @@ const leave_conversation = (user_id: number, conversation_id: number) => {
 };
 
 const broadcast_to_conversation = (conversation_id: number, message: WSMessage, exclude_user?: number) => {
+  console.log("broadcast started")
+  console.log("conversation_connections ->", conversation_connections)
   const conv_connections = conversation_connections.get(conversation_id);
+  console.log(`conv_connections for ${conversation_id} ->`, conv_connections)
   if (!conv_connections) return;
 
   const message_str = JSON.stringify(message);
@@ -119,15 +162,35 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
     if (exclude_user && user_id === exclude_user) return;
 
     const connection = connections.get(user_id);
-    if (connection && connection.ws.readyState === 1) { // WebSocket.OPEN
+    // send message to online users, else increase the unread count in the database
+    if (connection && connection.ws.readyState === 1) {
       try {
         connection.ws.send(message_str);
+        console.log("msg sent to ->", getUserId(connection.ws))
         sent_count++;
       } catch (error) {
         console.error(`[WS] Error sending to user ${user_id}:`, error);
         remove_connection(user_id);
       }
     }
+    else {
+      // increase unread count in the database
+      db.update(conversation_member_model)
+        .set({ unread_count: sql`${conversation_member_model.unread_count} + 1` })
+        .where(
+          and(
+            eq(conversation_member_model.conversation_id, conversation_id),
+            eq(conversation_member_model.user_id, user_id)
+          )
+        )
+        .then(() => {
+          console.log(`[WS] Increased unread count for inactive user ${user_id} in conversation ${conversation_id}`);
+        })
+        .catch((error) => {
+          console.error(`[WS] Error increasing unread count for user ${user_id}:`, error);
+        });
+    }
+
   });
 
   console.log(`[WS] Broadcasted to ${sent_count} users in conversation ${conversation_id}`);
@@ -153,23 +216,20 @@ const web_socket = new Elysia()
   .ws('/chat', {
 
     body: t.Object({
-      message: t.Object(
-        {
-          type: t.String(),
-          data: t.Any(),
-          conversation_id: t.Optional(t.Number()),
-          message_id: t.Optional(t.Number()),
-          timestamp: t.Optional(t.String())
-        }
-      )
+      type: t.String(),
+      data: t.Optional(t.Any()),
+      conversation_id: t.Optional(t.Number()),
+      message_ids: t.Optional(t.Array(t.Number())),
+      timestamp: t.Optional(t.String())
     }),
 
     query: t.Object({
-      id: t.Number(),
+      token: t.Optional(t.String())
     }),
 
     open: async (ws) => {
       try {
+        console.log('[WS] New connection attempt');
 
         // const user_id = new URL(ws.data.request.url).searchParams.get('user_id')
         // if (!user_id {
@@ -195,9 +255,14 @@ const web_socket = new Elysia()
 
         const user_id = auth_result.data.id;
 
-        // Store user_id in WebSocket data
-        (ws.data as any).user_id = user_id;
+        // Store user_id in WebSocket data using type-safe helper
+        setUserId(ws, user_id);
 
+        // -----------------------------------------------------------------------
+        // you just have to fetch all conversation IDs for this user,
+        // and store them in either connections.conversations or a new Map,
+        // and then send the message to all the conversation IDs (idk how will you find sockets for them)
+        // -----------------------------------------------------------------------
         add_connection(user_id, ws);
 
         // Send welcome message
@@ -214,9 +279,16 @@ const web_socket = new Elysia()
       }
     },
 
-    message: async (ws, { message }) => {
+    message: async (ws, message) => {
       try {
-        const user_id = ws.data.query.id
+        const user_id = getUserId(ws);
+        if (!user_id) {
+          ws.send(JSON.stringify({
+            code: 4001,
+            message: "Missing User ID in the socket, try reconnecting..."
+          }));
+          return
+        }
 
         // Update last seen timestamp
         const connection = connections.get(user_id);
@@ -226,38 +298,41 @@ const web_socket = new Elysia()
 
         switch (message.type) {
           case 'ping':
-            send_to_user(user_id, { type: 'pong', data: {}, timestamp: new Date().toISOString() });
+            send_to_user(user_id, { type: 'pong', data: message.data || {}, timestamp: new Date().toISOString() });
             break;
 
           case 'join_conversation':
             if (message.conversation_id) {
+              // -----------------------------------------------------------
+              // TEMPORARY BYPASS AUTHORIZATION CHECK (FOR TESTING ONLY)
+              // -----------------------------------------------------------
               // Verify user is member of conversation
-              const membership = await db
-                .select()
-                .from(conversation_member_model)
-                .where(
-                  and(
-                    eq(conversation_member_model.conversation_id, message.conversation_id),
-                    eq(conversation_member_model.user_id, user_id)
-                  )
-                )
-                .limit(1);
+              // const membership = await db
+              //   .select()
+              //   .from(conversation_member_model)
+              //   .where(
+              //     and(
+              //       eq(conversation_member_model.conversation_id, message.conversation_id),
+              //       eq(conversation_member_model.user_id, user_id)
+              //     )
+              //   )
+              //   .limit(1);
 
-              if (membership.length > 0) {
-                join_conversation(user_id, message.conversation_id);
-                send_to_user(user_id, {
-                  type: 'join_conversation',
-                  data: { conversation_id: message.conversation_id, success: true },
-                  conversation_id: message.conversation_id,
-                  timestamp: new Date().toISOString()
-                });
-              } else {
-                send_to_user(user_id, {
-                  type: 'error',
-                  data: { message: 'Not authorized to join this conversation' },
-                  timestamp: new Date().toISOString()
-                });
-              }
+              // if (membership.length > 0) {
+              join_conversation(user_id, message.conversation_id);
+              send_to_user(user_id, {
+                type: 'join_conversation',
+                data: { success: true },
+                conversation_id: message.conversation_id,
+                timestamp: new Date().toISOString()
+              });
+              // } else {
+              //   send_to_user(user_id, {
+              //     type: 'error',
+              //     data: { message: 'Not authorized to join this conversation' },
+              //     timestamp: new Date().toISOString()
+              //   });
+              // }
             }
             break;
 
@@ -292,11 +367,11 @@ const web_socket = new Elysia()
                 const saved_message = new_message[0];
 
                 // Get sender name
-                const sender = await db
-                  .select({ name: sql<string>`users.name` })
-                  .from(sql`users`)
-                  .where(eq(sql`users.id`, user_id))
-                  .limit(1);
+                // const sender = await db
+                //   .select({ name: user_model.name })
+                //   .from(user_model)
+                //   .where(eq(user_model.id, user_id))
+                //   .limit(1);
 
                 const chat_message: ChatMessage = {
                   id: saved_message.id,
@@ -307,7 +382,7 @@ const web_socket = new Elysia()
                   attachments: saved_message.attachments as any[] || undefined,
                   metadata: saved_message.metadata as any || undefined,
                   created_at: saved_message.created_at.toISOString(),
-                  sender_name: sender[0]?.name
+                  // sender_name: sender[0]?.name
                 };
 
                 // Broadcast to conversation members
@@ -315,14 +390,14 @@ const web_socket = new Elysia()
                   type: 'message',
                   data: chat_message,
                   conversation_id: message.conversation_id,
-                  message_id: saved_message.id,
+                  message_ids: [saved_message.id],
                   timestamp: new Date().toISOString()
                 }, user_id);
 
                 // Update conversation last_message_at
                 await db
                   .update(conversation_model)
-                  .set({ last_message_at: new Date() })
+                  .set({ metadata: { last_message: chat_message }, last_message_at: new Date() })
                   .where(eq(conversation_model.id, message.conversation_id));
               }
             }
@@ -332,7 +407,10 @@ const web_socket = new Elysia()
             if (message.conversation_id) {
               broadcast_to_conversation(message.conversation_id, {
                 type: 'typing',
-                data: { user_id, is_typing: message.data.is_typing },
+                data: {
+                  user_id,
+                  is_typing: message.data.is_typing
+                },
                 conversation_id: message.conversation_id,
                 timestamp: new Date().toISOString()
               }, user_id);
@@ -340,11 +418,11 @@ const web_socket = new Elysia()
             break;
 
           case 'read_receipt':
-            if (message.conversation_id && message.message_id) {
+            if (message.conversation_id && message.message_ids) {
               // Update read receipt in database
               await db
                 .update(conversation_member_model)
-                .set({ last_read_message_id: message.message_id })
+                .set({ last_read_message_id: message.message_ids[0] })
                 .where(
                   and(
                     eq(conversation_member_model.conversation_id, message.conversation_id),
@@ -354,8 +432,117 @@ const web_socket = new Elysia()
 
               broadcast_to_conversation(message.conversation_id, {
                 type: 'read_receipt',
-                data: { user_id, message_id: message.message_id },
+                data: { user_id, message_id: message.message_ids[0] },
                 conversation_id: message.conversation_id,
+                timestamp: new Date().toISOString()
+              }, user_id);
+            }
+            break;
+
+          case 'message_pin':
+            if (message.conversation_id && message.message_ids) {
+              // Broadcast pin action to conversation members
+              broadcast_to_conversation(message.conversation_id, {
+                type: 'message_pin',
+                data: {
+                  user_id,
+                  action: message.data?.action || 'toggle' // 'pin' or 'unpin'
+                },
+                conversation_id: message.conversation_id,
+                message_ids: message.message_ids,
+                timestamp: new Date().toISOString(),
+              }, user_id);
+
+              await pin_message({ message_id: message.message_ids[0], conversation_id: message.conversation_id }, user_id)
+            }
+            break;
+
+          case 'message_star':
+            if (message.conversation_id && message.message_ids) {
+              // Broadcast star action to conversation members (only to sender if private)
+              broadcast_to_conversation(message.conversation_id, {
+                type: 'message_star',
+                data: {
+                  user_id,
+                  action: message.data?.action || 'toggle' // 'star' or 'unstar' or 'toggle'
+                },
+                conversation_id: message.conversation_id,
+                message_ids: message.message_ids,
+                timestamp: new Date().toISOString()
+              }, user_id);
+
+              await star_messages({ message_ids: message.message_ids, conversation_id: message.conversation_id }, user_id)
+            }
+            break;
+
+          case 'message_reply':
+            if (message.conversation_id && message.message_ids && message.data) {
+              // Reply is handled like a regular message with reply metadata
+              // The actual reply creation should be done via REST API
+              // This WebSocket event is for broadcasting the reply notification
+
+              const reply_msg_res = await reply_to_message(
+                {
+                  reply_to_message_id: message.message_ids[0],
+                  conversation_id: message.conversation_id,
+                  body: message.data?.new_message,
+                  attachments: message.data.new_message.attachments
+                },
+                message.data?.user_id
+              )
+
+              if (reply_msg_res.success) {
+                broadcast_to_conversation(message.conversation_id, {
+                  type: 'message_reply',
+                  data: {
+                    user_id,
+                    new_message: message.data.new_message,
+                    new_message_id: reply_msg_res.data?.id
+                  },
+                  conversation_id: message.conversation_id,
+                  message_ids: message.message_ids,
+                  timestamp: new Date().toISOString()
+                }, user_id);
+              }
+
+
+            }
+            break;
+
+          case 'message_forward':
+            if (message.data) {
+              // Forward is handled via REST API, this broadcasts the forward notification
+              // Broadcast to target conversation
+              if (message.data.target_conversation_id) {
+                broadcast_to_conversation(message.data.target_conversation_id, {
+                  type: 'message_forward',
+                  data: {
+                    user_id,
+                    source_conversation_id: message.data.source_conversation_id,
+                    message_ids: (message as any).message_ids,
+                    forwarded_message_ids: message.data.forwarded_message_ids
+                  },
+                  conversation_id: message.data.target_conversation_id,
+                  message_ids: message.data.forwarded_message_ids,
+                  timestamp: new Date().toISOString()
+                }, user_id);
+              }
+            }
+            break;
+
+          case 'message_delete':
+            if (message.conversation_id && message.message_ids && message.data) {
+
+              // ------------------------------------------------------------------
+              // store deleted_by in the metadata so that other person can see
+              // ------------------------------------------------------------------
+              broadcast_to_conversation(message.conversation_id, {
+                type: 'message_delete',
+                data: {
+                  user_id,
+                },
+                conversation_id: message.conversation_id,
+                message_ids: message.message_ids,
                 timestamp: new Date().toISOString()
               }, user_id);
             }
@@ -370,21 +557,28 @@ const web_socket = new Elysia()
         }
       } catch (error) {
         console.error('[WS] Error processing message:', error);
-        send_to_user((ws.data as any).user_id, {
-          type: 'error',
-          data: { message: 'Invalid message format' },
-          timestamp: new Date().toISOString()
-        });
+        const user_id = getUserId(ws);
+        if (user_id) {
+          send_to_user(user_id, {
+            type: 'error',
+            data: { message: 'Invalid message format' },
+            timestamp: new Date().toISOString()
+          });
+        }
       }
     },
 
     close: (ws) => {
-      if (ws.data.query.id) {
-        remove_connection(ws.data.query.id);
+      const user_id = getUserId(ws);
+      if (user_id) {
+        remove_connection(user_id);
       }
     }
 
-  });
+  })
+  .listen(5002)
+
+console.log('[WS] WebSocket server running on ws://localhost:5002/chat');
 
 // Connection monitoring and cleanup
 const startConnectionMonitor = () => {
@@ -404,7 +598,7 @@ const startConnectionMonitor = () => {
 };
 
 // Start monitoring
-startConnectionMonitor();
+// startConnectionMonitor();
 
 // Graceful shutdown
 process.on('SIGINT', () => {

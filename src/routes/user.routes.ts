@@ -1,5 +1,5 @@
 import { Elysia, t } from "elysia";
-import { get_user_details, update_user_details } from "@/services/user.services";
+import { get_available_users, get_user_details, update_user_details, update_profile_image } from "@/services/user.services";
 import { get_all_users } from "@/services/user.services";
 import { app_middleware } from "@/middleware";
 
@@ -23,13 +23,11 @@ const user_routes = new Elysia({ prefix: "/user" })
     return user_Details;
   })
 
-  .post(
-    "/update-user",
-    async ({ set, store, body }) => {
-      const user_Details = await update_user_details(store.id, body);
-      set.status = user_Details.code;
-      return user_Details;
-    },
+  .post("/update-user", async ({ set, store, body }) => {
+    const user_Details = await update_user_details(store.id, body);
+    set.status = user_Details.code;
+    return user_Details;
+  },
     {
       body: t.Object({
         name: t.Optional(t.String()),
@@ -52,5 +50,49 @@ const user_routes = new Elysia({ prefix: "/user" })
       }
     }
   })
+
+  .post("/get-available-users", async ({ set, store, body }) => {
+    const user_Details = await get_available_users(store.id, body.phone_numbers);
+    set.status = user_Details.code;
+    return user_Details;
+  },
+    {
+      body: t.Object({
+        phone_numbers: t.Array(t.String()),
+      }),
+    }
+  )
+
+  .post("/update-profile-image", async ({ set, store, body }) => {
+    try {
+      if (!body.image) {
+        set.status = 400;
+        return {
+          success: false,
+          message: "No image file provided",
+        };
+      }
+
+      const result = await update_profile_image(store.id, body.image);
+      set.status = result.code;
+      return result;
+    } catch (error: any) {
+      console.error("Error in profile image upload route:", error);
+      set.status = 500;
+      return {
+        success: false,
+        message: "Internal server error",
+      };
+    }
+  },
+    {
+      body: t.Object({
+        image: t.File({
+          type: ["image/jpeg", "image/jpg", "image/png", "image/webp"],
+          maxSize: 5 * 1024 * 1024, // 5MB
+        }),
+      }),
+    }
+  )
 
 export default user_routes;

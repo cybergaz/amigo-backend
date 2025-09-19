@@ -1,0 +1,1 @@
+ALTER TABLE "messages" ADD COLUMN "forwarded" boolean DEFAULT false;

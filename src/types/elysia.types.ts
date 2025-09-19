@@ -7,5 +7,22 @@ interface ElysiaMiddlewareType {
   allowed?: RoleType[];
 }
 
-export { ElysiaMiddlewareType };
+// WebSocket data interface for type safety
+interface WebSocketData {
+  user_id?: number;
+  request: Request;
+  query: {
+    token?: string;
+  };
+}
+
+// Extended WebSocket type with proper typing
+interface TypedElysiaWS {
+  data: WebSocketData;
+  send: (data: string) => void;
+  close: (code?: number, reason?: string) => void;
+  readyState: number;
+}
+
+export { ElysiaMiddlewareType, WebSocketData, TypedElysiaWS };
 
