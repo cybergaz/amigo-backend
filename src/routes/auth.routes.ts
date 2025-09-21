@@ -1,6 +1,8 @@
+import { handle_login } from "@/services/auth.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
+import { password } from "bun";
 import Elysia, { t } from "elysia";
 
 const auth_routes = new Elysia({ prefix: "/auth" })
@@ -13,7 +15,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   },
     {
       params: t.Object({
-        phone: t.String()
+        phone: t.String(),
       }),
     }
   )
@@ -32,7 +34,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   },
     {
       params: t.Object({
-        phone: t.String()
+        phone: t.String(),
       }),
     }
   )
@@ -46,7 +48,12 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       return otpResponse;
     }
 
-    const create_user_res = await create_user({ name, password, role, phone, })
+    const create_user_res = await create_user({
+      name,
+      password,
+      role,
+      phone,
+    });
     if (!create_user_res?.success) {
       set.status = create_user_res?.code;
       return create_user_res;
@@ -70,31 +77,134 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         value: create_user_res.data.access_token,
         httpOnly: true,
         secure: true,
-        maxAge: 60 * 60 * 24,
+        maxAge: 60 * 60 * 24 * 7,
         path: "/",
       });
-      console.log(`[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`);
+      console.log(
+        `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
+      );
     }
 
-    console.log(`[SERVER]   User Created Success : ${new Date().toLocaleString()}`);
+    console.log(
+      `[SERVER]   User Created Success : ${new Date().toLocaleString()}`
+    );
     return create_user_res;
   },
     { body: VerifySignupSchema }
   )
 
-  .post(
-    "/verify-login-otp",
-    async ({ body, set }) => {
-      const otpResponse = await verify_otp(body.otp, body.phone);
+  .post("/verify-login-otp", async ({ body, set, cookie }) => {
+    const otpResponse = await verify_otp(body.otp, body.phone);
 
+    if (!otpResponse.success) {
       set.status = otpResponse.code;
-      return otpResponse
-    },
+      return otpResponse;
+    }
+
+    const login_res = await handle_login({ phone: body.phone });
+    if (login_res.success == false) {
+      set.status = login_res.code;
+      return login_res;
+    }
+
+    if (
+      login_res.success &&
+      login_res.data?.refresh_token &&
+      login_res.data?.access_token
+    ) {
+      cookie["refresh_token"].set({
+        value: login_res.data.refresh_token,
+        httpOnly: true,
+        secure: true,
+        maxAge: 60 * 60 * 24 * 7,
+        path: "/",
+      });
+      cookie["access_token"].set({
+        value: login_res.data.access_token,
+        httpOnly: true,
+        secure: true,
+        maxAge: 60 * 60 * 24 * 7,
+        path: "/",
+      });
+      console.log(
+        `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
+      );
+    }
+
+    set.status = login_res.code;
+
+    return login_res
+    // return {
+    //   success: true,
+    //   message: "Login Successful",
+    //   data: {
+    //     id: login_res.data?.id,
+    //     name: login_res.data?.name,
+    //     role: login_res.data?.role,
+    //     phone: login_res.data?.phone,
+    //   },
+    // };
+  },
     {
       body: t.Object({
         phone: t.String(),
         otp: t.Number(),
-      })
+      }),
+    }
+  )
+
+
+  .post("/verify-email-login", async ({ body, set, cookie }) => {
+    console.log("body ->", body)
+    const login_res = await handle_login({ email: body.email, password: body.password });
+    if (login_res.success == false) {
+      set.status = login_res.code;
+      return login_res;
+    }
+
+    if (
+      login_res.success &&
+      login_res.data?.refresh_token &&
+      login_res.data?.access_token
+    ) {
+      cookie["refresh_token"].set({
+        value: login_res.data.refresh_token,
+        httpOnly: true,
+        secure: true,
+        maxAge: 60 * 60 * 24 * 7,
+        path: "/",
+      });
+      cookie["access_token"].set({
+        value: login_res.data.access_token,
+        httpOnly: true,
+        secure: true,
+        maxAge: 60 * 60 * 24,
+        path: "/",
+      });
+      console.log(
+        `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
+      );
+    }
+
+    set.status = login_res.code;
+
+    return login_res
+    // return {
+    //   success: true,
+    //   message: "Login Successful",
+    //   data: {
+    //     id: login_res.data?.id,
+    //     name: login_res.data?.name,
+    //     role: login_res.data?.role,
+    //     phone: login_res.data?.phone,
+    //   },
+    // };
+  },
+    {
+      body: t.Object({
+        email: t.String(),
+        password: t.String(),
+      }),
     }
   )
 
@@ -103,7 +213,9 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     const access_token = cookie["access_token"].value;
     if (!existing_token && !access_token) {
       set.status = 404;
-      console.log(`[SERVER]   Already Logged Out : ${new Date().toLocaleString()}`);
+      console.log(
+        `[SERVER]   Already Logged Out : ${new Date().toLocaleString()}`
+      );
       return {
         success: true,
         message: "Already Logged Out",
@@ -118,5 +230,6 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       message: "Logged Out Successfully",
     };
   })
+
 
 export default auth_routes;

@@ -1,0 +1,202 @@
+### Community API Testing
+
+### Variables
+@baseUrl = http://localhost:3000/api
+@authToken = your_auth_token_here
+@communityId = 123456789
+@userId = 987654321
+@conversationId = 456789123
+
+### 1. Create Community (Super Admin only)
+POST {{baseUrl}}/community/create
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "name": "Tech Community",
+  "description": "A community for tech enthusiasts to discuss latest trends",
+  "metadata": {
+    "category": "technology",
+    "public": true
+  }
+}
+
+### 2. Get User's Communities
+GET {{baseUrl}}/community/list
+Authorization: Bearer {{authToken}}
+
+### 3. Get Community Details
+GET {{baseUrl}}/community/{{communityId}}
+Authorization: Bearer {{authToken}}
+
+### 4. Update Community (Super Admin only)
+PUT {{baseUrl}}/community/{{communityId}}
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "name": "Updated Tech Community",
+  "description": "An updated community for tech enthusiasts"
+}
+
+### 5. Add Members to Community (Admin only)
+POST {{baseUrl}}/community/{{communityId}}/members/add
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "user_ids": [{{userId}}, 111111111, 222222222],
+  "role": "member"
+}
+
+### 6. Get Community Members
+GET {{baseUrl}}/community/{{communityId}}/members
+Authorization: Bearer {{authToken}}
+
+### 7. Create Community Group with Time Restrictions (Admin only)
+POST {{baseUrl}}/community/{{communityId}}/groups/create
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "title": "Morning Standup",
+  "active_time_slots": [
+    {
+      "start_time": "10:00",
+      "end_time": "13:00"
+    },
+    {
+      "start_time": "15:00",
+      "end_time": "18:00"
+    }
+  ],
+  "timezone": "UTC",
+  "active_days": [1, 2, 3, 4, 5]
+}
+
+### 8. Create Another Community Group (Evening Discussion)
+POST {{baseUrl}}/community/{{communityId}}/groups/create
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "title": "Evening Discussion",
+  "active_time_slots": [
+    {
+      "start_time": "19:00",
+      "end_time": "21:00"
+    }
+  ],
+  "timezone": "America/New_York",
+  "active_days": [1, 2, 3, 4, 5, 6, 0]
+}
+
+### 9. Get Community Groups
+GET {{baseUrl}}/community/{{communityId}}/groups
+Authorization: Bearer {{authToken}}
+
+### 10. Update Community Group Time Restrictions (Admin only)
+PUT {{baseUrl}}/community/groups/{{conversationId}}
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "title": "Updated Morning Standup",
+  "active_time_slots": [
+    {
+      "start_time": "09:00",
+      "end_time": "12:00"
+    },
+    {
+      "start_time": "14:00",
+      "end_time": "17:00"
+    }
+  ],
+  "active_days": [1, 2, 3, 4, 5, 6]
+}
+
+### 11. Get Updated Chat List (includes community groups)
+GET {{baseUrl}}/chat/get-chat-list
+Authorization: Bearer {{authToken}}
+
+### 12. Get Community Group Conversation History
+GET {{baseUrl}}/chat/get-conversation-history/{{conversationId}}?page=1&limit=20
+Authorization: Bearer {{authToken}}
+
+### 13. Remove Members from Community (Admin only)
+POST {{baseUrl}}/community/{{communityId}}/members/remove
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "user_ids": [{{userId}}]
+}
+
+### 14. Delete Community Group (Admin only)
+DELETE {{baseUrl}}/community/groups/{{conversationId}}
+Authorization: Bearer {{authToken}}
+
+### 15. Delete Community (Super Admin only)
+DELETE {{baseUrl}}/community/{{communityId}}
+Authorization: Bearer {{authToken}}
+
+### Sample Time Slot Configurations
+
+### Weekend Only Group
+POST {{baseUrl}}/community/{{communityId}}/groups/create
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "title": "Weekend Casual Chat",
+  "active_time_slots": [
+    {
+      "start_time": "10:00",
+      "end_time": "22:00"
+    }
+  ],
+  "timezone": "UTC",
+  "active_days": [0, 6]
+}
+
+### Multiple Time Slots Group
+POST {{baseUrl}}/community/{{communityId}}/groups/create
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "title": "Break Time Chats",
+  "active_time_slots": [
+    {
+      "start_time": "10:30",
+      "end_time": "11:00"
+    },
+    {
+      "start_time": "15:30",
+      "end_time": "16:00"
+    },
+    {
+      "start_time": "20:00",
+      "end_time": "21:00"
+    }
+  ],
+  "timezone": "Asia/Kolkata",
+  "active_days": [1, 2, 3, 4, 5]
+}
+
+### 24/7 Group (No time restrictions)
+POST {{baseUrl}}/community/{{communityId}}/groups/create
+Content-Type: application/json
+Authorization: Bearer {{authToken}}
+
+{
+  "title": "24/7 Support Channel",
+  "active_time_slots": [
+    {
+      "start_time": "00:00",
+      "end_time": "23:59"
+    }
+  ],
+  "timezone": "UTC",
+  "active_days": [0, 1, 2, 3, 4, 5, 6]
+}

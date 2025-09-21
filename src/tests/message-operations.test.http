@@ -1,0 +1,157 @@
+### Message Operations API Tests
+
+
+### Make sure to replace the actual values with your test data
+
+
+### 1. Pin Messages
+
+POST http://localhost:5000/api/chat/messages/pin HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Njg0Njc1NjY3NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTgxODMwMjYsImV4cCI6MTc1ODI2OTQyNn0.74jwJ72vCwicXl8_EvvIK6xKillZ9TuyQ6Gis2hQwlg
+
+{
+  "conversation_id": 814722941,
+  "message_id": 219
+}
+
+
+### 2. Star Messages
+
+POST http://localhost:5000/api/chat/messages/star HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Njg0Njc1NjY3NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTgxODMwMjYsImV4cCI6MTc1ODI2OTQyNn0.74jwJ72vCwicXl8_EvvIK6xKillZ9TuyQ6Gis2hQwlg
+
+{
+  "conversation_id": 814722941,
+  "message_ids": [
+    218,
+    223
+  ]
+}
+
+
+### 3. Reply to Message
+
+POST http://localhost:5000/chat/messages/reply HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN
+
+{
+  "attachments": [],
+  "body": "This is a reply to the message",
+  "conversation_id": 1,
+  "reply_to_message_id": 123
+}
+
+
+### 4. Forward Messages
+
+POST http://localhost:5000/chat/messages/forward HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN
+
+{
+  "message_ids": [
+    123,
+    124
+  ],
+  "source_conversation_id": 1,
+  "target_conversation_id": 2
+}
+
+
+### 5. Delete Messages (for everyone)
+
+DELETE http://localhost:5000/chat/messages/delete HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer YOUR_JWT_TOKEN
+
+{
+  "conversation_id": 1,
+  "delete_for_everyone": true,
+  "message_ids": [
+    123,
+    124
+  ]
+}
+
+
+### 6. Get Pinned Messages
+
+GET http://localhost:5000/chat/messages/pinned/1 HTTP/1.1
+Authorization: Bearer YOUR_JWT_TOKEN
+
+
+### 7. Get Starred Messages (all)
+
+GET http://localhost:5000/chat/messages/starred HTTP/1.1
+Authorization: Bearer YOUR_JWT_TOKEN
+
+
+### 8. Get Starred Messages (specific conversation)
+
+GET http://localhost:5000/chat/messages/starred?conversation_id=1 HTTP/1.1
+Authorization: Bearer YOUR_JWT_TOKEN
+
+
+### WebSocket Message Examples
+
+
+### Connect to ws://localhost:5000/ws with Authorization header
+
+# Pin messages via WebSocket
+
+GET {
+ "type": "message_pin",
+ "conversation_id": 1,
+ "message_ids": [123, 124],
+ "data": {
+ "action": "toggle"
+ } HTTP/1.1
+
+
+### 
+
+GET } HTTP/1.1
+
+# Star messages via WebSocket
+{
+  "type": "message_star",
+  "conversation_id": 1,
+  "message_ids": [123],
+  "data": {
+    "action": "toggle"
+  }
+}
+
+# Reply notification via WebSocket (after creating reply via REST API)
+{
+  "type": "message_reply",
+  "conversation_id": 1,
+  "data": {
+    "reply_to_message_id": 123,
+    "new_message_id": 456
+  }
+}
+
+# Forward notification via WebSocket (after forwarding via REST API)
+{
+  "type": "message_forward",
+  "message_ids": [123, 124],
+  "data": {
+    "source_conversation_id": 1,
+    "target_conversation_id": 2,
+    "forwarded_message_ids": [789, 790]
+  }
+}
+
+# Delete messages via WebSocket
+{
+  "type": "message_delete",
+  "conversation_id": 1,
+  "message_ids": [123, 124],
+  "data": {
+    "delete_for_everyone": true
+  }
+}

@@ -1,6 +1,6 @@
 {
-  "id": "733c927d-ddfe-4817-8871-5b5f948e0cac",
-  "prevId": "9fe2579c-2404-43f3-b3e3-89359b1b1d8a",
+  "id": "828bead8-56d9-48e3-80d8-62ceb00f35d8",
+  "prevId": "49f1d38f-310b-45b6-8b41-f36a8fc0159d",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -567,6 +567,38 @@
           "primaryKey": false,
           "notNull": false,
           "default": "now()"
+        },
+        "call_access": {
+          "name": "call_access",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": false,
+          "default": false
+        },
+        "online_status": {
+          "name": "online_status",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": false,
+          "default": false
+        },
+        "location": {
+          "name": "location",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "ip_address": {
+          "name": "ip_address",
+          "type": "varchar(50)",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "permissions": {
+          "name": "permissions",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
         }
       },
       "indexes": {},

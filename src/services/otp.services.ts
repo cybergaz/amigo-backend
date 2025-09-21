@@ -12,7 +12,14 @@ const generate_otp = async (phone: string) => {
   }
 
   try {
-    // const otp = Math.floor(100000 + Math.random() * 900000); // Generate a 6-digit OTP
+    // -----------------------------------------------------------
+    // Handle Send OTP Logic here
+    // -----------------------------------------------------------
+
+
+    // -----------------------------------------------------------
+    // use Nanoid to generate_otp
+    // -----------------------------------------------------------
     const otp = 123456
 
     // upsert user
@@ -95,6 +102,8 @@ const verify_otp = async (otp: number, phone: string) => {
     };
   }
 };
+
+
 
 
 export { generate_otp, verify_otp };
