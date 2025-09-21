@@ -7,12 +7,22 @@ import {
 } from "@/utils/general.utils";
 import { eq } from "drizzle-orm";
 
-const handle_login = async (password: string | undefined, phone: string) => {
+const handle_login = async ({
+  phone,
+  email,
+  password,
+}: {
+  phone?: string;
+  email?: string;
+  password?: string;
+}) => {
   try {
     const user = await db
       .select()
       .from(user_model)
-      .where(eq(user_model.phone, phone))
+      .where(
+        phone ? eq(user_model.phone, phone) : eq(user_model.email, email!)
+      )
       .then((res) => res[0]);
 
     if (!user) {
@@ -66,6 +76,7 @@ const handle_login = async (password: string | undefined, phone: string) => {
         name: user.name,
         role: user.role,
         phone: user.phone,
+        email: user.email,
         refresh_token,
         access_token,
       },

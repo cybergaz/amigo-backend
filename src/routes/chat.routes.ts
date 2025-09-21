@@ -10,7 +10,8 @@ import {
   delete_conversation,
   get_conversation_history,
   mark_as_delete_message,
-  mark_as_delete_conversation
+  mark_as_delete_conversation,
+  get_group_info
 } from "@/services/chat.services";
 import {
   pin_message,
@@ -56,7 +57,16 @@ const chat_routes = new Elysia({ prefix: "/chat" })
         t.Object({ type: t.String() })
       )
     }
+  )
 
+  .get("/get-group-info/:conversation_id", async ({ set, store, params }) => {
+    const chats_result = await get_group_info(params.conversation_id);
+    set.status = chats_result.code;
+    return chats_result;
+  },
+    {
+      params: t.Object({ conversation_id: t.Number() })
+    }
   )
 
   .post("/create-group", async ({ set, store, body }) => {
@@ -70,14 +80,14 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     })
   })
 
-  .post("/add-member", async ({ set, store, body }) => {
-    const member_result = await add_new_member(body.conversation_id, body.user_id, body.role);
+  .post("/add-members", async ({ set, store, body }) => {
+    const member_result = await add_new_member(body.conversation_id, body.user_ids, body.role);
     set.status = member_result.code;
     return member_result;
   }, {
     body: t.Object({
       conversation_id: t.Number(),
-      user_id: t.Number(),
+      user_ids: t.Array(t.Number()),
       role: t.Optional(t.Union([t.Literal("admin"), t.Literal("member")]))
     })
   })
@@ -103,7 +113,6 @@ const chat_routes = new Elysia({ prefix: "/chat" })
       title: t.String()
     })
   })
-
 
   .get("/get-conversation-history/:conversation_id", async ({ set, store, params, query }) => {
     const history_result = await get_conversation_history(

@@ -2,6 +2,7 @@ import { handle_login } from "@/services/auth.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
+import { password } from "bun";
 import Elysia, { t } from "elysia";
 
 const auth_routes = new Elysia({ prefix: "/auth" })
@@ -76,7 +77,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         value: create_user_res.data.access_token,
         httpOnly: true,
         secure: true,
-        maxAge: 60 * 60 * 24,
+        maxAge: 60 * 60 * 24 * 7,
         path: "/",
       });
       console.log(
@@ -100,7 +101,62 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       return otpResponse;
     }
 
-    const login_res = await handle_login(undefined, body.phone);
+    const login_res = await handle_login({ phone: body.phone });
+    if (login_res.success == false) {
+      set.status = login_res.code;
+      return login_res;
+    }
+
+    if (
+      login_res.success &&
+      login_res.data?.refresh_token &&
+      login_res.data?.access_token
+    ) {
+      cookie["refresh_token"].set({
+        value: login_res.data.refresh_token,
+        httpOnly: true,
+        secure: true,
+        maxAge: 60 * 60 * 24 * 7,
+        path: "/",
+      });
+      cookie["access_token"].set({
+        value: login_res.data.access_token,
+        httpOnly: true,
+        secure: true,
+        maxAge: 60 * 60 * 24 * 7,
+        path: "/",
+      });
+      console.log(
+        `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
+      );
+    }
+
+    set.status = login_res.code;
+
+    return login_res
+    // return {
+    //   success: true,
+    //   message: "Login Successful",
+    //   data: {
+    //     id: login_res.data?.id,
+    //     name: login_res.data?.name,
+    //     role: login_res.data?.role,
+    //     phone: login_res.data?.phone,
+    //   },
+    // };
+  },
+    {
+      body: t.Object({
+        phone: t.String(),
+        otp: t.Number(),
+      }),
+    }
+  )
+
+
+  .post("/verify-email-login", async ({ body, set, cookie }) => {
+    console.log("body ->", body)
+    const login_res = await handle_login({ email: body.email, password: body.password });
     if (login_res.success == false) {
       set.status = login_res.code;
       return login_res;
@@ -146,8 +202,8 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   },
     {
       body: t.Object({
-        phone: t.String(),
-        otp: t.Number(),
+        email: t.String(),
+        password: t.String(),
       }),
     }
   )

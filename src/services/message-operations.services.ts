@@ -306,6 +306,7 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: number) =
       }
     };
 
+    console.log("user_id ->", user_id)
     // Create new reply message
     const [replyMessage] = await db
       .insert(message_model)

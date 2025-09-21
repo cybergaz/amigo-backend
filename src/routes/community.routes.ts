@@ -1,14 +1,17 @@
 import { Elysia, t } from "elysia";
 import { app_middleware } from "@/middleware";
+import db from "@/config/db";
+import { conversation_model } from "@/models/chat.model";
+import { user_model } from "@/models/user.model";
+import { and, eq, desc } from "drizzle-orm";
 import {
   create_community,
   get_communities,
   get_community_details,
   update_community,
   delete_community,
-  add_community_members,
-  remove_community_members,
-  get_community_members,
+  add_community_groups,
+  remove_community_groups,
   create_community_group,
   update_community_group,
   get_community_groups,
@@ -83,9 +86,9 @@ const community_routes = new Elysia({ prefix: "/community" })
     })
   })
 
-  // Community member management
-  .post("/:community_id/members/add", async ({ set, store, params, body }) => {
-    const add_result = await add_community_members(
+  // Community group management
+  .post("/:community_id/groups/add", async ({ set, store, params, body }) => {
+    const add_result = await add_community_groups(
       params.community_id, 
       store.id, 
       { ...body, community_id: params.community_id }
@@ -97,13 +100,12 @@ const community_routes = new Elysia({ prefix: "/community" })
       community_id: t.Number()
     }),
     body: t.Object({
-      user_ids: t.Array(t.Number()),
-      role: t.Optional(t.Union([t.Literal("member"), t.Literal("admin")]))
+      group_ids: t.Array(t.Number())
     })
   })
 
-  .post("/:community_id/members/remove", async ({ set, store, params, body }) => {
-    const remove_result = await remove_community_members(
+  .post("/:community_id/groups/remove", async ({ set, store, params, body }) => {
+    const remove_result = await remove_community_groups(
       params.community_id, 
       store.id, 
       { ...body, community_id: params.community_id }
@@ -115,17 +117,7 @@ const community_routes = new Elysia({ prefix: "/community" })
       community_id: t.Number()
     }),
     body: t.Object({
-      user_ids: t.Array(t.Number())
-    })
-  })
-
-  .get("/:community_id/members", async ({ set, store, params }) => {
-    const members_result = await get_community_members(params.community_id, store.id);
-    set.status = members_result.code;
-    return members_result;
-  }, {
-    params: t.Object({
-      community_id: t.Number()
+      group_ids: t.Array(t.Number())
     })
   })
 
@@ -193,6 +185,61 @@ const community_routes = new Elysia({ prefix: "/community" })
     params: t.Object({
       conversation_id: t.Number()
     })
+  })
+
+  // Get all available groups (for adding to communities)
+  .get("/available-groups", async ({ set, store }) => {
+    try {
+      // Check if user is admin or sub_admin
+      const [user] = await db
+        .select({ role: user_model.role })
+        .from(user_model)
+        .where(eq(user_model.id, store.id));
+
+      if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+        set.status = 403;
+        return {
+          success: false,
+          code: 403,
+          message: "Only admins and sub admins can view available groups",
+          data: null,
+        };
+      }
+
+      // Get all community groups that are not deleted
+      const groups = await db
+        .select({
+          id: conversation_model.id,
+          title: conversation_model.title,
+          type: conversation_model.type,
+          created_at: conversation_model.created_at,
+          metadata: conversation_model.metadata,
+        })
+        .from(conversation_model)
+        .where(
+          and(
+            eq(conversation_model.type, "community_group"),
+            eq(conversation_model.deleted, false)
+          )
+        )
+        .orderBy(desc(conversation_model.created_at));
+
+      set.status = 200;
+      return {
+        success: true,
+        code: 200,
+        data: groups,
+      };
+    } catch (error) {
+      console.error("get_available_groups error:", error);
+      set.status = 500;
+      return {
+        success: false,
+        code: 500,
+        message: "Internal server error",
+        data: null,
+      };
+    }
   });
 
 export default community_routes;

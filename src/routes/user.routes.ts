@@ -35,6 +35,11 @@ const user_routes = new Elysia({ prefix: "/user" })
         phone: t.Optional(t.String()),
         role: t.Optional(t.Enum(Object.fromEntries(ROLE_CONST.map(x => [x, x])))),
         profile_pic: t.Optional(t.String()),
+        location: t.Optional(t.Object({
+          latitude: t.Number(),
+          longitude: t.Number(),
+        })),
+        ip_address: t.Optional(t.String()),
       }),
     }
   )

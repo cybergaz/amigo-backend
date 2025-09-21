@@ -89,6 +89,16 @@ interface UpdateCommunityMemberRoleRequest {
   role: CommunityRoleType;
 }
 
+interface AddCommunityGroupRequest {
+  community_id: number;
+  group_ids: number[];
+}
+
+interface RemoveCommunityGroupRequest {
+  community_id: number;
+  group_ids: number[];
+}
+
 // Response types
 interface CommunityWithMembers {
   id: number;
@@ -127,6 +137,8 @@ export type {
   AddCommunityMemberRequest,
   RemoveCommunityMemberRequest,
   UpdateCommunityMemberRoleRequest,
+  AddCommunityGroupRequest,
+  RemoveCommunityGroupRequest,
   CommunityWithMembers,
   CommunityGroupWithDetails
 };

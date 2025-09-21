@@ -1,5 +1,5 @@
 import db from "@/config/db";
-import { community_model, community_member_model } from "@/models/community.model";
+import { community_model } from "@/models/community.model";
 import { conversation_model, conversation_member_model } from "@/models/chat.model";
 import { user_model } from "@/models/user.model";
 import {
@@ -7,9 +7,8 @@ import {
   UpdateCommunityRequest,
   CreateCommunityGroupRequest,
   UpdateCommunityGroupRequest,
-  AddCommunityMemberRequest,
-  RemoveCommunityMemberRequest,
-  UpdateCommunityMemberRoleRequest,
+  AddCommunityGroupRequest,
+  RemoveCommunityGroupRequest,
   CommunityGroupMetadata
 } from "@/types/community.types";
 import { ChatRoleType } from "@/types/chat.types";
@@ -22,17 +21,17 @@ const create_community = async (
   data: CreateCommunityRequest
 ) => {
   try {
-    // Check if user is super admin
+    // Check if user is super admin or sub admin
     const [user] = await db
       .select({ role: user_model.role })
       .from(user_model)
       .where(eq(user_model.id, super_admin_id));
 
-    if (!user || user.role !== "admin") {
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
       return {
         success: false,
         code: 403,
-        message: "Only super admins can create communities",
+        message: "Only super admins and sub admins can create communities",
       };
     }
 
@@ -41,20 +40,10 @@ const create_community = async (
       .values({
         id: create_unique_id(),
         name: data.name,
-        description: data.description,
-        super_admin_id,
         metadata: data.metadata || {},
         updated_at: new Date(),
       })
       .returning();
-
-    // Add super admin as community member
-    await db.insert(community_member_model).values({
-      id: create_unique_id(),
-      community_id: community.id,
-      user_id: super_admin_id,
-      role: "admin",
-    });
 
     return {
       success: true,
@@ -74,29 +63,31 @@ const create_community = async (
 
 const get_communities = async (user_id: number) => {
   try {
+    // Check if user is admin or sub_admin
+    // const [user] = await db
+    //   .select({ role: user_model.role })
+    //   .from(user_model)
+    //   .where(eq(user_model.id, user_id));
+    //
+    // if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+    //   return {
+    //     success: false,
+    //     code: 403,
+    //     message: "Only admins and sub admins can view communities",
+    //   };
+    // }
+
     const communities = await db
       .select({
         id: community_model.id,
         name: community_model.name,
-        description: community_model.description,
-        super_admin_id: community_model.super_admin_id,
+        group_ids: community_model.group_ids,
         metadata: community_model.metadata,
         created_at: community_model.created_at,
         updated_at: community_model.updated_at,
-        user_role: community_member_model.role,
       })
-      .from(community_member_model)
-      .innerJoin(
-        community_model,
-        eq(community_model.id, community_member_model.community_id)
-      )
-      .where(
-        and(
-          eq(community_member_model.user_id, user_id),
-          eq(community_model.deleted, false),
-          eq(community_member_model.deleted, false)
-        )
-      )
+      .from(community_model)
+      .where(eq(community_model.deleted, false))
       .orderBy(desc(community_model.updated_at));
 
     return {
@@ -116,25 +107,19 @@ const get_communities = async (user_id: number) => {
 
 const get_community_details = async (community_id: number, user_id: number) => {
   try {
-    // Check if user is member of community
-    const [membership] = await db
-      .select({ role: community_member_model.role })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, community_id),
-          eq(community_member_model.user_id, user_id),
-          eq(community_member_model.deleted, false)
-        )
-      );
-
-    if (!membership) {
-      return {
-        success: false,
-        code: 403,
-        message: "You are not a member of this community",
-      };
-    }
+    // Check if user is admin or sub_admin
+    // const [user] = await db
+    //   .select({ role: user_model.role })
+    //   .from(user_model)
+    //   .where(eq(user_model.id, user_id));
+    //
+    // if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+    //   return {
+    //     success: false,
+    //     code: 403,
+    //     message: "Only admins and sub admins can view community details",
+    //   };
+    // }
 
     // Get community details
     const [community] = await db
@@ -155,37 +140,15 @@ const get_community_details = async (community_id: number, user_id: number) => {
       };
     }
 
-    // Get member count
-    const memberCountResult = await db
-      .select({ count: sql<number>`count(*)` })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, community_id),
-          eq(community_member_model.deleted, false)
-        )
-      );
-
-    // Get group count
-    const groupCountResult = await db
-      .select({ count: sql<number>`count(*)` })
-      .from(conversation_model)
-      .where(
-        and(
-          eq(conversation_model.type, "community_group"),
-          sql`${conversation_model.metadata}->>'community_id' = ${community_id.toString()}`,
-          eq(conversation_model.deleted, false)
-        )
-      );
+    // Get group count from group_ids array
+    const group_count = community.group_ids ? community.group_ids.length : 0;
 
     return {
       success: true,
       code: 200,
       data: {
         ...community,
-        user_role: membership.role,
-        member_count: memberCountResult[0]?.count || 0,
-        group_count: groupCountResult[0]?.count || 0,
+        group_count,
       },
     };
   } catch (error) {
@@ -204,17 +167,17 @@ const update_community = async (
   data: UpdateCommunityRequest
 ) => {
   try {
-    // Check if user is super admin of the community
-    const [community] = await db
-      .select({ super_admin_id: community_model.super_admin_id })
-      .from(community_model)
-      .where(eq(community_model.id, community_id));
+    // Check if user is admin or sub_admin
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, user_id));
 
-    if (!community || community.super_admin_id !== user_id) {
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
       return {
         success: false,
         code: 403,
-        message: "Only the super admin can update this community",
+        message: "Only admins and sub admins can update communities",
       };
     }
 
@@ -245,17 +208,17 @@ const update_community = async (
 
 const delete_community = async (community_id: number, user_id: number) => {
   try {
-    // Check if user is super admin of the community
-    const [community] = await db
-      .select({ super_admin_id: community_model.super_admin_id })
-      .from(community_model)
-      .where(eq(community_model.id, community_id));
+    // Check if user is admin or sub_admin
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, user_id));
 
-    if (!community || community.super_admin_id !== user_id) {
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
       return {
         success: false,
         code: 403,
-        message: "Only the super admin can delete this community",
+        message: "Only admins and sub admins can delete communities",
       };
     }
 
@@ -264,17 +227,6 @@ const delete_community = async (community_id: number, user_id: number) => {
       .update(community_model)
       .set({ deleted: true, updated_at: new Date() })
       .where(eq(community_model.id, community_id));
-
-    // Also soft delete all community groups
-    await db
-      .update(conversation_model)
-      .set({ deleted: true })
-      .where(
-        and(
-          eq(conversation_model.type, "community_group"),
-          sql`${conversation_model.metadata}->>'community_id' = ${community_id.toString()}`
-        )
-      );
 
     return {
       success: true,
@@ -291,194 +243,148 @@ const delete_community = async (community_id: number, user_id: number) => {
   }
 };
 
-// Community member management
-const add_community_members = async (
-  community_id: number,
-  admin_user_id: number,
-  data: AddCommunityMemberRequest
-) => {
-  try {
-    // Check if user is admin of the community
-    const [membership] = await db
-      .select({ role: community_member_model.role })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, community_id),
-          eq(community_member_model.user_id, admin_user_id)
-        )
-      );
-
-    if (!membership || membership.role !== "admin") {
-      return {
-        success: false,
-        code: 403,
-        message: "Only community admins can add members",
-      };
-    }
-
-    // Add members
-    const membersToAdd = data.user_ids.map(user_id => ({
-      id: create_unique_id(),
-      community_id,
-      user_id,
-      role: data.role || "member",
-    }));
-
-    const addedMembers = await db
-      .insert(community_member_model)
-      .values(membersToAdd)
-      .onConflictDoNothing()
-      .returning();
-
-    return {
-      success: true,
-      code: 200,
-      message: "Members added successfully",
-      data: addedMembers,
-    };
-  } catch (error) {
-    console.error("add_community_members error:", error);
-    return {
-      success: false,
-      code: 500,
-      message: "ERROR: add_community_members",
-    };
-  }
-};
-
-const remove_community_members = async (
-  community_id: number,
-  admin_user_id: number,
-  data: RemoveCommunityMemberRequest
-) => {
-  try {
-    // Check if user is admin of the community
-    const [membership] = await db
-      .select({ role: community_member_model.role })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, community_id),
-          eq(community_member_model.user_id, admin_user_id)
-        )
-      );
-
-    if (!membership || membership.role !== "admin") {
-      return {
-        success: false,
-        code: 403,
-        message: "Only community admins can remove members",
-      };
-    }
-
-    // Soft delete members
-    const removedMembers = await db
-      .update(community_member_model)
-      .set({ deleted: true })
-      .where(
-        and(
-          eq(community_member_model.community_id, community_id),
-          inArray(community_member_model.user_id, data.user_ids)
-        )
-      )
-      .returning();
-
-    return {
-      success: true,
-      code: 200,
-      message: "Members removed successfully",
-      data: removedMembers,
-    };
-  } catch (error) {
-    console.error("remove_community_members error:", error);
-    return {
-      success: false,
-      code: 500,
-      message: "ERROR: remove_community_members",
-    };
-  }
-};
-
-const get_community_members = async (community_id: number, user_id: number) => {
-  try {
-    // Check if user is member of community
-    const [membership] = await db
-      .select({ role: community_member_model.role })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, community_id),
-          eq(community_member_model.user_id, user_id),
-          eq(community_member_model.deleted, false)
-        )
-      );
-
-    if (!membership) {
-      return {
-        success: false,
-        code: 403,
-        message: "You are not a member of this community",
-      };
-    }
-
-    const members = await db
-      .select({
-        id: community_member_model.id,
-        user_id: community_member_model.user_id,
-        role: community_member_model.role,
-        joined_at: community_member_model.joined_at,
-        user_name: user_model.name,
-        user_profile_pic: user_model.profile_pic,
-        user_last_seen: user_model.last_seen,
-      })
-      .from(community_member_model)
-      .innerJoin(user_model, eq(user_model.id, community_member_model.user_id))
-      .where(
-        and(
-          eq(community_member_model.community_id, community_id),
-          eq(community_member_model.deleted, false)
-        )
-      )
-      .orderBy(community_member_model.joined_at);
-
-    return {
-      success: true,
-      code: 200,
-      data: members,
-    };
-  } catch (error) {
-    console.error("get_community_members error:", error);
-    return {
-      success: false,
-      code: 500,
-      message: "ERROR: get_community_members",
-    };
-  }
-};
-
 // Community group management
+const add_community_groups = async (
+  community_id: number,
+  admin_user_id: number,
+  data: AddCommunityGroupRequest
+) => {
+  try {
+    // Check if user is admin or sub_admin
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, admin_user_id));
+
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+      return {
+        success: false,
+        code: 403,
+        message: "Only admins and sub admins can manage community groups",
+      };
+    }
+
+    // Get current community
+    const [community] = await db
+      .select({ group_ids: community_model.group_ids })
+      .from(community_model)
+      .where(eq(community_model.id, community_id));
+
+    if (!community) {
+      return {
+        success: false,
+        code: 404,
+        message: "Community not found",
+      };
+    }
+
+    // Add new group IDs to the community
+    const currentGroupIds = community.group_ids || [];
+    const newGroupIds = [...new Set([...currentGroupIds, ...data.group_ids])];
+
+    await db
+      .update(community_model)
+      .set({
+        group_ids: newGroupIds,
+        updated_at: new Date()
+      })
+      .where(eq(community_model.id, community_id));
+
+    return {
+      success: true,
+      code: 200,
+      message: "Groups added to community successfully",
+      data: { group_ids: newGroupIds },
+    };
+  } catch (error) {
+    console.error("add_community_groups error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: add_community_groups",
+    };
+  }
+};
+
+const remove_community_groups = async (
+  community_id: number,
+  admin_user_id: number,
+  data: RemoveCommunityGroupRequest
+) => {
+  try {
+    // Check if user is admin or sub_admin
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, admin_user_id));
+
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+      return {
+        success: false,
+        code: 403,
+        message: "Only admins and sub admins can manage community groups",
+      };
+    }
+
+    // Get current community
+    const [community] = await db
+      .select({ group_ids: community_model.group_ids })
+      .from(community_model)
+      .where(eq(community_model.id, community_id));
+
+    if (!community) {
+      return {
+        success: false,
+        code: 404,
+        message: "Community not found",
+      };
+    }
+
+    // Remove group IDs from the community
+    const currentGroupIds = community.group_ids || [];
+    const newGroupIds = currentGroupIds.filter(id => !data.group_ids.includes(id));
+
+    await db
+      .update(community_model)
+      .set({
+        group_ids: newGroupIds,
+        updated_at: new Date()
+      })
+      .where(eq(community_model.id, community_id));
+
+    return {
+      success: true,
+      code: 200,
+      message: "Groups removed from community successfully",
+      data: { group_ids: newGroupIds },
+    };
+  } catch (error) {
+    console.error("remove_community_groups error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: remove_community_groups",
+    };
+  }
+};
+
+// Community group creation (creates a new group and adds it to community)
 const create_community_group = async (
   admin_user_id: number,
   data: CreateCommunityGroupRequest
 ) => {
   try {
-    // Check if user is admin of the community
-    const [membership] = await db
-      .select({ role: community_member_model.role })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, data.community_id),
-          eq(community_member_model.user_id, admin_user_id)
-        )
-      );
+    // Check if user is admin or sub_admin
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, admin_user_id));
 
-    if (!membership || membership.role !== "admin") {
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
       return {
         success: false,
         code: 403,
-        message: "Only community admins can create groups",
+        message: "Only admins and sub admins can create community groups",
       };
     }
 
@@ -502,25 +408,35 @@ const create_community_group = async (
       })
       .returning();
 
-    // Get all community members to add to the group
-    const communityMembers = await db
-      .select({ user_id: community_member_model.user_id })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, data.community_id),
-          eq(community_member_model.deleted, false)
-        )
-      );
+    // Add the group to the community's group_ids
+    const [community] = await db
+      .select({ group_ids: community_model.group_ids })
+      .from(community_model)
+      .where(eq(community_model.id, data.community_id));
 
-    // Add all community members to the group
-    const membersToAdd = communityMembers.map(member => ({
-      conversation_id: group.id,
-      user_id: member.user_id,
-      role: (member.user_id === admin_user_id ? "admin" : "member") as ChatRoleType,
-    }));
+    if (community) {
+      const currentGroupIds = community.group_ids || [];
+      const newGroupIds = [...currentGroupIds, group.id];
 
-    await db.insert(conversation_member_model).values(membersToAdd);
+      await db
+        .update(community_model)
+        .set({
+          group_ids: newGroupIds,
+          updated_at: new Date()
+        })
+        .where(eq(community_model.id, data.community_id));
+    }
+
+    // Add members to the group if specified
+    if (data.member_ids && data.member_ids.length > 0) {
+      const membersToAdd = data.member_ids.map(user_id => ({
+        conversation_id: group.id,
+        user_id,
+        role: (user_id === admin_user_id ? "admin" : "member") as ChatRoleType,
+      }));
+
+      await db.insert(conversation_member_model).values(membersToAdd);
+    }
 
     return {
       success: true,
@@ -543,6 +459,20 @@ const update_community_group = async (
   data: UpdateCommunityGroupRequest
 ) => {
   try {
+    // Check if user is admin or sub_admin
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, admin_user_id));
+
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+      return {
+        success: false,
+        code: 403,
+        message: "Only admins and sub admins can update community groups",
+      };
+    }
+
     // Get current group data
     const [group] = await db
       .select({
@@ -568,25 +498,6 @@ const update_community_group = async (
     }
 
     const currentMetadata = group.metadata as CommunityGroupMetadata;
-    
-    // Check if user is admin of the community
-    const [membership] = await db
-      .select({ role: community_member_model.role })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, currentMetadata.community_id!),
-          eq(community_member_model.user_id, admin_user_id)
-        )
-      );
-
-    if (!membership || membership.role !== "admin") {
-      return {
-        success: false,
-        code: 403,
-        message: "Only community admins can update groups",
-      };
-    }
 
     // Update metadata
     const updatedMetadata: CommunityGroupMetadata = {
@@ -624,26 +535,35 @@ const update_community_group = async (
 
 const get_community_groups = async (community_id: number, user_id: number) => {
   try {
-    // Check if user is member of community
-    const [membership] = await db
-      .select({ role: community_member_model.role })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, community_id),
-          eq(community_member_model.user_id, user_id),
-          eq(community_member_model.deleted, false)
-        )
-      );
+    // Check if user is admin or sub_admin
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, user_id));
 
-    if (!membership) {
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
       return {
         success: false,
         code: 403,
-        message: "You are not a member of this community",
+        message: "Only admins and sub admins can view community groups",
       };
     }
 
+    // Get community to get group_ids
+    const [community] = await db
+      .select({ group_ids: community_model.group_ids })
+      .from(community_model)
+      .where(eq(community_model.id, community_id));
+
+    if (!community || !community.group_ids || community.group_ids.length === 0) {
+      return {
+        success: true,
+        code: 200,
+        data: [],
+      };
+    }
+
+    // Get groups by IDs
     const groups = await db
       .select({
         id: conversation_model.id,
@@ -656,7 +576,7 @@ const get_community_groups = async (community_id: number, user_id: number) => {
       .where(
         and(
           eq(conversation_model.type, "community_group"),
-          sql`${conversation_model.metadata}->>'community_id' = ${community_id.toString()}`,
+          inArray(conversation_model.id, community.group_ids),
           eq(conversation_model.deleted, false)
         )
       )
@@ -682,6 +602,20 @@ const delete_community_group = async (
   admin_user_id: number
 ) => {
   try {
+    // Check if user is admin or sub_admin
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, admin_user_id));
+
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+      return {
+        success: false,
+        code: 403,
+        message: "Only admins and sub admins can delete community groups",
+      };
+    }
+
     // Get group data
     const [group] = await db
       .select({
@@ -705,24 +639,26 @@ const delete_community_group = async (
     }
 
     const metadata = group.metadata as CommunityGroupMetadata;
-    
-    // Check if user is admin of the community
-    const [membership] = await db
-      .select({ role: community_member_model.role })
-      .from(community_member_model)
-      .where(
-        and(
-          eq(community_member_model.community_id, metadata.community_id!),
-          eq(community_member_model.user_id, admin_user_id)
-        )
-      );
 
-    if (!membership || membership.role !== "admin") {
-      return {
-        success: false,
-        code: 403,
-        message: "Only community admins can delete groups",
-      };
+    // Remove the group from the community's group_ids
+    if (metadata.community_id) {
+      const [community] = await db
+        .select({ group_ids: community_model.group_ids })
+        .from(community_model)
+        .where(eq(community_model.id, metadata.community_id));
+
+      if (community) {
+        const currentGroupIds = community.group_ids || [];
+        const newGroupIds = currentGroupIds.filter(id => id !== conversation_id);
+
+        await db
+          .update(community_model)
+          .set({
+            group_ids: newGroupIds,
+            updated_at: new Date()
+          })
+          .where(eq(community_model.id, metadata.community_id));
+      }
     }
 
     // Soft delete the group
@@ -752,9 +688,8 @@ export {
   get_community_details,
   update_community,
   delete_community,
-  add_community_members,
-  remove_community_members,
-  get_community_members,
+  add_community_groups,
+  remove_community_groups,
   create_community_group,
   update_community_group,
   get_community_groups,

@@ -1,6 +1,9 @@
 import jwt from "jsonwebtoken";
 import { ElysiaMiddlewareType } from "@/types/elysia.types";
 import { RoleType } from "../types/user.types";
+import { user_model } from "@/models/user.model";
+import db from "@/config/db";
+import { eq } from "drizzle-orm";
 
 const secretKey = process.env.ACCESS_KEY || "heymama";
 
@@ -58,4 +61,77 @@ export const app_middleware = ({ cookie, headers, allowed }: ElysiaMiddlewareTyp
     data: middleware_response.data
   };
 }
+
+export const check_permission = async (userId: number, requiredPermission: string) => {
+  try {
+    const user = await db
+      .select({
+        role: user_model.role,
+        permissions: user_model.permissions,
+        online_status: user_model.online_status,
+      })
+      .from(user_model)
+      .where(eq(user_model.id, userId))
+      .limit(1);
+
+    if (user.length === 0) {
+      return {
+        success: false,
+        code: 404,
+        message: "User not found",
+      };
+    }
+
+    const userData = user[0];
+
+    // Super admin has all permissions
+    if (userData.role === "admin") {
+      return {
+        success: true,
+        code: 200,
+        message: "Permission granted",
+      };
+    }
+
+    // Check if sub-admin is active
+    if (userData.role === "sub_admin" && !userData.online_status) {
+      return {
+        success: false,
+        code: 403,
+        message: "Account is inactive",
+      };
+    }
+
+    // Check if sub-admin has the required permission
+    if (userData.role === "sub_admin") {
+      const permissions = userData.permissions as string[] || [];
+      if (permissions.includes(requiredPermission)) {
+        return {
+          success: true,
+          code: 200,
+          message: "Permission granted",
+        };
+      } else {
+        return {
+          success: false,
+          code: 403,
+          message: "Insufficient permissions",
+        };
+      }
+    }
+
+    return {
+      success: false,
+      code: 403,
+      message: "Access denied",
+    };
+  } catch (error) {
+    console.error("Error checking permission:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Internal server error",
+    };
+  }
+};
 

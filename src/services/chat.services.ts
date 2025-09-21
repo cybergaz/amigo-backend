@@ -10,7 +10,7 @@ import {
   ChatRoleType,
 } from "@/types/chat.types";
 import { create_dm_key, create_unique_id } from "@/utils/general.utils";
-import { and, arrayContains, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, arrayContains, asc, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 
 const create_chat = async (sender_id: number, receiver_id: number) => {
   try {
@@ -211,6 +211,75 @@ const get_chat_list = async (user_id: number, type: string) => {
   }
 };
 
+const get_group_info = async (conversation_id: number) => {
+  try {
+    const [group] = await db
+      .select({
+        conversation_id: conversation_model.id,
+        type: conversation_model.type,
+        title: conversation_model.title,
+        metadata: conversation_model.metadata,
+        lastMessageAt: conversation_model.last_message_at,
+
+        createrId: user_model.id,
+        createrName: user_model.name,
+        createrProfilePic: user_model.profile_pic,
+      })
+      .from(conversation_model)
+      .leftJoin(
+        user_model,
+        eq(user_model.id, conversation_model.creater_id)
+      )
+      .where(
+        and(
+          eq(conversation_model.id, conversation_id),
+          eq(conversation_model.type, "group")
+        )
+      )
+      .limit(1);
+
+    if (!group) {
+      return {
+        success: false,
+        code: 404,
+        message: "Group not found",
+      };
+    }
+
+    const members = await db
+      .select({
+        userId: user_model.id,
+        userName: user_model.name,
+        userProfilePic: user_model.profile_pic,
+        role: conversation_member_model.role,
+        joinedAt: conversation_member_model.joined_at,
+      })
+      .from(conversation_member_model)
+      .innerJoin(
+        user_model,
+        eq(user_model.id, conversation_member_model.user_id)
+      )
+      .where(eq(conversation_member_model.conversation_id, conversation_id))
+      .orderBy(asc(conversation_member_model.joined_at));
+
+    return {
+      success: true,
+      code: 200,
+      data: {
+        group: group,
+        members,
+      },
+    };
+  } catch (error) {
+    console.error("get_group_info error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : get_group_info",
+    };
+  }
+}
+
 const create_group = async (
   creater_id: number,
   title: string,
@@ -254,39 +323,74 @@ const create_group = async (
 };
 
 
+
 const add_new_member = async (
   conversation_id: number,
-  user_id: number,
+  user_ids: number[],
   role: ChatRoleType = "member"
 ) => {
   try {
-    const [member] = await db
-      .insert(conversation_member_model)
-      .values({
-        conversation_id,
-        user_id,
-        role,
-      })
-      .onConflictDoNothing({ target: [conversation_member_model.conversation_id, conversation_member_model.user_id] })
-      .returning();
+    // 1. Filter valid users
+    const validUsers = await db
+      .select({ id: user_model.id })
+      .from(user_model)
+      .where(inArray(user_model.id, user_ids));
 
-    if (!member) {
+    const validUserIds = validUsers.map((u) => u.id);
+    const invalidUserIds = user_ids.filter((id) => !validUserIds.includes(id));
+
+    if (validUserIds.length === 0) {
       return {
-        success: true,
-        code: 200,
-        message: "Member already exists in the conversation",
-        data: { conversation_id, user_id, existing: true },
+        success: false,
+        code: 400,
+        message: "No valid users found",
+        data: { inserted: [], existing: [], invalid: invalidUserIds },
       };
+    }
+
+    // 2. Find already existing members
+    const existingMembers = await db
+      .select({ user_id: conversation_member_model.user_id })
+      .from(conversation_member_model)
+      .where(
+        and(
+          inArray(conversation_member_model.user_id, validUserIds),
+          eq(conversation_member_model.conversation_id, conversation_id)
+        )
+      )
+
+    const existingIds = existingMembers.map((m) => m.user_id);
+
+    // 3. Eligible new members = valid - existing
+    const eligibleIds = validUserIds.filter((id) => !existingIds.includes(id));
+
+    // 4. Insert eligible members
+    let inserted: typeof conversation_member_model.$inferSelect[] = [];
+    if (eligibleIds.length > 0) {
+      inserted = await db
+        .insert(conversation_member_model)
+        .values(
+          eligibleIds.map((id) => ({
+            conversation_id,
+            user_id: id,
+            role,
+          }))
+        )
+        .returning();
     }
 
     return {
       success: true,
       code: 200,
-      message: "Member added successfully",
-      data: member
+      message: "Processed members",
+      data: {
+        inserted,          // ✅ actually added
+        existing: existingIds, // ⚠️ already in conversation
+        invalid: invalidUserIds, // ❌ not real users
+      },
     };
-
   } catch (error) {
+    console.log("error ->", error);
     return {
       success: false,
       code: 500,
@@ -498,17 +602,28 @@ const get_conversation_history = async (
 ) => {
   try {
     // First, verify user is a member of this conversation
-    const membership = await db
-      .select({ id: conversation_member_model.id })
+    const members = await db
+      .select({
+        user_id: conversation_member_model.user_id,
+        last_read_message_id: conversation_member_model.last_read_message_id,
+        last_delivered_message_id: conversation_member_model.last_delivered_message_id,
+      })
       .from(conversation_member_model)
       .where(
         and(
           eq(conversation_member_model.conversation_id, conversation_id),
-          eq(conversation_member_model.user_id, user_id)
         )
       );
 
-    if (membership.length === 0) {
+    if (members.length === 0) {
+      return {
+        success: false,
+        code: 404,
+        message: "Conversation not found",
+      };
+    }
+
+    if (!members.find(m => m.user_id === user_id)) {
       return {
         success: false,
         code: 403,
@@ -578,6 +693,7 @@ const get_conversation_history = async (
       code: 200,
       data: {
         messages: messages.reverse(), // Reverse to show oldest first
+        members,
         pagination: {
           currentPage: page,
           totalPages,
@@ -599,4 +715,237 @@ const get_conversation_history = async (
   }
 };
 
-export { create_chat, get_chat_list, create_group, add_new_member, remove_member, update_group_title, delete_conversation, mark_as_delete_conversation, mark_as_delete_message, get_conversation_history };
+// Admin-specific functions for managing all chats
+const get_all_conversations_admin = async (type?: string) => {
+  try {
+    let whereCondition = eq(conversation_model.deleted, false);
+    
+    if (type && type !== "all") {
+      whereCondition = and(
+        eq(conversation_model.deleted, false),
+        eq(conversation_model.type, type)
+      );
+    }
+
+    const conversations = await db
+      .select({
+        conversationId: conversation_model.id,
+        type: conversation_model.type,
+        title: conversation_model.title,
+        metadata: conversation_model.metadata,
+        lastMessageAt: conversation_model.last_message_at,
+        created_at: conversation_model.created_at,
+        createrId: conversation_model.creater_id,
+        
+        // Creator info
+        createrName: user_model.name,
+        createrProfilePic: user_model.profile_pic,
+      })
+      .from(conversation_model)
+      .leftJoin(
+        user_model,
+        eq(user_model.id, conversation_model.creater_id)
+      )
+      .where(whereCondition)
+      .orderBy(desc(conversation_model.last_message_at));
+
+    // Get member counts for each conversation
+    const conversationsWithMembers = await Promise.all(
+      conversations.map(async (conv) => {
+        const memberCount = await db
+          .select({ count: sql<number>`count(*)` })
+          .from(conversation_member_model)
+          .where(
+            and(
+              eq(conversation_member_model.conversation_id, conv.conversationId),
+              eq(conversation_member_model.deleted, false)
+            )
+          );
+        
+        return {
+          ...conv,
+          memberCount: memberCount[0]?.count || 0
+        };
+      })
+    );
+
+    return {
+      success: true,
+      code: 200,
+      data: conversationsWithMembers,
+    };
+  } catch (error) {
+    console.error("get_all_conversations_admin error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : get_all_conversations_admin",
+    };
+  }
+};
+
+const get_conversation_members_admin = async (conversation_id: number) => {
+  try {
+    const members = await db
+      .select({
+        userId: user_model.id,
+        userName: user_model.name,
+        userProfilePic: user_model.profile_pic,
+        userEmail: user_model.email,
+        role: conversation_member_model.role,
+        joinedAt: conversation_member_model.joined_at,
+        unreadCount: conversation_member_model.unread_count,
+      })
+      .from(conversation_member_model)
+      .innerJoin(
+        user_model,
+        eq(user_model.id, conversation_member_model.user_id)
+      )
+      .where(
+        and(
+          eq(conversation_member_model.conversation_id, conversation_id),
+          eq(conversation_member_model.deleted, false)
+        )
+      )
+      .orderBy(asc(conversation_member_model.joined_at));
+
+    return {
+      success: true,
+      code: 200,
+      data: members,
+    };
+  } catch (error) {
+    console.error("get_conversation_members_admin error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : get_conversation_members_admin",
+    };
+  }
+};
+
+const get_conversation_history_admin = async (
+  conversation_id: number,
+  page: number = 1,
+  limit: number = 20
+) => {
+  try {
+    // Calculate offset for pagination
+    const offset = (page - 1) * limit;
+
+    // Get messages with sender information
+    const messages = await db
+      .select({
+        id: message_model.id,
+        conversation_id: message_model.conversation_id,
+        sender_id: message_model.sender_id,
+        type: message_model.type,
+        body: message_model.body,
+        attachments: message_model.attachments,
+        metadata: message_model.metadata,
+        edited_at: message_model.edited_at,
+        created_at: message_model.created_at,
+        deleted: message_model.deleted,
+        forwarded_from: message_model.forwarded_from,
+        forwarded_count: message_model.forwarded_to,
+
+        // Sender information
+        senderName: user_model.name,
+        senderProfilePic: user_model.profile_pic,
+      })
+      .from(message_model)
+      .leftJoin(
+        user_model,
+        eq(user_model.id, message_model.sender_id)
+      )
+      .where(eq(message_model.conversation_id, conversation_id))
+      .orderBy(desc(message_model.created_at))
+      .limit(limit)
+      .offset(offset);
+
+    // Get total count for pagination info
+    const totalCountResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(message_model)
+      .where(eq(message_model.conversation_id, conversation_id));
+
+    const totalCount = totalCountResult[0]?.count || 0;
+    const totalPages = Math.ceil(totalCount / limit);
+    const hasNextPage = page < totalPages;
+    const hasPreviousPage = page > 1;
+
+    return {
+      success: true,
+      code: 200,
+      data: {
+        messages: messages.reverse(), // Reverse to show oldest first
+        pagination: {
+          currentPage: page,
+          totalPages,
+          totalCount,
+          limit,
+          hasNextPage,
+          hasPreviousPage,
+        },
+      },
+    };
+
+  } catch (error) {
+    console.error("get_conversation_history_admin error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : get_conversation_history_admin",
+    };
+  }
+};
+
+const permanently_delete_message_admin = async (message_id: number) => {
+  try {
+    // Check if user is super admin (this should be verified at route level)
+    const result = await db
+      .delete(message_model)
+      .where(eq(message_model.id, message_id))
+      .returning();
+
+    if (result.length === 0) {
+      return {
+        success: false,
+        code: 404,
+        message: "Message not found",
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Message permanently deleted",
+      data: result[0],
+    };
+  } catch (error) {
+    console.error("permanently_delete_message_admin error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : permanently_delete_message_admin",
+    };
+  }
+};
+
+export { 
+  create_chat, 
+  get_chat_list, 
+  get_group_info, 
+  create_group, 
+  add_new_member, 
+  remove_member, 
+  update_group_title, 
+  delete_conversation, 
+  mark_as_delete_conversation, 
+  mark_as_delete_message, 
+  get_conversation_history,
+  get_all_conversations_admin,
+  get_conversation_members_admin,
+  get_conversation_history_admin,
+  permanently_delete_message_admin
+};
