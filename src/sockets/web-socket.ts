@@ -6,7 +6,7 @@ import { eq, and, or, sql } from 'drizzle-orm';
 import { ElysiaWS } from 'elysia/dist/ws';
 import { WebSocketData, TypedElysiaWS } from '@/types/elysia.types';
 import { user_model } from '@/models/user.model';
-import { pin_message, reply_to_message, star_messages } from '@/services/message-operations.services';
+import { forward_messages, pin_message, reply_to_message, star_messages, store_media } from '@/services/message-operations.services';
 
 // Connection management
 interface UserConnection {
@@ -21,7 +21,7 @@ const conversation_connections = new Map<number, Set<number>>(); // conversation
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'message' | 'typing' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete';
+  type: 'message' | 'typing' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media';
   data?: any;
   conversation_id?: number;
   message_ids?: number[];
@@ -30,6 +30,7 @@ interface WSMessage {
 
 interface ChatMessage {
   id: number;
+  optimistic_id?: string;
   conversation_id: number;
   sender_id: number;
   type: string;
@@ -149,10 +150,7 @@ const leave_conversation = (user_id: number, conversation_id: number) => {
 };
 
 const broadcast_to_conversation = (conversation_id: number, message: WSMessage, exclude_user?: number) => {
-  console.log("broadcast started")
-  console.log("conversation_connections ->", conversation_connections)
   const conv_connections = conversation_connections.get(conversation_id);
-  console.log(`conv_connections for ${conversation_id} ->`, conv_connections)
   if (!conv_connections) return;
 
   const message_str = JSON.stringify(message);
@@ -166,7 +164,6 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
     if (connection && connection.ws.readyState === 1) {
       try {
         connection.ws.send(message_str);
-        console.log("msg sent to ->", getUserId(connection.ws))
         sent_count++;
       } catch (error) {
         console.error(`[WS] Error sending to user ${user_id}:`, error);
@@ -220,6 +217,7 @@ const web_socket = new Elysia()
       data: t.Optional(t.Any()),
       conversation_id: t.Optional(t.Number()),
       message_ids: t.Optional(t.Array(t.Number())),
+      user_id: t.Optional(t.Number()), // for certain actions like reply where user_id may differ
       timestamp: t.Optional(t.String())
     }),
 
@@ -375,7 +373,8 @@ const web_socket = new Elysia()
 
                 const chat_message: ChatMessage = {
                   id: saved_message.id,
-                  conversation_id: saved_message.conversation_id,
+                  optimistic_id: message.data.optimistic_id || undefined, // echo back optimistic_id if provided
+                  conversation_id: saved_message.conversation_id!,
                   sender_id: saved_message.sender_id,
                   type: saved_message.type,
                   body: saved_message.body || undefined,
@@ -392,7 +391,7 @@ const web_socket = new Elysia()
                   conversation_id: message.conversation_id,
                   message_ids: [saved_message.id],
                   timestamp: new Date().toISOString()
-                }, user_id);
+                });
 
                 // Update conversation last_message_at
                 await db
@@ -453,7 +452,10 @@ const web_socket = new Elysia()
                 timestamp: new Date().toISOString(),
               }, user_id);
 
-              await pin_message({ message_id: message.message_ids[0], conversation_id: message.conversation_id }, user_id)
+              await pin_message({
+                message_id: message.message_ids[0],
+                conversation_id: message.conversation_id
+              }, user_id)
             }
             break;
 
@@ -471,7 +473,10 @@ const web_socket = new Elysia()
                 timestamp: new Date().toISOString()
               }, user_id);
 
-              await star_messages({ message_ids: message.message_ids, conversation_id: message.conversation_id }, user_id)
+              await star_messages({
+                message_ids: message.message_ids,
+                conversation_id: message.conversation_id
+              }, user_id)
             }
             break;
 
@@ -504,47 +509,81 @@ const web_socket = new Elysia()
                   timestamp: new Date().toISOString()
                 }, user_id);
               }
-
-
             }
             break;
 
           case 'message_forward':
-            if (message.data) {
-              // Forward is handled via REST API, this broadcasts the forward notification
-              // Broadcast to target conversation
-              if (message.data.target_conversation_id) {
-                broadcast_to_conversation(message.data.target_conversation_id, {
-                  type: 'message_forward',
-                  data: {
-                    user_id,
-                    source_conversation_id: message.data.source_conversation_id,
-                    message_ids: (message as any).message_ids,
-                    forwarded_message_ids: message.data.forwarded_message_ids
-                  },
-                  conversation_id: message.data.target_conversation_id,
-                  message_ids: message.data.forwarded_message_ids,
-                  timestamp: new Date().toISOString()
-                }, user_id);
+            if (message.message_ids && message.data) {
+              console.log("data ->", message.data)
+
+              const forward_res = await forward_messages({
+                message_ids: message.message_ids,
+                source_conversation_id: message.data.source_conversation_id,
+                target_conversation_ids: message.data.target_conversation_ids
+              }, user_id)
+
+
+              if (forward_res.success && message.data.target_conversation_ids) {
+                for (const target_conversation_id of message.data.target_conversation_ids) {
+                  console.log("forwarding to  ->", target_conversation_id)
+                  broadcast_to_conversation(target_conversation_id, {
+                    type: 'message_forward',
+                    data: {
+                      user_id,
+                      source_conversation_id: message.data.source_conversation_id,
+                      forwarded_message_ids: message.data.forwarded_message_ids
+                    },
+                    conversation_id: message.data.target_conversation_id,
+                    message_ids: message.data.forwarded_message_ids,
+                    timestamp: new Date().toISOString()
+                  }, user_id);
+                }
               }
             }
             break;
 
-          case 'message_delete':
-            if (message.conversation_id && message.message_ids && message.data) {
+          // case 'message_delete':
+          //   if (message.conversation_id && message.message_ids && message.data) {
+          //
+          //     // ------------------------------------------------------------------
+          //     // store deleted_by in the metadata so that other person can see
+          //     // ------------------------------------------------------------------
+          //     broadcast_to_conversation(message.conversation_id, {
+          //       type: 'message_delete',
+          //       data: { user_id },
+          //       conversation_id: message.conversation_id,
+          //       message_ids: message.message_ids,
+          //       timestamp: new Date().toISOString()
+          //     }, user_id);
+          //   }
+          //   break;
 
-              // ------------------------------------------------------------------
-              // store deleted_by in the metadata so that other person can see
-              // ------------------------------------------------------------------
-              broadcast_to_conversation(message.conversation_id, {
-                type: 'message_delete',
-                data: {
-                  user_id,
-                },
+          case 'media':
+            if (message.conversation_id && message.data) {
+              // console.log("conversation_id ->", message.conversation_id, "data ->", message.data)
+
+              const media_res = await store_media({
                 conversation_id: message.conversation_id,
-                message_ids: message.message_ids,
-                timestamp: new Date().toISOString()
+                url: message.data.url,
+                key: message.data.key,
+                mime_type: message.data.mime_type,
+                file_name: message.data.file_name,
+                file_size: message.data.file_size,
+                category: message.data.category
               }, user_id);
+
+              if (media_res.success) {
+                broadcast_to_conversation(message.conversation_id, {
+                  type: 'media',
+                  data: {
+                    user_id,
+                    ...message.data,
+                    media_message_id: media_res.data?.id
+                  },
+                  conversation_id: message.conversation_id,
+                  timestamp: new Date().toISOString()
+                }, user_id);
+              }
             }
             break;
 

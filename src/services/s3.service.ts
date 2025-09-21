@@ -27,9 +27,10 @@ export const FILE_TYPE_MAPPINGS = {
   "audio/mpeg": S3_FOLDERS.AUDIOS,
   "audio/mp3": S3_FOLDERS.AUDIOS,
   "audio/wav": S3_FOLDERS.AUDIOS,
+  "audio/x-wav": S3_FOLDERS.AUDIOS,
   "audio/ogg": S3_FOLDERS.AUDIOS,
   "audio/aac": S3_FOLDERS.AUDIOS,
-  "audio/m4a": S3_FOLDERS.AUDIOS,
+  "audio/x-m4a": S3_FOLDERS.AUDIOS,
   "audio/flac": S3_FOLDERS.AUDIOS,
 
   // Video files

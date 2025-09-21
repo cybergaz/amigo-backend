@@ -1,4 +1,4 @@
-const CHAT_TYPE_CONSTS = ["dm", "group"] as const;
+const CHAT_TYPE_CONSTS = ["dm", "group", "community_group"] as const;
 type ChatType = typeof CHAT_TYPE_CONSTS[number];
 
 const MESSAGE_TYPE_CONSTS = ["text", "system", "attachment", "reaction"] as const;
@@ -93,7 +93,7 @@ interface ReplyMessageRequest {
 interface ForwardMessageRequest {
   message_ids: number[];
   source_conversation_id: number;
-  target_conversation_id: number;
+  target_conversation_ids: number[];
 }
 
 interface DeleteMessageRequest {
@@ -101,6 +101,17 @@ interface DeleteMessageRequest {
   conversation_id: number;
   // delete_for_everyone?: boolean; // true = delete for all, false = delete for me only
 }
+
+interface MediaMetadataRequest {
+  conversation_id: number;
+  url: string;
+  key: string;
+  category: string; // e.g. "images", "docs"
+  file_name: string;
+  file_size: number;
+  mime_type: string;
+}
+
 
 export { CHAT_TYPE_CONSTS, MESSAGE_TYPE_CONSTS, CHAT_ROLE_CONST, MESSAGE_OPERATION_CONSTS };
 export type {
@@ -115,5 +126,6 @@ export type {
   StarMessageRequest,
   ReplyMessageRequest,
   ForwardMessageRequest,
-  DeleteMessageRequest
+  DeleteMessageRequest,
+  MediaMetadataRequest
 };

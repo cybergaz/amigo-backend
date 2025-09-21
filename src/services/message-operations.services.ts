@@ -12,7 +12,8 @@ import {
   StarMessageRequest,
   ReplyMessageRequest,
   ForwardMessageRequest,
-  DeleteMessageRequest
+  DeleteMessageRequest,
+  MediaMetadataRequest
 } from "@/types/chat.types";
 import { create_unique_id } from "@/utils/general.utils";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
@@ -345,40 +346,38 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: number) =
 const forward_messages = async (request: ForwardMessageRequest, user_id: number) => {
   try {
     // Verify user membership in both conversations
-    const sourceMembership = await verify_user_membership(request.source_conversation_id, user_id);
-    const targetMembership = await verify_user_membership(request.target_conversation_id, user_id);
-
-    if (!sourceMembership || !targetMembership) {
-      return {
-        success: false,
-        code: 403,
-        message: "You are not a member of one or both conversations",
-      };
-    }
+    // const sourceMembership = await verify_user_membership(request.source_conversation_id, user_id);
+    // const targetMembership = await verify_user_membership(request.target_conversation_id, user_id);
+    //
+    // if (!sourceMembership || !targetMembership) {
+    //   return {
+    //     success: false,
+    //     code: 403,
+    //     message: "You are not a member of one or both conversations",
+    //   };
+    // }
 
     // Get user info
-    const user = await get_user_info(user_id);
-    if (!user) {
-      return {
-        success: false,
-        code: 404,
-        message: "User not found",
-      };
-    }
+    // const user = await get_user_info(user_id);
+    // if (!user) {
+    //   return {
+    //     success: false,
+    //     code: 404,
+    //     message: "User not found",
+    //   };
+    // }
 
     // Get messages to forward
-    const messages = await db
+    const original_messages = await db
       .select({
         id: message_model.id,
         body: message_model.body,
         attachments: message_model.attachments,
         type: message_model.type,
         sender_id: message_model.sender_id,
-        sender_name: user_model.name,
         created_at: message_model.created_at
       })
       .from(message_model)
-      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
       .where(
         and(
           inArray(message_model.id, request.message_ids),
@@ -388,7 +387,7 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
       )
       .orderBy(message_model.created_at);
 
-    if (messages.length === 0) {
+    if (original_messages.length === 0) {
       return {
         success: false,
         code: 404,
@@ -398,7 +397,7 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
 
     // Create forwarded messages
     const forwardedMessages = [];
-    for (const message of messages) {
+    for (const message of original_messages) {
       const forwardMetadata: MessageMetadata = {
         forwarded_from: {
           original_message_id: message.id,
@@ -412,8 +411,8 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
       const [forwardedMessage] = await db
         .insert(message_model)
         .values({
-          id: create_unique_id(),
-          conversation_id: request.target_conversation_id,
+          forwarded_from: request.source_conversation_id,
+          forwarded_to: request.target_conversation_ids,
           sender_id: user_id,
           type: message.type,
           body: message.body,
@@ -429,7 +428,7 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
     await db
       .update(conversation_model)
       .set({ last_message_at: new Date() })
-      .where(eq(conversation_model.id, request.target_conversation_id));
+      .where(inArray(conversation_model.id, request.target_conversation_ids));
 
     return {
       success: true,
@@ -670,6 +669,44 @@ const get_starred_messages = async (user_id: number, conversation_id?: number) =
   }
 };
 
+const store_media = async (request: MediaMetadataRequest, user_id: number) => {
+  try {
+
+    const { conversation_id, ...rest_of_the_request } = request;
+
+    const [media] = await db
+      .insert(message_model)
+      .values({
+        conversation_id: request.conversation_id,
+        sender_id: user_id,
+        type: "attachment",
+        attachments: rest_of_the_request || null,
+      })
+      .returning();
+
+    // Update conversation's last_message_at
+    await db
+      .update(conversation_model)
+      .set({ last_message_at: new Date() })
+      .where(eq(conversation_model.id, request.conversation_id));
+
+    return {
+      success: true,
+      code: 200,
+      message: "Media message stored successfully",
+      data: media,
+    };
+
+  } catch (error) {
+    console.error("store_media error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: store_media",
+    };
+  }
+}
+
 export {
   pin_message,
   star_messages,
@@ -677,5 +714,6 @@ export {
   forward_messages,
   delete_messages,
   get_pinned_messages,
-  get_starred_messages
+  get_starred_messages,
+  store_media
 };

@@ -1,1 +1,0 @@
-ALTER TABLE "conversation_members" ALTER COLUMN "role" DROP NOT NULL;

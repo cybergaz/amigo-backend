@@ -8,7 +8,9 @@ import {
   remove_member,
   update_group_title,
   delete_conversation,
-  get_conversation_history
+  get_conversation_history,
+  mark_as_delete_message,
+  mark_as_delete_conversation
 } from "@/services/chat.services";
 import {
   pin_message,
@@ -44,11 +46,18 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     })
   })
 
-  .get("/get-chat-list", async ({ set, store }) => {
-    const chats_result = await get_chat_list(store.id);
+  .get("/get-chat-list/:type", async ({ set, store, params }) => {
+    const chats_result = await get_chat_list(store.id, params.type ? params.type : "all");
     set.status = chats_result.code;
     return chats_result;
-  })
+  },
+    {
+      params: t.Optional(
+        t.Object({ type: t.String() })
+      )
+    }
+
+  )
 
   .post("/create-group", async ({ set, store, body }) => {
     const group_result = await create_group(store.id, body.title, body.member_ids);
@@ -116,12 +125,33 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   })
 
   .delete("/delete-conversation/:conversation_id", async ({ set, store, params }) => {
-    const delete_result = await delete_conversation(params.conversation_id);
+    const delete_result = await delete_conversation(params.conversation_id, store.id);
     set.status = delete_result.code;
     return delete_result;
   }, {
     params: t.Object({
       conversation_id: t.Number()
+    })
+  })
+
+  .delete("/mark-as-delete-conversation/:conversation_id", async ({ set, store, params }) => {
+    const delete_result = await mark_as_delete_conversation(params.conversation_id, store.id);
+    set.status = delete_result.code;
+    return delete_result;
+  }, {
+    params: t.Object({
+      conversation_id: t.Number()
+    })
+  })
+
+  .delete("/mark-as-delete-message", async ({ set, store, body }) => {
+    console.log("body ->", body)
+    const delete_result = await mark_as_delete_message(body.message_ids, store.id);
+    set.status = delete_result.code;
+    return delete_result;
+  }, {
+    body: t.Object({
+      message_ids: t.Array(t.Number())
     })
   })
 
@@ -169,7 +199,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     body: t.Object({
       message_ids: t.Array(t.Number()),
       source_conversation_id: t.Number(),
-      target_conversation_id: t.Number()
+      target_conversation_ids: t.Array(t.Number())
     })
   })
 

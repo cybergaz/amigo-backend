@@ -1,5 +1,5 @@
 import db from "@/config/db";
-import { user_model } from "@/models/user.model";
+import { UpdateUserType, user_model } from "@/models/user.model";
 import { RoleType } from "@/types/user.types";
 import {
   create_unique_id,
@@ -162,20 +162,13 @@ export const get_user_details = async (id: number) => {
   }
 };
 
-export const update_user_details = async (id: number, body: any) => {
+export const update_user_details = async (id: number, body: UpdateUserType) => {
   try {
-    if (!id) {
-      return {
-        success: false,
-        code: 400,
-        message: "Invalid request",
-        data: null,
-      };
-    }
     const user_details = await db
       .update(user_model)
       .set(body)
       .where(eq(user_model.id, id));
+
     return {
       success: true,
       code: 200,

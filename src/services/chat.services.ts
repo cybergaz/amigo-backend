@@ -5,11 +5,12 @@ import {
   message_model,
 } from "@/models/chat.model";
 import { user_model } from "@/models/user.model";
-import { 
-  ChatRoleType, 
+import user_routes from "@/routes/user.routes";
+import {
+  ChatRoleType,
 } from "@/types/chat.types";
 import { create_dm_key, create_unique_id } from "@/utils/general.utils";
-import { and, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, arrayContains, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
 
 const create_chat = async (sender_id: number, receiver_id: number) => {
   try {
@@ -89,7 +90,7 @@ const create_chat = async (sender_id: number, receiver_id: number) => {
   }
 };
 
-const get_chat_list = async (user_id: number) => {
+const get_chat_list = async (user_id: number, type: string) => {
   try {
     const conversationIdsRes = await db
       .select({ conversationId: conversation_member_model.conversation_id })
@@ -110,7 +111,7 @@ const get_chat_list = async (user_id: number) => {
         unreadCount: conversation_member_model.unread_count,
         joinedAt: conversation_member_model.joined_at,
 
-        // from user_model
+        // from user_model - for DMs, this will be the other user
         userId: user_model.id,
         userName: user_model.name,
         lastSeen: user_model.last_seen,
@@ -121,19 +122,73 @@ const get_chat_list = async (user_id: number) => {
         conversation_model,
         eq(conversation_model.id, conversation_member_model.conversation_id)
       )
-      .innerJoin(
+      .leftJoin(
         user_model,
-        eq(user_model.id, conversation_member_model.user_id)
+        and(
+          eq(user_model.id, conversation_member_model.user_id),
+          ne(user_model.id, user_id) // Only join with other users for DMs
+        )
       )
       .where(
         and(
           inArray(conversation_model.id, conversationIds),
-          ne(user_model.id, user_id)
+          eq(conversation_member_model.user_id, user_id), // Get user's own membership record
+          type !== "all" ?
+            type === "group"
+              ? eq(conversation_model.type, "group")
+              : eq(conversation_model.type, "dm")
+            : eq(conversation_model.deleted, false)
         )
       )
       .orderBy(desc(conversation_model.last_message_at));
 
-    if (chats.length === 0) {
+    // For groups and community groups, we don't need the other user info
+    // For DMs, we need to get the other user's info separately
+    const processedChats = await Promise.all(
+      chats.map(async (chat) => {
+        if (chat.type === "dm" && !chat.userId) {
+          // Get the other user for DM
+          const [otherUser] = await db
+            .select({
+              userId: user_model.id,
+              userName: user_model.name,
+              lastSeen: user_model.last_seen,
+              userProfilePic: user_model.profile_pic,
+            })
+            .from(conversation_member_model)
+            .innerJoin(user_model, eq(user_model.id, conversation_member_model.user_id))
+            .where(
+              and(
+                eq(conversation_member_model.conversation_id, chat.conversationId),
+                ne(conversation_member_model.user_id, user_id)
+              )
+            );
+
+          return {
+            ...chat,
+            userId: otherUser?.userId || null,
+            userName: otherUser?.userName || null,
+            lastSeen: otherUser?.lastSeen || null,
+            userProfilePic: otherUser?.userProfilePic || null,
+          };
+        }
+
+        // For groups and community groups, clear user info since it's not relevant
+        if (chat.type === "group" || chat.type === "community_group") {
+          return {
+            ...chat,
+            userId: null,
+            userName: null,
+            lastSeen: null,
+            userProfilePic: null,
+          };
+        }
+
+        return chat;
+      })
+    );
+
+    if (processedChats.length === 0) {
       return {
         success: false,
         code: 404,
@@ -144,9 +199,10 @@ const get_chat_list = async (user_id: number) => {
     return {
       success: true,
       code: 200,
-      data: chats,
+      data: processedChats,
     };
   } catch (error) {
+    console.error("get_chat_list error:", error);
     return {
       success: false,
       code: 500,
@@ -314,11 +370,26 @@ const update_group_title = async (
   }
 }
 
-const delete_conversation = async (conversation_id: number) => {
+const delete_conversation = async (conversation_id: number, user_id: number) => {
   try {
+
+    // check if user role is admin
+    const [membership] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, user_id));
+
+    if (!membership || membership.role !== "admin") {
+      return {
+        success: false,
+        code: 403,
+        message: "You do not have permission to delete a conversation",
+      };
+    }
+
+
     const [conversation] = await db
-      .update(conversation_model)
-      .set({ deleted: true })
+      .delete(conversation_model)
       .where(eq(conversation_model.id, conversation_id))
       .returning();
 
@@ -344,6 +415,77 @@ const delete_conversation = async (conversation_id: number) => {
       success: false,
       code: 500,
       message: "ERROR : delete_conversation",
+    };
+  }
+};
+
+const mark_as_delete_conversation = async (conversation_id: number, user_id: number) => {
+  try {
+    const [conversation] = await db
+      .update(conversation_member_model)
+      .set({ deleted: true })
+      .where(eq(conversation_member_model.id, conversation_id))
+      .returning();
+
+    if (!conversation) {
+      return {
+        success: false,
+        code: 404,
+        message: "Conversation not found",
+        data: { conversation_id, deleted: false },
+      }
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Conversation marked as deleted successfully",
+      data: conversation
+    };
+
+  } catch (error) {
+    console.error("delete conversation error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : mark_as_delete_conversation",
+    };
+  }
+};
+
+const mark_as_delete_message = async (message_ids: number[], user_id: number) => {
+  try {
+    const messages = await db
+      .update(message_model)
+      .set({ deleted: true })
+      .where(and(
+        inArray(message_model.id, message_ids),
+        eq(message_model.sender_id, user_id)
+      ))
+
+    console.log("messages ->", messages)
+    if (!messages) {
+      return {
+        success: false,
+        code: 404,
+        message: "Either message not found or you do not own this message",
+        data: { message_id: message_ids, deleted: false },
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Messages marked as deleted successfully",
+      data: messages
+    };
+
+  } catch (error) {
+    console.error("delete Message error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : mark_as_delete_message",
     };
   }
 };
@@ -390,19 +532,24 @@ const get_conversation_history = async (
         edited_at: message_model.edited_at,
         created_at: message_model.created_at,
         deleted: message_model.deleted,
+        forwarded_from: message_model.forwarded_from,
+        forwarded_count: message_model.forwarded_to,
 
         // Sender information
-        sender_name: user_model.name,
-        sender_profile_pic: user_model.profile_pic,
+        // sender_name: user_model.name,
+        // sender_profile_pic: user_model.profile_pic,
       })
       .from(message_model)
-      .innerJoin(
-        user_model,
-        eq(user_model.id, message_model.sender_id)
-      )
+      // .innerJoin(
+      //   user_model,
+      //   eq(user_model.id, message_model.sender_id)
+      // )
       .where(
         and(
-          eq(message_model.conversation_id, conversation_id),
+          or(
+            eq(message_model.conversation_id, conversation_id),
+            arrayContains(message_model.forwarded_to, [conversation_id]),
+          ),
           eq(message_model.deleted, false)
         )
       )
@@ -452,4 +599,4 @@ const get_conversation_history = async (
   }
 };
 
-export { create_chat, get_chat_list, create_group, add_new_member, remove_member, update_group_title, delete_conversation, get_conversation_history };
+export { create_chat, get_chat_list, create_group, add_new_member, remove_member, update_group_title, delete_conversation, mark_as_delete_conversation, mark_as_delete_message, get_conversation_history };

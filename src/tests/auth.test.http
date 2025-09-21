@@ -122,9 +122,9 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MjU5NTAzMjU3M
 
 ### 
 
-GET http://localhost:5000/api/chat/get-chat-list HTTP/1.1
+GET http://localhost:5000/api/chat/get-chat-list/dm HTTP/1.1
 Content-Type: application/json
-Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Njg0Njc1NjY3NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTgwMTA0NDYsImV4cCI6MTc1ODA5Njg0Nn0.3ysXW1elf49Ta_gjqvEFDZsVJ_tYVgDeT95Lb1PVnec
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MjU5NTAzMjU3Miwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTgzNTkyMzYsImV4cCI6MTc1ODQ0NTYzNn0.IdAQQbv1twZrkoMHM6uE5Pnph70L9v0jytE8vvxANf8
 
 
 ### 
@@ -139,6 +139,13 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Njg0Njc1NjY3N
 GET http://localhost:5000/api/user/get-user HTTP/1.1
 Content-Type: application/json
 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MTk0MzgyNTQwMCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTgwMTAzNjgsImV4cCI6MTc1ODA5Njc2OH0.Ptw_XaTwtZoqHRRQf8rWqiSa6JhPloQ19QWIo8GWE_k
+
+
+### 
+
+GET http://localhost:5000/api/chat/get-conversation-history/322847238 HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Njg0Njc1NjY3NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTgzNzk5NDUsImV4cCI6MTc1ODQ2NjM0NX0.XP3Y2VqRWxf-jEhggZaEJEerEegz7OBYy-G36FBcS9s
 
 
 ### 

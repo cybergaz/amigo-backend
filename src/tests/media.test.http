@@ -20,13 +20,13 @@ Content-Type: application/pdf
 
 ### Image Upload
 
-POST http://localhost:5000/api/media/upload/image HTTP/1.1
+POST http://localhost:5000/api/media/upload HTTP/1.1
 Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6Njg0Njc1NjY3NCwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTgxODEyOTIsImV4cCI6MTc1ODI2NzY5Mn0.4rTXl-uzdThXsy-a-Sm3sCn_rwSWpHAiDcz_-7fgf1I
 
 ------WebKitFormBoundary7MA4YWxkTrZu0gW
 Content-Disposition: form-data; name="file"; filename="image.jpg"
-Content-Type: image/jpeg
+Content-Type: multipart/form-data
 
 < /home/gaz/Downloads/2025-08-27\ 00-11-30.png
 ------WebKitFormBoundary7MA4YWxkTrZu0gW--
@@ -62,7 +62,7 @@ Content-Type: video/mp4
 
 ### Document Upload
 
-POST http://localhost:5000/api/media/upload/document HTTP/1.1
+POST http://localhost:5000/api/media/upload HTTP/1.1
 Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
 Authorization: Bearer YOUR_ACCESS_TOKEN_HERE
 

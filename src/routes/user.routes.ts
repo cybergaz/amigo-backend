@@ -2,6 +2,7 @@ import { Elysia, t } from "elysia";
 import { get_available_users, get_user_details, update_user_details, update_profile_image } from "@/services/user.services";
 import { get_all_users } from "@/services/user.services";
 import { app_middleware } from "@/middleware";
+import { ROLE_CONST } from "@/types/user.types";
 
 const user_routes = new Elysia({ prefix: "/user" })
   .state({ id: 0, role: "" })
@@ -32,7 +33,7 @@ const user_routes = new Elysia({ prefix: "/user" })
       body: t.Object({
         name: t.Optional(t.String()),
         phone: t.Optional(t.String()),
-        role: t.Optional(t.String()),
+        role: t.Optional(t.Enum(Object.fromEntries(ROLE_CONST.map(x => [x, x])))),
         profile_pic: t.Optional(t.String()),
       }),
     }

@@ -26,26 +26,9 @@ const media_routes = new Elysia({ prefix: "/media" })
 
   // Generic file upload
   .post("/upload", async ({ set, store, body }) => {
-    try {
-      if (!body.file) {
-        set.status = 400;
-        return {
-          success: false,
-          message: "No file provided",
-        };
-      }
-
-      const result = await upload_media_file(store.id, body.file);
-      set.status = result.code;
-      return result;
-    } catch (error: any) {
-      console.error("Error in generic file upload:", error);
-      set.status = 500;
-      return {
-        success: false,
-        message: "Internal server error",
-      };
-    }
+    const result = await upload_media_file(store.id, body.file);
+    set.status = result.code;
+    return result;
   },
     {
       body: t.Object({

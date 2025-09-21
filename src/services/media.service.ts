@@ -1,12 +1,12 @@
-import { 
-  upload_file_to_s3, 
-  delete_image_from_s3, 
-  generate_file_key, 
+import {
+  upload_file_to_s3,
+  delete_image_from_s3,
+  generate_file_key,
   get_file_size_limit,
   is_valid_file_type,
   get_file_category,
   S3_FOLDERS,
-  type S3Folder 
+  type S3Folder
 } from "@/services/s3.service";
 
 export const upload_media_file = async (
@@ -14,6 +14,7 @@ export const upload_media_file = async (
   file: File,
   category?: S3Folder
 ) => {
+  console.log("incoming file ->", file)
   try {
     // Validate file type
     if (!is_valid_file_type(file.type)) {
@@ -70,9 +71,9 @@ export const upload_media_file = async (
         url: uploadResult.url,
         key: uploadResult.key,
         category: targetCategory,
-        fileName: file.name,
-        fileSize: file.size,
-        mimeType: file.type,
+        file_name: file.name,
+        file_size: file.size,
+        mime_type: file.type,
       },
     };
   } catch (error: any) {
@@ -113,14 +114,14 @@ export const delete_media_file = async (key: string) => {
 };
 
 // Specific upload functions for different media types
-export const upload_image = (userId: number, file: File) => 
+export const upload_image = (userId: number, file: File) =>
   upload_media_file(userId, file, S3_FOLDERS.IMAGES);
 
-export const upload_audio = (userId: number, file: File) => 
+export const upload_audio = (userId: number, file: File) =>
   upload_media_file(userId, file, S3_FOLDERS.AUDIOS);
 
-export const upload_video = (userId: number, file: File) => 
+export const upload_video = (userId: number, file: File) =>
   upload_media_file(userId, file, S3_FOLDERS.VIDEOS);
 
-export const upload_document = (userId: number, file: File) => 
+export const upload_document = (userId: number, file: File) =>
   upload_media_file(userId, file, S3_FOLDERS.DOCS);
