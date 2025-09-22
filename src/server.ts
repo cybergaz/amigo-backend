@@ -12,14 +12,14 @@ import web_socket from "./sockets/web-socket";
 import { hash_password, parse_phone } from "./utils/general.utils";
 import admin_routes from "./routes/admin.routes";
 
-const SERVER_PORT = process.env.SERVER_PORT;
+const SERVER_PORT = process.env.SERVER_PORT || 5000;
 if (!SERVER_PORT) {
   throw new Error("SERVER_PORT environment variable is not set");
 }
 const app = new Elysia({ prefix: "/api" })
   .get("/", () => "Elysia Server is running")
   .use(cors({
-    origin: ["http://192.168.137.1", "http://172.24.137.187", "http://localhost:3001", "http://localhost:3000"],
+    origin: [process.env.FRONTEND_URL || "http://localhost:3000"],
     credentials: true,
   }))
   .use(auth_routes)
@@ -33,7 +33,7 @@ const app = new Elysia({ prefix: "/api" })
   .listen(SERVER_PORT);
 
 console.log(
-  `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
+  `🦊 Elysia is running at port ${app.server?.port}`
 );
 
 // console.log(((await hash_password("Admin@123"))))

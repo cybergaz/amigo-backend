@@ -9,9 +9,7 @@ const db_connect = () => {
 
     const db = drizzle(process.env.DB_URL);
 
-    console.log(
-      `[DATABASE] -> Connected ${new Date().toLocaleString()}`
-    );
+    console.log(`🛢️  DB -> Connected `);
     return db;
 
   } catch (error) {
