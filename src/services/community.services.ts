@@ -13,7 +13,7 @@ import {
 } from "@/types/community.types";
 import { ChatRoleType } from "@/types/chat.types";
 import { create_unique_id } from "@/utils/general.utils";
-import { and, eq, inArray, sql, desc, arrayContains } from "drizzle-orm";
+import { and, eq, inArray, sql, desc, arrayContains, arrayOverlaps } from "drizzle-orm";
 
 // Community CRUD operations
 const create_community = async (
@@ -119,8 +119,9 @@ const get_connected_communities = async (user_id: number) => {
 
     if (userGroupIds.length === 0) {
       return {
-        success: true,
-        code: 200,
+        success: false,
+        code: 404,
+        message: "No connected communities",
         data: [],
       };
     }
@@ -140,7 +141,7 @@ const get_connected_communities = async (user_id: number) => {
       .where(
         and(
           eq(community_model.deleted, false),
-          arrayContains(community_model.group_ids, userGroupIds)
+          arrayOverlaps(community_model.group_ids, userGroupIds)
         )
       )
       .orderBy(desc(community_model.updated_at));

@@ -19,7 +19,7 @@ const active_calls = new Map<number, ActiveCall>();
 const user_calls = new Map<number, number>(); // user_id -> call_id
 
 export class CallService {
-  
+
   // Initialize a new call
   static async initiate_call(caller_id: number, callee_id: number, payload: CallInitPayload) {
     try {
@@ -39,7 +39,7 @@ export class CallService {
         .where(eq(user_model.id, callee_id))
         .limit(1);
 
-      console.log(`[CALL] Callee ${callee_id} found: ${!!callee}, call_access: ${callee?.call_access}`);
+      // console.log(`[CALL] Callee ${callee_id} found: ${!!callee}, call_access: ${callee?.call_access}`);
 
       if (!callee) {
         return {
@@ -86,7 +86,7 @@ export class CallService {
         await this.timeout_call(new_call.id);
       }, 30000);
 
-      console.log(`[CALL] Call initiated: ${new_call.id} from ${caller_id} to ${callee_id}`);
+      // console.log(`[CALL] Call initiated: ${new_call.id} from ${caller_id} to ${callee_id}`);
 
       return {
         success: true,
@@ -124,7 +124,7 @@ export class CallService {
 
       // Update call status
       active_call.status = 'answered';
-      
+
       // Update database
       await db
         .update(call_model)
@@ -134,7 +134,7 @@ export class CallService {
         })
         .where(eq(call_model.id, call_id));
 
-      console.log(`[CALL] Call accepted: ${call_id}`);
+      // console.log(`[CALL] Call accepted: ${call_id}`);
 
       return { success: true };
     } catch (error) {
@@ -174,7 +174,7 @@ export class CallService {
       // Remove from active calls
       this.cleanup_call(call_id);
 
-      console.log(`[CALL] Call declined: ${call_id}`);
+      // console.log(`[CALL] Call declined: ${call_id}`);
 
       return { success: true };
     } catch (error) {
@@ -229,11 +229,11 @@ export class CallService {
       // Remove from active calls
       this.cleanup_call(call_id);
 
-      console.log(`[CALL] Call ended: ${call_id}, duration: ${duration_seconds}s`);
+      // console.log(`[CALL] Call ended: ${call_id}, duration: ${duration_seconds}s`);
 
-      return { 
-        success: true, 
-        data: { duration_seconds } 
+      return {
+        success: true,
+        data: { duration_seconds }
       };
     } catch (error) {
       console.error('[CALL] Error ending call:', error);
@@ -260,7 +260,7 @@ export class CallService {
       // Remove from active calls
       this.cleanup_call(call_id);
 
-      console.log(`[CALL] Call timed out: ${call_id}`);
+      // console.log(`[CALL] Call timed out: ${call_id}`);
 
       return { success: true };
     } catch (error) {

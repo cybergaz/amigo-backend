@@ -14,7 +14,6 @@ export const upload_media_file = async (
   file: File,
   category?: S3Folder
 ) => {
-  console.log("incoming file ->", file)
   try {
     // Validate file type
     if (!is_valid_file_type(file.type)) {

@@ -42,7 +42,6 @@ class ChatWebSocketClient {
       this.ws = new WebSocket(wsUrl);
 
       this.ws.onopen = () => {
-        console.log('Connected to chat server');
         this.isConnected = true;
         this.reconnectAttempts = 0;
         this.startPingInterval();
@@ -58,10 +57,9 @@ class ChatWebSocketClient {
       };
 
       this.ws.onclose = (event) => {
-        console.log('Disconnected from chat server:', event.code, event.reason);
         this.isConnected = false;
         this.stopPingInterval();
-        
+
         // Attempt to reconnect if not a normal closure
         if (event.code !== 1000 && this.reconnectAttempts < this.maxReconnectAttempts) {
           this.scheduleReconnect();
@@ -80,9 +78,9 @@ class ChatWebSocketClient {
   private scheduleReconnect() {
     this.reconnectAttempts++;
     const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
-    
+
     console.log(`Attempting to reconnect in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
-    
+
     setTimeout(() => {
       this.connect();
     }, delay);

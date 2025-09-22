@@ -8,6 +8,7 @@ import { user_model } from "@/models/user.model";
 import user_routes from "@/routes/user.routes";
 import {
   ChatRoleType,
+  ChatType,
 } from "@/types/chat.types";
 import { create_dm_key, create_unique_id } from "@/utils/general.utils";
 import { and, arrayContains, asc, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
@@ -395,7 +396,6 @@ const add_new_member = async (
       },
     };
   } catch (error) {
-    console.log("error ->", error);
     return {
       success: false,
       code: 500,
@@ -572,7 +572,6 @@ const mark_as_delete_message = async (message_ids: number[], user_id: number) =>
         eq(message_model.sender_id, user_id)
       ))
 
-    console.log("messages ->", messages)
     if (!messages) {
       return {
         success: false,
@@ -728,8 +727,8 @@ const get_all_conversations_admin = async (type?: string) => {
     if (type && type !== "all") {
       whereCondition = and(
         eq(conversation_model.deleted, false),
-        eq(conversation_model.type, type)
-      );
+        eq(conversation_model.type, type as ChatType)
+      )!;
     }
 
     const conversations = await db

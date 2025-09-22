@@ -138,7 +138,7 @@ const join_conversation = (user_id: number, conversation_id: number) => {
     }
     conversation_connections.get(conversation_id)?.add(user_id);
 
-    console.log(`[WS] User ${user_id} joined conversation ${conversation_id}`);
+    // console.log(`[WS] User ${user_id} joined conversation ${conversation_id}`);
   }
 };
 
@@ -160,9 +160,9 @@ const leave_conversation = (user_id: number, conversation_id: number) => {
 };
 
 const broadcast_to_conversation = (conversation_id: number, message: WSMessage, exclude_user?: number, message_id?: number) => {
-  console.log("message ->", message)
-  console.log("connnections :", connections)
-  console.log("conversation_connections :", conversation_connections)
+  // console.log("message ->", message)
+  // console.log("connnections :", connections)
+  // console.log("conversation_connections :", conversation_connections)
   const conv_connections = conversation_connections.get(conversation_id);
   if (!conv_connections) return;
 
@@ -208,7 +208,7 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
                 )
               )
               .then(() => {
-                console.log(`[WS] Updated read receipt for user ${user_id} in conversation ${conversation_id}, message ${message_id}`);
+                // console.log(`[WS] Updated read receipt for user ${user_id} in conversation ${conversation_id}, message ${message_id}`);
               })
               .catch((error) => {
                 console.error(`[WS] Error updating read receipt for user ${user_id}:`, error);
@@ -232,7 +232,7 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
                 )
               )
               .then(() => {
-                console.log(`[WS] Increased unread count for online but inactive user ${user_id} in conversation ${conversation_id}`);
+                // console.log(`[WS] Increased unread count for online but inactive user ${user_id} in conversation ${conversation_id}`);
               })
               .catch((error) => {
                 console.error(`[WS] Error increasing unread count for user ${user_id}:`, error);
@@ -257,7 +257,7 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
           )
         )
         .then(() => {
-          console.log(`[WS] Increased unread count for offline user ${user_id} in conversation ${conversation_id}`);
+          // console.log(`[WS] Increased unread count for offline user ${user_id} in conversation ${conversation_id}`);
         })
         .catch((error) => {
           console.error(`[WS] Error increasing unread count for user ${user_id}:`, error);
@@ -265,7 +265,7 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
     }
   });
 
-  console.log(`[WS] Broadcasted to ${sent_count} users in conversation ${conversation_id}. Delivered: ${delivered_count}, Read: ${read_count}`);
+  // console.log(`[WS] Broadcasted to ${sent_count} users in conversation ${conversation_id}. Delivered: ${delivered_count}, Read: ${read_count}`);
 
   // Send delivery/read receipt back to sender if message_id is provided
   if (exclude_user && message_id) {
@@ -278,7 +278,7 @@ const send_to_user = (user_id: number, message: WSMessage) => {
   if (connection && connection.ws.readyState === 1) {
     try {
       connection.ws.send(JSON.stringify(message));
-      console.log(`[WS] Sent ${message.type} to user ${user_id}`);
+      // console.log(`[WS] Sent ${message.type} to user ${user_id}`);
       return true;
     } catch (error) {
       console.error(`[WS] Error sending to user ${user_id}:`, error);
@@ -316,7 +316,7 @@ const send_delivery_receipt = (
   };
 
   send_to_user(sender_id, receipt_message);
-  console.log(`[WS] Sent delivery receipt to sender ${sender_id} for message ${message_id}`);
+  // console.log(`[WS] Sent delivery receipt to sender ${sender_id} for message ${message_id}`);
 };
 
 const broadcast_to_all = (message: WSMessage) => {
@@ -331,7 +331,7 @@ const broadcast_to_all = (message: WSMessage) => {
       }
     }
   });
-  console.log(`[WS] Broadcasted to all users`);
+  // console.log(`[WS] Broadcasted to all users`);
 };
 
 // WebSocket server
@@ -411,7 +411,7 @@ const web_socket = new Elysia()
         // update the online status of user in the DB
         await update_user_details(user_id, { online_status: true, last_seen: new Date() });
 
-        console.log(`[WS] User ${user_id} authenticated and connected`);
+        // console.log(`[WS] User ${user_id} authenticated and connected`);
       } catch (error) {
         console.error('[WS] Error in connection:', error);
         ws.close(4000, "Connection error");
@@ -669,7 +669,6 @@ const web_socket = new Elysia()
 
               if (forward_res.success && message.data.target_conversation_ids) {
                 for (const target_conversation_id of message.data.target_conversation_ids) {
-                  console.log("forwarding to  ->", target_conversation_id)
                   broadcast_to_conversation(target_conversation_id, {
                     type: 'message_forward',
                     data: {
@@ -768,11 +767,10 @@ const web_socket = new Elysia()
 
           case 'active_in_conversation':
             if (message.conversation_id) {
-              console.log("active_in_conversation ->", message.conversation_id)
               const connection = connections.get(user_id);
               if (connection) {
                 connection.active_conversation_id = message.conversation_id;
-                console.log(`user ${user_id} is currently viewing ${message.conversation_id}`);
+                // console.log(`user ${user_id} is currently viewing ${message.conversation_id}`);
 
                 // Clear unread count when user becomes active in conversation
                 await db
@@ -825,7 +823,7 @@ const web_socket = new Elysia()
                   }, user_id);
                 }
 
-                console.log(`[WS] Cleared unread count for user ${user_id} in conversation ${message.conversation_id}`);
+                // console.log(`[WS] Cleared unread count for user ${user_id} in conversation ${message.conversation_id}`);
               }
             }
 
@@ -836,7 +834,7 @@ const web_socket = new Elysia()
               const connection = connections.get(user_id);
               if (connection && connection.active_conversation_id === message.conversation_id) {
                 connection.active_conversation_id = undefined;
-                console.log(`user ${user_id} is no longer viewing ${message.conversation_id}`);
+                // console.log(`user ${user_id} is no longer viewing ${message.conversation_id}`);
               }
             }
             break;
@@ -844,16 +842,16 @@ const web_socket = new Elysia()
           // Call signaling handlers
           case 'call:init':
             if (message.to && message.payload) {
-              console.log(`[WS] Processing call:init from ${user_id} to ${message.to}`);
-              console.log(`[WS] Current connections: ${Array.from(connections.keys())}`);
-              console.log(`[WS] Target user ${message.to} connected: ${connections.has(message.to)}`);
-              
+              // console.log(`[WS] Processing call:init from ${user_id} to ${message.to}`);
+              // console.log(`[WS] Current connections: ${Array.from(connections.keys())}`);
+              // console.log(`[WS] Target user ${message.to} connected: ${connections.has(message.to)}`);
+
               const result = await CallService.initiate_call(user_id, message.to, message.payload);
-              
+
               if (result.success) {
                 const callId = result.data?.callId;
-                console.log(`[WS] Call initiation successful, callId: ${callId}`);
-                
+                // console.log(`[WS] Call initiation successful, callId: ${callId}`);
+
                 // Send acknowledgment to caller
                 const ackSent = send_to_user(user_id, {
                   type: 'call:init',
@@ -863,7 +861,7 @@ const web_socket = new Elysia()
                   data: { success: true, callId },
                   timestamp: new Date().toISOString()
                 });
-                console.log(`[WS] Ack sent to caller ${user_id}: ${ackSent}`);
+                // console.log(`[WS] Ack sent to caller ${user_id}: ${ackSent}`);
 
                 // Send incoming call notification to callee
                 const ringSent = send_to_user(message.to, {
@@ -874,11 +872,11 @@ const web_socket = new Elysia()
                   payload: message.payload,
                   timestamp: new Date().toISOString()
                 });
-                console.log(`[WS] Ring sent to callee ${message.to}: ${ringSent}`);
-
-                console.log(`[WS] Call init complete: ${callId} from ${user_id} to ${message.to}`);
+                // console.log(`[WS] Ring sent to callee ${message.to}: ${ringSent}`);
+                //
+                // console.log(`[WS] Call init complete: ${callId} from ${user_id} to ${message.to}`);
               } else {
-                console.log(`[WS] Call initiation failed: ${result.error} (${result.code})`);
+                // console.log(`[WS] Call initiation failed: ${result.error} (${result.code})`);
                 // Send error to caller
                 send_to_user(user_id, {
                   type: 'error',
@@ -904,15 +902,15 @@ const web_socket = new Elysia()
                 payload: message.payload,
                 timestamp: new Date().toISOString()
               });
-              
-              console.log(`[WS] Forwarded ${message.type} for call ${message.callId}`);
+
+              // console.log(`[WS] Forwarded ${message.type} for call ${message.callId}`);
             }
             break;
 
           case 'call:accept':
             if (message.callId) {
               const result = await CallService.accept_call(message.callId, user_id);
-              
+
               if (result.success) {
                 // Notify both parties
                 const active_call = CallService.get_user_active_call(user_id);
@@ -949,7 +947,7 @@ const web_socket = new Elysia()
           case 'call:decline':
             if (message.callId) {
               const result = await CallService.decline_call(message.callId, user_id, message.payload?.reason);
-              
+
               if (result.success) {
                 const active_call = CallService.get_user_active_call(user_id);
                 if (active_call) {
@@ -971,24 +969,24 @@ const web_socket = new Elysia()
             if (message.callId) {
               // Get active call first before ending it
               const active_call = CallService.get_user_active_call(user_id);
-              
+
               const result = await CallService.end_call(message.callId, user_id, message.payload?.reason);
-              
+
               if (result.success) {
                 // Find the other party and notify them
                 if (active_call) {
                   const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
-                  
-                  console.log(`[WS] Call ended: ${message.callId}, notifying user ${other_user}`);
-                  
+
+                  // console.log(`[WS] Call ended: ${message.callId}, notifying user ${other_user}`);
+
                   send_to_user(other_user, {
                     type: 'call:end',
                     callId: message.callId,
                     from: user_id,
                     to: other_user,
-                    payload: { 
+                    payload: {
                       reason: message.payload?.reason,
-                      duration: result.data?.duration_seconds 
+                      duration: result.data?.duration_seconds
                     },
                     timestamp: new Date().toISOString()
                   });
@@ -1051,7 +1049,7 @@ const web_socket = new Elysia()
   })
   .listen(5002)
 
-console.log('[WS] WebSocket server running on ws://localhost:5002/chat');
+// console.log('[WS] WebSocket server running on ws://localhost:5002/chat');
 
 // Connection monitoring and cleanup
 const startConnectionMonitor = () => {

@@ -155,7 +155,6 @@ const auth_routes = new Elysia({ prefix: "/auth" })
 
 
   .post("/verify-email-login", async ({ body, set, cookie }) => {
-    console.log("body ->", body)
     const login_res = await handle_login({ email: body.email, password: body.password });
     if (login_res.success == false) {
       set.status = login_res.code;

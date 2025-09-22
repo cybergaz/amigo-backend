@@ -181,3 +181,17 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MjU5NTAzMjU3M
     "longitude": 75.8182143
   }
 }
+
+
+### 
+
+GET http://localhost:5000/api/community/list-connected-communities HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MjU5NTAzMjU3Miwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTg0OTI4NTksImV4cCI6MTc1ODU3OTI1OX0.t99RZoT-oFQp_3HvZkLjWmND2QVInzWmkMJj1gHU6as
+
+
+### 
+
+GET http://localhost:5000/api/chat/get-chat-list/community_group HTTP/1.1
+Content-Type: application/json
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MjU5NTAzMjU3Miwicm9sZSI6InVzZXIiLCJpYXQiOjE3NTg0OTI4NTksImV4cCI6MTc1ODU3OTI1OX0.t99RZoT-oFQp_3HvZkLjWmND2QVInzWmkMJj1gHU6as
