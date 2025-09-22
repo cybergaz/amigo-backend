@@ -8,6 +8,8 @@ import { WebSocketData, TypedElysiaWS } from '@/types/elysia.types';
 import { user_model } from '@/models/user.model';
 import { forward_messages, pin_message, reply_to_message, star_messages, store_media } from '@/services/message-operations.services';
 import { update_user_details } from '@/services/user.services';
+import { CallService } from '@/services/call.service';
+import { CallSignalingMessage } from '@/types/call.types';
 
 // Connection management
 interface UserConnection {
@@ -24,11 +26,16 @@ const conversation_connections = new Map<number, Set<number>>(); // conversation
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'active_in_conversation' | 'inactive_in_conversation';
+  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'active_in_conversation' | 'inactive_in_conversation' | 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed';
   data?: any;
   conversation_id?: number;
   message_ids?: number[];
   timestamp?: string;
+  // Call-specific fields
+  callId?: number;
+  from?: number;
+  to?: number;
+  payload?: any;
 }
 
 interface ChatMessage {
@@ -271,12 +278,16 @@ const send_to_user = (user_id: number, message: WSMessage) => {
   if (connection && connection.ws.readyState === 1) {
     try {
       connection.ws.send(JSON.stringify(message));
+      console.log(`[WS] Sent ${message.type} to user ${user_id}`);
       return true;
     } catch (error) {
       console.error(`[WS] Error sending to user ${user_id}:`, error);
       remove_connection(user_id);
       return false;
     }
+  } else {
+    console.warn(`[WS] Cannot send ${message.type} to user ${user_id} - not connected or connection not ready`);
+    console.warn(`[WS] Connection exists: ${!!connection}, ReadyState: ${connection?.ws.readyState}`);
   }
   return false;
 };
@@ -333,7 +344,12 @@ const web_socket = new Elysia()
       conversation_id: t.Optional(t.Number()),
       message_ids: t.Optional(t.Array(t.Number())),
       user_id: t.Optional(t.Number()), // for certain actions like reply where user_id may differ
-      timestamp: t.Optional(t.String())
+      timestamp: t.Optional(t.String()),
+      // Call-specific fields
+      callId: t.Optional(t.Number()),
+      from: t.Optional(t.Number()),
+      to: t.Optional(t.Number()),
+      payload: t.Optional(t.Any())
     }),
 
     query: t.Object({
@@ -821,6 +837,174 @@ const web_socket = new Elysia()
               if (connection && connection.active_conversation_id === message.conversation_id) {
                 connection.active_conversation_id = undefined;
                 console.log(`user ${user_id} is no longer viewing ${message.conversation_id}`);
+              }
+            }
+            break;
+
+          // Call signaling handlers
+          case 'call:init':
+            if (message.to && message.payload) {
+              console.log(`[WS] Processing call:init from ${user_id} to ${message.to}`);
+              console.log(`[WS] Current connections: ${Array.from(connections.keys())}`);
+              console.log(`[WS] Target user ${message.to} connected: ${connections.has(message.to)}`);
+              
+              const result = await CallService.initiate_call(user_id, message.to, message.payload);
+              
+              if (result.success) {
+                const callId = result.data?.callId;
+                console.log(`[WS] Call initiation successful, callId: ${callId}`);
+                
+                // Send acknowledgment to caller
+                const ackSent = send_to_user(user_id, {
+                  type: 'call:init',
+                  callId,
+                  from: user_id,
+                  to: message.to,
+                  data: { success: true, callId },
+                  timestamp: new Date().toISOString()
+                });
+                console.log(`[WS] Ack sent to caller ${user_id}: ${ackSent}`);
+
+                // Send incoming call notification to callee
+                const ringSent = send_to_user(message.to, {
+                  type: 'call:ringing',
+                  callId,
+                  from: user_id,
+                  to: message.to,
+                  payload: message.payload,
+                  timestamp: new Date().toISOString()
+                });
+                console.log(`[WS] Ring sent to callee ${message.to}: ${ringSent}`);
+
+                console.log(`[WS] Call init complete: ${callId} from ${user_id} to ${message.to}`);
+              } else {
+                console.log(`[WS] Call initiation failed: ${result.error} (${result.code})`);
+                // Send error to caller
+                send_to_user(user_id, {
+                  type: 'error',
+                  data: { message: result.error, code: result.code },
+                  timestamp: new Date().toISOString()
+                });
+              }
+            } else {
+              console.log(`[WS] Invalid call:init message - missing to or payload`);
+            }
+            break;
+
+          case 'call:offer':
+          case 'call:answer':
+          case 'call:ice':
+            // Forward WebRTC signaling between caller and callee
+            if (message.callId && message.to && message.payload) {
+              send_to_user(message.to, {
+                type: message.type,
+                callId: message.callId,
+                from: user_id,
+                to: message.to,
+                payload: message.payload,
+                timestamp: new Date().toISOString()
+              });
+              
+              console.log(`[WS] Forwarded ${message.type} for call ${message.callId}`);
+            }
+            break;
+
+          case 'call:accept':
+            if (message.callId) {
+              const result = await CallService.accept_call(message.callId, user_id);
+              
+              if (result.success) {
+                // Notify both parties
+                const active_call = CallService.get_user_active_call(user_id);
+                if (active_call) {
+                  // Notify caller
+                  send_to_user(active_call.caller_id, {
+                    type: 'call:accept',
+                    callId: message.callId,
+                    from: user_id,
+                    to: active_call.caller_id,
+                    timestamp: new Date().toISOString()
+                  });
+
+                  // Acknowledge to callee
+                  send_to_user(user_id, {
+                    type: 'call:accept',
+                    callId: message.callId,
+                    from: user_id,
+                    to: active_call.caller_id,
+                    data: { success: true },
+                    timestamp: new Date().toISOString()
+                  });
+                }
+              } else {
+                send_to_user(user_id, {
+                  type: 'error',
+                  data: { message: result.error },
+                  timestamp: new Date().toISOString()
+                });
+              }
+            }
+            break;
+
+          case 'call:decline':
+            if (message.callId) {
+              const result = await CallService.decline_call(message.callId, user_id, message.payload?.reason);
+              
+              if (result.success) {
+                const active_call = CallService.get_user_active_call(user_id);
+                if (active_call) {
+                  // Notify caller
+                  send_to_user(active_call.caller_id, {
+                    type: 'call:decline',
+                    callId: message.callId,
+                    from: user_id,
+                    to: active_call.caller_id,
+                    payload: message.payload,
+                    timestamp: new Date().toISOString()
+                  });
+                }
+              }
+            }
+            break;
+
+          case 'call:end':
+            if (message.callId) {
+              // Get active call first before ending it
+              const active_call = CallService.get_user_active_call(user_id);
+              
+              const result = await CallService.end_call(message.callId, user_id, message.payload?.reason);
+              
+              if (result.success) {
+                // Find the other party and notify them
+                if (active_call) {
+                  const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
+                  
+                  console.log(`[WS] Call ended: ${message.callId}, notifying user ${other_user}`);
+                  
+                  send_to_user(other_user, {
+                    type: 'call:end',
+                    callId: message.callId,
+                    from: user_id,
+                    to: other_user,
+                    payload: { 
+                      reason: message.payload?.reason,
+                      duration: result.data?.duration_seconds 
+                    },
+                    timestamp: new Date().toISOString()
+                  });
+
+                  // Acknowledge to sender
+                  send_to_user(user_id, {
+                    type: 'call:end',
+                    callId: message.callId,
+                    data: { success: true, duration: result.data?.duration_seconds },
+                    timestamp: new Date().toISOString()
+                  });
+                } else {
+                  console.warn(`[WS] No active call found for user ${user_id} when ending call ${message.callId}`);
+                }
+              } else {
+                console.error(`[WS] Failed to end call ${message.callId}: ${result.error}`);
               }
             }
             break;
