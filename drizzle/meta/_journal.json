@@ -43,6 +43,13 @@
       "when": 1758489282935,
       "tag": "0005_pink_wither",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1758494651333,
+      "tag": "0006_past_stepford_cuckoos",
+      "breakpoints": true
     }
   ]
 }

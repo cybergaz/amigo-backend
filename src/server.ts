@@ -7,6 +7,7 @@ import user_routes from "./routes/user.routes";
 import chat_routes from "./routes/chat.routes";
 import media_routes from "./routes/media.routes";
 import community_routes from "./routes/community.routes";
+import call_routes from "./routes/call.routes";
 import web_socket from "./sockets/web-socket";
 import { hash_password, parse_phone } from "./utils/general.utils";
 import admin_routes from "./routes/admin.routes";
@@ -26,6 +27,7 @@ const app = new Elysia({ prefix: "/api" })
   .use(chat_routes)
   .use(media_routes)
   .use(community_routes)
+  .use(call_routes)
   .use(admin_routes)
   .use(web_socket)
   .listen(SERVER_PORT);
