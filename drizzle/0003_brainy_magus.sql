@@ -1,1 +1,0 @@
-ALTER TABLE "users" ADD COLUMN "ip_address" varchar(50);

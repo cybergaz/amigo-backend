@@ -4,7 +4,7 @@ import { user_model } from "./user.model";
 
 export const CALL_STATUS_CONSTS = [
   "initiated",
-  "ringing", 
+  "ringing",
   "answered",
   "ended",
   "missed",

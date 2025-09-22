@@ -15,7 +15,8 @@ import {
   create_community_group,
   update_community_group,
   get_community_groups,
-  delete_community_group
+  delete_community_group,
+  get_connected_communities
 } from "@/services/community.services";
 
 const community_routes = new Elysia({ prefix: "/community" })
@@ -45,8 +46,14 @@ const community_routes = new Elysia({ prefix: "/community" })
     })
   })
 
-  .get("/list", async ({ set, store }) => {
+  .get("/list-all", async ({ set, store }) => {
     const communities_result = await get_communities(store.id);
+    set.status = communities_result.code;
+    return communities_result;
+  })
+
+  .get("/list-connected-communities", async ({ set, store }) => {
+    const communities_result = await get_connected_communities(store.id);
     set.status = communities_result.code;
     return communities_result;
   })
@@ -89,8 +96,8 @@ const community_routes = new Elysia({ prefix: "/community" })
   // Community group management
   .post("/:community_id/groups/add", async ({ set, store, params, body }) => {
     const add_result = await add_community_groups(
-      params.community_id, 
-      store.id, 
+      params.community_id,
+      store.id,
       { ...body, community_id: params.community_id }
     );
     set.status = add_result.code;
@@ -106,8 +113,8 @@ const community_routes = new Elysia({ prefix: "/community" })
 
   .post("/:community_id/groups/remove", async ({ set, store, params, body }) => {
     const remove_result = await remove_community_groups(
-      params.community_id, 
-      store.id, 
+      params.community_id,
+      store.id,
       { ...body, community_id: params.community_id }
     );
     set.status = remove_result.code;

@@ -5,50 +5,8 @@
     {
       "idx": 0,
       "version": "7",
-      "when": 1758287481287,
-      "tag": "0000_slippery_elektra",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "7",
-      "when": 1758441915900,
-      "tag": "0001_nice_pyro",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "7",
-      "when": 1758474940660,
-      "tag": "0002_burly_ken_ellis",
-      "breakpoints": true
-    },
-    {
-      "idx": 3,
-      "version": "7",
-      "when": 1758477813936,
-      "tag": "0003_brainy_magus",
-      "breakpoints": true
-    },
-    {
-      "idx": 4,
-      "version": "7",
-      "when": 1758487327949,
-      "tag": "0004_flat_frank_castle",
-      "breakpoints": true
-    },
-    {
-      "idx": 5,
-      "version": "7",
-      "when": 1758489282935,
-      "tag": "0005_pink_wither",
-      "breakpoints": true
-    },
-    {
-      "idx": 6,
-      "version": "7",
-      "when": 1758494651333,
-      "tag": "0006_past_stepford_cuckoos",
+      "when": 1758505244646,
+      "tag": "0000_brown_robin_chapel",
       "breakpoints": true
     }
   ]

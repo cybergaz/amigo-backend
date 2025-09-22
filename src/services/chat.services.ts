@@ -136,7 +136,9 @@ const get_chat_list = async (user_id: number, type: string) => {
           type !== "all" ?
             type === "group"
               ? eq(conversation_model.type, "group")
-              : eq(conversation_model.type, "dm")
+              : type === "community_group"
+                ? eq(conversation_model.type, "community_group")
+                : eq(conversation_model.type, "dm")
             : eq(conversation_model.deleted, false)
         )
       )
@@ -233,7 +235,10 @@ const get_group_info = async (conversation_id: number) => {
       .where(
         and(
           eq(conversation_model.id, conversation_id),
-          eq(conversation_model.type, "group")
+          or(
+            eq(conversation_model.type, "group"),
+            eq(conversation_model.type, "community_group")
+          )
         )
       )
       .limit(1);
@@ -719,7 +724,7 @@ const get_conversation_history = async (
 const get_all_conversations_admin = async (type?: string) => {
   try {
     let whereCondition = eq(conversation_model.deleted, false);
-    
+
     if (type && type !== "all") {
       whereCondition = and(
         eq(conversation_model.deleted, false),
@@ -736,7 +741,7 @@ const get_all_conversations_admin = async (type?: string) => {
         lastMessageAt: conversation_model.last_message_at,
         created_at: conversation_model.created_at,
         createrId: conversation_model.creater_id,
-        
+
         // Creator info
         createrName: user_model.name,
         createrProfilePic: user_model.profile_pic,
@@ -761,7 +766,7 @@ const get_all_conversations_admin = async (type?: string) => {
               eq(conversation_member_model.deleted, false)
             )
           );
-        
+
         return {
           ...conv,
           memberCount: memberCount[0]?.count || 0
@@ -932,17 +937,17 @@ const permanently_delete_message_admin = async (message_id: number) => {
   }
 };
 
-export { 
-  create_chat, 
-  get_chat_list, 
-  get_group_info, 
-  create_group, 
-  add_new_member, 
-  remove_member, 
-  update_group_title, 
-  delete_conversation, 
-  mark_as_delete_conversation, 
-  mark_as_delete_message, 
+export {
+  create_chat,
+  get_chat_list,
+  get_group_info,
+  create_group,
+  add_new_member,
+  remove_member,
+  update_group_title,
+  delete_conversation,
+  mark_as_delete_conversation,
+  mark_as_delete_message,
   get_conversation_history,
   get_all_conversations_admin,
   get_conversation_members_admin,

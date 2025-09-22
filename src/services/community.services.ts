@@ -13,7 +13,7 @@ import {
 } from "@/types/community.types";
 import { ChatRoleType } from "@/types/chat.types";
 import { create_unique_id } from "@/utils/general.utils";
-import { and, eq, inArray, sql, desc } from "drizzle-orm";
+import { and, eq, inArray, sql, desc, arrayContains } from "drizzle-orm";
 
 // Community CRUD operations
 const create_community = async (
@@ -64,18 +64,18 @@ const create_community = async (
 const get_communities = async (user_id: number) => {
   try {
     // Check if user is admin or sub_admin
-    // const [user] = await db
-    //   .select({ role: user_model.role })
-    //   .from(user_model)
-    //   .where(eq(user_model.id, user_id));
-    //
-    // if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
-    //   return {
-    //     success: false,
-    //     code: 403,
-    //     message: "Only admins and sub admins can view communities",
-    //   };
-    // }
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, user_id));
+
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+      return {
+        success: false,
+        code: 403,
+        message: "Only admins and sub admins can view communities",
+      };
+    }
 
     const communities = await db
       .select({
@@ -95,6 +95,64 @@ const get_communities = async (user_id: number) => {
       code: 200,
       data: communities,
     };
+  } catch (error) {
+    console.error("get_communities error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: get_communities",
+    };
+  }
+};
+
+const get_connected_communities = async (user_id: number) => {
+  try {
+
+    // we have to get all communities where the user is a member of at least one group in the community
+    // Get all community groups the user is a member of
+    const userGroupIdsResult = await db
+      .select({ conversation_id: conversation_member_model.conversation_id })
+      .from(conversation_member_model)
+      .where(eq(conversation_member_model.user_id, user_id));
+
+    const userGroupIds = userGroupIdsResult.map(r => r.conversation_id);
+
+    if (userGroupIds.length === 0) {
+      return {
+        success: true,
+        code: 200,
+        data: [],
+      };
+    }
+
+    // Get all communities where group_ids overlap with userGroupIds
+    // Using raw SQL for array overlap
+    const communities = await db
+      .select({
+        id: community_model.id,
+        name: community_model.name,
+        group_ids: community_model.group_ids,
+        metadata: community_model.metadata,
+        created_at: community_model.created_at,
+        updated_at: community_model.updated_at,
+      })
+      .from(community_model)
+      .where(
+        and(
+          eq(community_model.deleted, false),
+          arrayContains(community_model.group_ids, userGroupIds)
+        )
+      )
+      .orderBy(desc(community_model.updated_at));
+
+
+    return {
+      success: true,
+      code: 200,
+      message: "Communities fetched successfully",
+      data: communities,
+    };
+
   } catch (error) {
     console.error("get_communities error:", error);
     return {
@@ -693,5 +751,7 @@ export {
   create_community_group,
   update_community_group,
   get_community_groups,
-  delete_community_group
+  get_connected_communities,
+  delete_community_group,
+
 };
