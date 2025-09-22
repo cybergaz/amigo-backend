@@ -73,6 +73,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
+        partitioned: true,
       });
       cookie["access_token"].set({
         value: create_user_res.data.access_token,
@@ -81,6 +82,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
+        partitioned: true,
       });
       console.log(
         `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
@@ -121,6 +123,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
+        partitioned: true,
       });
       cookie["access_token"].set({
         value: login_res.data.access_token,
@@ -129,6 +132,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
+        partitioned: true,
       });
       console.log(
         `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
@@ -177,6 +181,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
+        partitioned: true,
       });
       cookie["access_token"].set({
         value: login_res.data.access_token,
@@ -185,6 +190,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24,
         path: "/",
+        partitioned: true,
       });
       console.log(
         `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
