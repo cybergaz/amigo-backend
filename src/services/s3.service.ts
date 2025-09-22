@@ -21,6 +21,7 @@ export const FILE_TYPE_MAPPINGS = {
   "image/png": S3_FOLDERS.IMAGES,
   "image/webp": S3_FOLDERS.IMAGES,
   "image/gif": S3_FOLDERS.IMAGES,
+  "image/heif": S3_FOLDERS.IMAGES,
   "image/svg+xml": S3_FOLDERS.IMAGES,
 
   // Audio files
@@ -41,6 +42,7 @@ export const FILE_TYPE_MAPPINGS = {
   "video/flv": S3_FOLDERS.VIDEOS,
   "video/webm": S3_FOLDERS.VIDEOS,
   "video/mkv": S3_FOLDERS.VIDEOS,
+  "video/h.265": S3_FOLDERS.VIDEOS,
 
   // Document files
   "application/pdf": S3_FOLDERS.DOCS,
