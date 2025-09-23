@@ -158,7 +158,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
 
-  .post("/verify-email-login", async ({ body, set, cookie }) => {
+  .post("/verify-email-login", async ({ body, set, cookie, headers }) => {
     const login_res = await handle_login({ email: body.email, password: body.password });
     if (login_res.success == false) {
       set.status = login_res.code;
@@ -178,6 +178,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
       });
+
       cookie["access_token"].set({
         value: login_res.data.access_token,
         httpOnly: true,

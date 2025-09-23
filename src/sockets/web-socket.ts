@@ -496,7 +496,6 @@ const web_socket = new Elysia()
 
           case 'message':
             if (message.conversation_id && message.data) {
-              console.log("message ->", message)
               // Save message to database
               const new_message = await db
                 .insert(message_model)
