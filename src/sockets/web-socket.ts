@@ -732,7 +732,7 @@ const web_socket = new Elysia()
                   },
                   conversation_id: message.conversation_id,
                   timestamp: new Date().toISOString()
-                }, undefined);
+                }, undefined, undefined, user_id);
               }
             }
             break;
