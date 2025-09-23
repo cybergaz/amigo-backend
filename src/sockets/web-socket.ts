@@ -159,7 +159,7 @@ const leave_conversation = (user_id: number, conversation_id: number) => {
   }
 };
 
-const broadcast_to_conversation = (conversation_id: number, message: WSMessage, exclude_user?: number, message_id?: number) => {
+const broadcast_to_conversation = (conversation_id: number, message: WSMessage, exclude_user?: number, message_id?: number, included_user?: number) => {
 
   console.log(`broadcasting to conversation ID || ${conversation_id} ->`, message)
   // console.log("message ->", message)
@@ -270,8 +270,8 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
   // console.log(`[WS] Broadcasted to ${sent_count} users in conversation ${conversation_id}. Delivered: ${delivered_count}, Read: ${read_count}`);
 
   // Send delivery/read receipt back to sender if message_id is provided
-  if (exclude_user && message_id) {
-    send_delivery_receipt(exclude_user, conversation_id, message_id, message.data.optimistic_id, delivery_status);
+  if (included_user && message_id) {
+    send_delivery_receipt(included_user, conversation_id, message_id, message.data.optimistic_id, delivery_status);
   }
 };
 
@@ -544,7 +544,7 @@ const web_socket = new Elysia()
                   conversation_id: message.conversation_id,
                   message_ids: [saved_message.id],
                   timestamp: new Date().toISOString()
-                }, undefined, saved_message.id);
+                }, undefined, saved_message.id, user_id);
 
                 // Update conversation last_message_at
                 await db
