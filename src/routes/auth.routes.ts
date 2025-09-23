@@ -172,8 +172,8 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     ) {
       cookie["refresh_token"].set({
         value: login_res.data.refresh_token,
-        httpOnly: true,
-        secure: true,
+        httpOnly: false,
+        secure: false,
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
@@ -182,8 +182,8 @@ const auth_routes = new Elysia({ prefix: "/auth" })
 
       cookie["access_token"].set({
         value: login_res.data.access_token,
-        httpOnly: true,
-        secure: true,
+        httpOnly: false,
+        secure: false,
         sameSite: "none",
         maxAge: 60 * 60 * 24,
         path: "/",
