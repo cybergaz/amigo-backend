@@ -177,6 +177,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
+        partitioned: false,
       });
 
       cookie["access_token"].set({
@@ -186,6 +187,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24,
         path: "/",
+        partitioned: false,
       });
       console.log(
         `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
