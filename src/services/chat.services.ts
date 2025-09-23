@@ -75,6 +75,19 @@ const create_chat = async (sender_id: number, receiver_id: number) => {
       },
     ]);
 
+    // -----------------------------------------------------------------------------------
+    // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
+    // -----------------------------------------------------------------------------------
+    await db.insert(message_model).values({
+      conversation_id: chat.id,
+      sender_id: sender_id,
+      type: "system",
+      body: "chat initiated",
+    });
+    // -----------------------------------------------------------------------------------
+    // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
+    // -----------------------------------------------------------------------------------
+
     return {
       success: true,
       code: 200,
@@ -115,6 +128,7 @@ const get_chat_list = async (user_id: number, type: string) => {
         // from user_model - for DMs, this will be the other user
         userId: user_model.id,
         userName: user_model.name,
+        onlineStatus: user_model.online_status,
         lastSeen: user_model.last_seen,
         userProfilePic: user_model.profile_pic,
       })
@@ -155,6 +169,7 @@ const get_chat_list = async (user_id: number, type: string) => {
             .select({
               userId: user_model.id,
               userName: user_model.name,
+              onlineStatus: user_model.online_status,
               lastSeen: user_model.last_seen,
               userProfilePic: user_model.profile_pic,
             })
@@ -171,6 +186,7 @@ const get_chat_list = async (user_id: number, type: string) => {
             ...chat,
             userId: otherUser?.userId || null,
             userName: otherUser?.userName || null,
+            onlineStatus: otherUser?.onlineStatus || "offline",
             lastSeen: otherUser?.lastSeen || null,
             userProfilePic: otherUser?.userProfilePic || null,
           };
@@ -182,6 +198,7 @@ const get_chat_list = async (user_id: number, type: string) => {
             ...chat,
             userId: null,
             userName: null,
+            onlineStatus: "offline",
             lastSeen: null,
             userProfilePic: null,
           };

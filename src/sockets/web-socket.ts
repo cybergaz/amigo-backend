@@ -20,7 +20,7 @@ interface UserConnection {
   active_conversation_id?: number; // Active conversation ID, that user is currently viewing
 }
 
-const connections = new Map<number, UserConnection>();
+const connections = new Map<number, UserConnection>(); // user_id -> UserConnection
 const conversation_connections = new Map<number, Set<number>>(); // conversation_id -> Set<user_id>
 // const active_conversation_connections = new Map<number, Set<number>>(); // conversation_id -> Set<user_id>
 
@@ -496,6 +496,7 @@ const web_socket = new Elysia()
 
           case 'message':
             if (message.conversation_id && message.data) {
+              console.log("message ->", message)
               // Save message to database
               const new_message = await db
                 .insert(message_model)
@@ -539,7 +540,7 @@ const web_socket = new Elysia()
                   conversation_id: message.conversation_id,
                   message_ids: [saved_message.id],
                   timestamp: new Date().toISOString()
-                }, user_id, saved_message.id);
+                }, undefined, saved_message.id);
 
                 // Update conversation last_message_at
                 await db
@@ -647,12 +648,13 @@ const web_socket = new Elysia()
                   data: {
                     user_id,
                     new_message: message.data.new_message,
-                    new_message_id: reply_msg_res.data?.id
+                    new_message_id: reply_msg_res.data?.id,
+                    optimistic_id: message.data?.optimistic_id
                   },
                   conversation_id: message.conversation_id,
                   message_ids: message.message_ids,
                   timestamp: new Date().toISOString()
-                }, user_id);
+                }, undefined);
               }
             }
             break;
@@ -721,11 +723,12 @@ const web_socket = new Elysia()
                   data: {
                     user_id,
                     ...message.data,
-                    media_message_id: media_res.data?.id
+                    media_message_id: media_res.data?.id,
+                    optimistic_id: message.data?.optimistic_id
                   },
                   conversation_id: message.conversation_id,
                   timestamp: new Date().toISOString()
-                }, user_id);
+                }, undefined);
               }
             }
             break;
