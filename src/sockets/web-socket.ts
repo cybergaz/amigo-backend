@@ -160,6 +160,8 @@ const leave_conversation = (user_id: number, conversation_id: number) => {
 };
 
 const broadcast_to_conversation = (conversation_id: number, message: WSMessage, exclude_user?: number, message_id?: number) => {
+
+  console.log(`broadcasting to conversation ID || ${conversation_id} ->`, message)
   // console.log("message ->", message)
   // console.log("connnections :", connections)
   // console.log("conversation_connections :", conversation_connections)
@@ -320,6 +322,7 @@ const send_delivery_receipt = (
 };
 
 const broadcast_to_all = (message: WSMessage) => {
+  console.log("broadcasting to all ->", message)
   const message_str = JSON.stringify(message);
   connections.forEach((connection, user_id) => {
     if (connection.ws.readyState === 1) {
