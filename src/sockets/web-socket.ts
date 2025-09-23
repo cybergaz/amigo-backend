@@ -419,6 +419,8 @@ const web_socket = new Elysia()
     },
 
     message: async (ws, message) => {
+      console.log("message came ->", message)
+
       try {
         const user_id = getUserId(ws);
         if (!user_id) {
