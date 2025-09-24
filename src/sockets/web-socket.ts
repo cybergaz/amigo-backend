@@ -26,7 +26,7 @@ const conversation_connections = new Map<number, Set<number>>(); // conversation
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'active_in_conversation' | 'inactive_in_conversation' | 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed';
+  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'active_in_conversation' | 'inactive_in_conversation' | 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed' | 'call:merge' | 'call:merge_accepted' | 'call:merge_declined' | 'call:participant_joined' | 'call:participant_left' | 'call:participant_removed' | 'call:remove_participant';
   data?: any;
   conversation_id?: number;
   message_ids?: number[];
@@ -776,6 +776,7 @@ const web_socket = new Elysia()
             if (message.conversation_id) {
               const connection = connections.get(user_id);
               if (connection) {
+                const wasActive = connection.active_conversation_id === message.conversation_id;
                 connection.active_conversation_id = message.conversation_id;
                 // console.log(`user ${user_id} is currently viewing ${message.conversation_id}`);
 
@@ -804,30 +805,36 @@ const web_socket = new Elysia()
                   .limit(1);
 
                 if (latest_message) {
-                  await db
-                    .update(conversation_member_model)
-                    .set({
-                      last_read_message_id: latest_message.id,
-                      last_delivered_message_id: latest_message.id
-                    })
-                    .where(
-                      and(
-                        eq(conversation_member_model.conversation_id, message.conversation_id),
-                        eq(conversation_member_model.user_id, user_id)
-                      )
-                    );
+                  // Only update last_read_message_id if user wasn't already active in this conversation
+                  // This prevents resetting read receipts when user comes back to the same conversation
+                  if (!wasActive) {
+                    await db
+                      .update(conversation_member_model)
+                      .set({
+                        last_read_message_id: latest_message.id,
+                        last_delivered_message_id: latest_message.id
+                      })
+                      .where(
+                        and(
+                          eq(conversation_member_model.conversation_id, message.conversation_id),
+                          eq(conversation_member_model.user_id, user_id)
+                        )
+                      );
 
-                  // Notify other users in the conversation about read receipt
-                  broadcast_to_conversation(message.conversation_id, {
-                    type: 'read_receipt',
-                    data: {
-                      user_id,
-                      message_id: latest_message.id,
-                      read_all: true // Indicates user read all messages up to this point
-                    },
-                    conversation_id: message.conversation_id,
-                    timestamp: new Date().toISOString()
-                  }, user_id);
+                    // Only send read receipt if user wasn't already active
+                    // Notify other users in the conversation about read receipt
+                    broadcast_to_conversation(message.conversation_id, {
+                      type: 'read_receipt',
+                      data: {
+                        user_id,
+                        message_id: null,
+                        read_all: true, // Indicates user read all messages up to this point
+                        user_active: true // User is currently active in conversation
+                      },
+                      conversation_id: message.conversation_id,
+                      timestamp: new Date().toISOString()
+                    }, user_id);
+                  }
                 }
 
                 // console.log(`[WS] Cleared unread count for user ${user_id} in conversation ${message.conversation_id}`);
@@ -842,6 +849,31 @@ const web_socket = new Elysia()
               if (connection && connection.active_conversation_id === message.conversation_id) {
                 connection.active_conversation_id = undefined;
                 // console.log(`user ${user_id} is no longer viewing ${message.conversation_id}`);
+                
+                const [latest_message] = await db
+                  .select({ id: message_model.id })
+                  .from(message_model)
+                  .where(
+                    and(
+                      eq(message_model.conversation_id, message.conversation_id),
+                      eq(message_model.deleted, false)
+                    )
+                  )
+                  .orderBy(sql`${message_model.id} DESC`)
+                  .limit(1);
+
+                // Send read receipt indicating user is no longer active
+                broadcast_to_conversation(message.conversation_id, {
+                  type: 'read_receipt',
+                  data: {
+                    user_id,
+                    message_id: latest_message.id,
+                    read_all: false, // User is no longer reading messages
+                    user_active: false // User is no longer active in conversation
+                  },
+                  conversation_id: message.conversation_id,
+                  timestamp: new Date().toISOString()
+                }, user_id);
               }
             }
             break;
@@ -1010,6 +1042,122 @@ const web_socket = new Elysia()
                 }
               } else {
                 console.error(`[WS] Failed to end call ${message.callId}: ${result.error}`);
+              }
+            }
+            break;
+
+          case 'call:merge':
+            if (message.to && message.callId && message.payload) {
+              console.log(`[WS] Processing call:merge from ${user_id} to ${message.to}`);
+              
+              // Check if target user is online
+              if (!connections.has(message.to)) {
+                send_to_user(user_id, {
+                  type: 'error',
+                  data: { message: 'User is not online', code: 'USER_OFFLINE' },
+                  timestamp: new Date().toISOString()
+                });
+                break;
+              }
+
+              // Send merge call request to target user
+              send_to_user(message.to, {
+                type: 'call:merge',
+                callId: message.callId,
+                from: user_id,
+                to: message.to,
+                payload: message.payload,
+                timestamp: new Date().toISOString()
+              });
+
+              // Acknowledge to sender
+              send_to_user(user_id, {
+                type: 'call:merge',
+                callId: message.callId,
+                data: { success: true },
+                timestamp: new Date().toISOString()
+              });
+            }
+            break;
+
+          case 'call:merge_accept':
+            if (message.callId) {
+              console.log(`[WS] User ${user_id} accepted merge call ${message.callId}`);
+              
+              // Notify the original caller about merge acceptance
+              const active_call = CallService.get_user_active_call(user_id);
+              if (active_call) {
+                send_to_user(active_call.caller_id, {
+                  type: 'call:merge_accepted',
+                  callId: message.callId,
+                  from: user_id,
+                  to: active_call.caller_id,
+                  payload: {
+                    userId: user_id,
+                    userName: message.payload?.userName || 'Unknown',
+                    userProfilePic: message.payload?.userProfilePic
+                  },
+                  timestamp: new Date().toISOString()
+                });
+              }
+            }
+            break;
+
+          case 'call:merge_decline':
+            if (message.callId) {
+              console.log(`[WS] User ${user_id} declined merge call ${message.callId}`);
+              
+              // Notify the original caller about merge decline
+              const active_call = CallService.get_user_active_call(user_id);
+              if (active_call) {
+                send_to_user(active_call.caller_id, {
+                  type: 'call:merge_declined',
+                  callId: message.callId,
+                  from: user_id,
+                  to: active_call.caller_id,
+                  payload: {
+                    userId: user_id,
+                    reason: message.payload?.reason || 'User declined'
+                  },
+                  timestamp: new Date().toISOString()
+                });
+              }
+            }
+            break;
+
+          case 'call:remove_participant':
+            if (message.callId && message.to) {
+              console.log(`[WS] Removing participant ${message.to} from call ${message.callId}`);
+              
+              // Notify the participant that they're being removed
+              send_to_user(message.to, {
+                type: 'call:participant_removed',
+                callId: message.callId,
+                from: user_id,
+                to: message.to,
+                payload: {
+                  reason: message.payload?.reason || 'Removed from call'
+                },
+                timestamp: new Date().toISOString()
+              });
+
+              // Notify other participants
+              const active_call = CallService.get_user_active_call(user_id);
+              if (active_call) {
+                const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
+                if (other_user !== message.to) {
+                  send_to_user(other_user, {
+                    type: 'call:participant_left',
+                    callId: message.callId,
+                    from: user_id,
+                    to: other_user,
+                    payload: {
+                      userId: message.to,
+                      userName: message.payload?.userName || 'Unknown'
+                    },
+                    timestamp: new Date().toISOString()
+                  });
+                }
               }
             }
             break;
