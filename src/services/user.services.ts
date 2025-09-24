@@ -49,6 +49,7 @@ export const create_user = async ({
         phone,
         hashed_password,
         refresh_token,
+        call_access: true,
       })
       .returning();
 

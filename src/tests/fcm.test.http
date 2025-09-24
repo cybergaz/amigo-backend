@@ -1,0 +1,22 @@
+### Test FCM Token Update
+POST http://localhost:5000/api/user/update-fcm-token
+Content-Type: application/json
+Cookie: access_token=your_access_token_here
+
+{
+  "fcm_token": "test_fcm_token_12345"
+}
+
+### Test User Details Update with FCM Token
+POST http://localhost:5000/api/user/update-user
+Content-Type: application/json
+Cookie: access_token=your_access_token_here
+
+{
+  "name": "Test User",
+  "fcm_token": "test_fcm_token_12345"
+}
+
+### Test Get User Details (should include FCM token)
+GET http://localhost:5000/api/user/get-user
+Cookie: access_token=your_access_token_here

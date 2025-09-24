@@ -10,6 +10,7 @@ import { forward_messages, pin_message, reply_to_message, star_messages, store_m
 import { update_user_details } from '@/services/user.services';
 import { CallService } from '@/services/call.service';
 import { CallSignalingMessage } from '@/types/call.types';
+import FCMService from '@/services/fcm.service';
 
 // Connection management
 interface UserConnection {
@@ -159,13 +160,15 @@ const leave_conversation = (user_id: number, conversation_id: number) => {
   }
 };
 
-const broadcast_to_conversation = (conversation_id: number, message: WSMessage, exclude_user?: number, message_id?: number, included_user?: number) => {
+const broadcast_to_conversation = async (conversation_id: number, message: WSMessage, exclude_user?: number, message_id?: number, included_user?: number) => {
 
   console.log(`broadcasting to conversation ID || ${conversation_id} ->`, message)
   // console.log("message ->", message)
   // console.log("connnections :", connections)
   // console.log("conversation_connections :", conversation_connections)
   const conv_connections = conversation_connections.get(conversation_id);
+  // console.log("connections ->", connections)
+  // console.log("conversation_connections ->", conversation_connections)
   if (!conv_connections) return;
 
   const message_str = JSON.stringify(message);
@@ -178,17 +181,27 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
     unread_by: [] as number[]
   };
 
-  conv_connections.forEach(user_id => {
+  // Track offline users for push notifications
+  // const online_users: Set<number> = conv_connections
+  // console.log("online_users ->", online_users)
+  // online_users.add(included_user || -1);
+
+  conv_connections.forEach(async user_id => {
+
+    // console.log("online_users ->", online_users)
     if (exclude_user && user_id === exclude_user) return;
 
     const connection = connections.get(user_id);
     // send message to online users, else increase the unread count in the database
     if (connection && connection.ws.readyState === 1) {
       try {
+        console.log(`sending to user ID || ${user_id} ->`, message)
         connection.ws.send(message_str);
         sent_count++;
         delivered_count++;
         delivery_status.delivered_to.push(user_id);
+
+        // online_users.add(user_id);
 
         // Check if user is actively viewing this conversation
         if (connection.active_conversation_id === conversation_id) {
@@ -217,6 +230,7 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
               });
           }
         } else {
+
           // User is online but not viewing this conversation - increase unread count
           delivery_status.unread_by.push(user_id);
 
@@ -244,6 +258,7 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
       } catch (error) {
         console.error(`[WS] Error sending to user ${user_id}:`, error);
         remove_connection(user_id);
+        // online_users.add(user_id);
       }
     }
     else {
@@ -264,8 +279,80 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
         .catch((error) => {
           console.error(`[WS] Error increasing unread count for user ${user_id}:`, error);
         });
+
+
     }
   });
+
+
+  // offline users from DB
+  const offline_members = await db
+    .select({ user_id: conversation_member_model.user_id })
+    .from(conversation_member_model)
+    .innerJoin(user_model, eq(conversation_member_model.user_id, user_model.id))
+    .where(
+      and(
+        eq(conversation_member_model.conversation_id, conversation_id),
+        eq(user_model.online_status, false)
+      )
+    )
+
+  const offline_member_ids = offline_members.map(m => m.user_id);
+  console.log("offline_member_ids ->", offline_member_ids)
+
+
+  // Send push notifications to offline users for message notifications
+  // Only send for actual message types, not call signaling
+  if (offline_member_ids.length > 0 && (message.type === 'message' || message.type === 'media' || message.type === 'message_reply' || message.type === 'message_forward') && message.data) {
+    try {
+      const messageData = message.data as any;
+      let senderId, senderName, messageBody, messageType;
+
+      // Handle different message types
+      if (message.type === 'message_reply') {
+        senderId = messageData.user_id;
+        messageBody = messageData.new_message;
+        messageType = 'reply';
+      } else if (message.type === 'message_forward') {
+        senderId = messageData.user_id;
+        messageBody = 'Forwarded message';
+        messageType = 'forward';
+      } else {
+        // Regular message or media
+        senderId = messageData.sender_id || messageData.user_id;
+        messageBody = messageData.body;
+        messageType = messageData.type || (message.type === 'media' ? 'media' : 'text');
+      }
+
+      senderName = messageData.sender_name || 'Someone';
+
+      // Get sender details for notification
+      const sender = await db
+        .select({ name: user_model.name })
+        .from(user_model)
+        .where(eq(user_model.id, senderId))
+        .limit(1);
+
+      const senderNameForNotification = sender[0]?.name || senderName;
+
+      // Filter out the sender from offline users to prevent self-notification
+      const recipientIds = offline_member_ids.filter(id => id !== senderId);
+
+      if (recipientIds.length > 0) {
+        // Send push notifications to offline users
+        await FCMService.sendBulkMessageNotifications(
+          recipientIds,
+          conversation_id.toString(),
+          senderId.toString(),
+          senderNameForNotification,
+          messageBody,
+          messageType
+        );
+      }
+    } catch (error) {
+      console.error(`[WS] Error sending push notifications:`, error);
+    }
+  }
 
   // console.log(`[WS] Broadcasted to ${sent_count} users in conversation ${conversation_id}. Delivered: ${delivered_count}, Read: ${read_count}`);
 
@@ -275,7 +362,7 @@ const broadcast_to_conversation = (conversation_id: number, message: WSMessage, 
   }
 };
 
-const send_to_user = (user_id: number, message: WSMessage) => {
+const send_to_user = async (user_id: number, message: WSMessage) => {
   const connection = connections.get(user_id);
   if (connection && connection.ws.readyState === 1) {
     try {
@@ -288,6 +375,17 @@ const send_to_user = (user_id: number, message: WSMessage) => {
       return false;
     }
   } else {
+
+    // console.log(`user ${user_id} is offline, total offline users for this message ->`)
+    // await FCMService.sendMessageNotification(user_id, {
+    //   conversationId: message.conversation_id ? message.conversation_id.toString() : '',
+    //   messageId: message.data?.id ? message.data.id.toString() : '',
+    //   senderId: message.data?.sender_id ? message.data.sender_id.toString() : '',
+    //   senderName: message.data?.sender_name || 'Someone',
+    //   messageBody: message.data?.body || '',
+    //   messageType: message.data?.type || 'text'
+    // })
+    //
     console.warn(`[WS] Cannot send ${message.type} to user ${user_id} - not connected or connection not ready`);
     console.warn(`[WS] Connection exists: ${!!connection}, ReadyState: ${connection?.ws.readyState}`);
   }
@@ -658,7 +756,7 @@ const web_socket = new Elysia()
                   conversation_id: message.conversation_id,
                   message_ids: message.message_ids,
                   timestamp: new Date().toISOString()
-                }, undefined);
+                }, undefined, reply_msg_res.data?.id, user_id);
               }
             }
             break;
@@ -673,19 +771,23 @@ const web_socket = new Elysia()
               }, user_id)
 
 
-              if (forward_res.success && message.data.target_conversation_ids) {
-                for (const target_conversation_id of message.data.target_conversation_ids) {
+              if (forward_res.success && message.data.target_conversation_ids && forward_res.data) {
+                for (let i = 0; i < message.data.target_conversation_ids.length; i++) {
+                  const target_conversation_id = message.data.target_conversation_ids[i];
+                  const forwarded_message = forward_res.data[i];
+                  
                   broadcast_to_conversation(target_conversation_id, {
                     type: 'message_forward',
                     data: {
                       user_id,
                       source_conversation_id: message.data.source_conversation_id,
-                      forwarded_message_ids: message.data.forwarded_message_ids
+                      forwarded_message_ids: message.data.forwarded_message_ids,
+                      new_message_id: forwarded_message?.id
                     },
-                    conversation_id: message.data.target_conversation_id,
+                    conversation_id: target_conversation_id,
                     message_ids: message.data.forwarded_message_ids,
                     timestamp: new Date().toISOString()
-                  }, user_id);
+                  }, user_id, forwarded_message?.id, user_id);
                 }
               }
             }
@@ -776,8 +878,9 @@ const web_socket = new Elysia()
             if (message.conversation_id) {
               const connection = connections.get(user_id);
               if (connection) {
+                const wasActive = connection.active_conversation_id === message.conversation_id;
                 connection.active_conversation_id = message.conversation_id;
-                // console.log(`user ${user_id} is currently viewing ${message.conversation_id}`);
+                // console.log(user ${user_id} is currently viewing ${message.conversation_id});
 
                 // Clear unread count when user becomes active in conversation
                 await db
@@ -804,33 +907,39 @@ const web_socket = new Elysia()
                   .limit(1);
 
                 if (latest_message) {
-                  await db
-                    .update(conversation_member_model)
-                    .set({
-                      last_read_message_id: latest_message.id,
-                      last_delivered_message_id: latest_message.id
-                    })
-                    .where(
-                      and(
-                        eq(conversation_member_model.conversation_id, message.conversation_id),
-                        eq(conversation_member_model.user_id, user_id)
-                      )
-                    );
+                  // Only update last_read_message_id if user wasn't already active in this conversation
+                  // This prevents resetting read receipts when user comes back to the same conversation
+                  if (!wasActive) {
+                    await db
+                      .update(conversation_member_model)
+                      .set({
+                        last_read_message_id: latest_message.id,
+                        last_delivered_message_id: latest_message.id
+                      })
+                      .where(
+                        and(
+                          eq(conversation_member_model.conversation_id, message.conversation_id),
+                          eq(conversation_member_model.user_id, user_id)
+                        )
+                      );
 
-                  // Notify other users in the conversation about read receipt
-                  broadcast_to_conversation(message.conversation_id, {
-                    type: 'read_receipt',
-                    data: {
-                      user_id,
-                      message_id: latest_message.id,
-                      read_all: true // Indicates user read all messages up to this point
-                    },
-                    conversation_id: message.conversation_id,
-                    timestamp: new Date().toISOString()
-                  }, user_id);
+                    // Only send read receipt if user wasn't already active
+                    // Notify other users in the conversation about read receipt
+                    broadcast_to_conversation(message.conversation_id, {
+                      type: 'read_receipt',
+                      data: {
+                        user_id,
+                        message_id: latest_message.id,
+                        read_all: true, // Indicates user read all messages up to this point
+                        user_active: true // User is currently active in conversation
+                      },
+                      conversation_id: message.conversation_id,
+                      timestamp: new Date().toISOString()
+                    }, user_id);
+                  }
                 }
 
-                // console.log(`[WS] Cleared unread count for user ${user_id} in conversation ${message.conversation_id}`);
+                // console.log([WS] Cleared unread count for user ${user_id} in conversation ${message.conversation_id});
               }
             }
 
@@ -841,7 +950,20 @@ const web_socket = new Elysia()
               const connection = connections.get(user_id);
               if (connection && connection.active_conversation_id === message.conversation_id) {
                 connection.active_conversation_id = undefined;
-                // console.log(`user ${user_id} is no longer viewing ${message.conversation_id}`);
+                // console.log(user ${user_id} is no longer viewing ${message.conversation_id});
+
+                // Send read receipt indicating user is no longer active
+                broadcast_to_conversation(message.conversation_id, {
+                  type: 'read_receipt',
+                  data: {
+                    user_id,
+                    message_id: null,
+                    read_all: false, // User is no longer reading messages
+                    user_active: false // User is no longer active in conversation
+                  },
+                  conversation_id: message.conversation_id,
+                  timestamp: new Date().toISOString()
+                }, user_id);
               }
             }
             break;
@@ -860,7 +982,7 @@ const web_socket = new Elysia()
                 // console.log(`[WS] Call initiation successful, callId: ${callId}`);
 
                 // Send acknowledgment to caller
-                const ackSent = send_to_user(user_id, {
+                const ackSent = await send_to_user(user_id, {
                   type: 'call:init',
                   callId,
                   from: user_id,
@@ -871,7 +993,7 @@ const web_socket = new Elysia()
                 // console.log(`[WS] Ack sent to caller ${user_id}: ${ackSent}`);
 
                 // Send incoming call notification to callee
-                const ringSent = send_to_user(message.to, {
+                const ringSent = await send_to_user(message.to, {
                   type: 'call:ringing',
                   callId,
                   from: user_id,
@@ -879,6 +1001,31 @@ const web_socket = new Elysia()
                   payload: message.payload,
                   timestamp: new Date().toISOString()
                 });
+
+                // Send push notification if user is offline
+                if (!ringSent) {
+                  try {
+                    // Get caller details for notification
+                    const caller = await db
+                      .select({ name: user_model.name, profile_pic: user_model.profile_pic })
+                      .from(user_model)
+                      .where(eq(user_model.id, user_id))
+                      .limit(1);
+
+                    const callerName = caller[0]?.name || 'Unknown';
+                    const callerProfilePic = caller[0]?.profile_pic!;
+
+                    await FCMService.sendCallNotification(message.to, {
+                      callId: callId!.toString(),
+                      callerId: user_id.toString(),
+                      callerName,
+                      callerProfilePic,
+                      callType: message.payload?.callType || 'audio',
+                    });
+                  } catch (error) {
+                    console.error(`[WS] Error sending call push notification:`, error);
+                  }
+                }
                 // console.log(`[WS] Ring sent to callee ${message.to}: ${ringSent}`);
                 //
                 // console.log(`[WS] Call init complete: ${callId} from ${user_id} to ${message.to}`);
@@ -953,19 +1100,25 @@ const web_socket = new Elysia()
 
           case 'call:decline':
             if (message.callId) {
+              const active_call = CallService.get_user_active_call(user_id);
               const result = await CallService.decline_call(message.callId, user_id, message.payload?.reason);
-              console.log("result ->", result)
 
               if (result.success) {
-                const active_call = CallService.get_user_active_call(user_id);
                 if (active_call) {
                   // Notify caller
+                  const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
                   send_to_user(active_call.caller_id, {
                     type: 'call:decline',
                     callId: message.callId,
                     from: user_id,
-                    to: active_call.caller_id,
+                    to: other_user,
                     payload: message.payload,
+                    timestamp: new Date().toISOString()
+                  });
+                  send_to_user(user_id, {
+                    type: 'call:decline',
+                    callId: message.callId,
+                    data: { success: true, reason: message.payload?.reason },
                     timestamp: new Date().toISOString()
                   });
                 }

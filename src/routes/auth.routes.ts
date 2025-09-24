@@ -172,24 +172,24 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     ) {
       cookie["refresh_token"].set({
         value: login_res.data.refresh_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        // httpOnly: true,
+        // secure: true,
+        // sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
-        domain: "ui.gosecureserver.in",
-        partitioned: true,
+        // domain: "ui.gosecureserver.in",
+        // partitioned: true,
       });
 
       cookie["access_token"].set({
         value: login_res.data.access_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        // httpOnly: true,
+        // secure: true,
+        // sameSite: "none",
         maxAge: 60 * 60 * 24,
         path: "/",
-        domain: "ui.gosecureserver.in",
-        partitioned: true,
+        // domain: "ui.gosecureserver.in",
+        // partitioned: true,
       });
       console.log(
         `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`

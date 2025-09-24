@@ -3,6 +3,7 @@ import { get_available_users, get_user_details, update_user_details, update_prof
 import { get_all_users } from "@/services/user.services";
 import { app_middleware } from "@/middleware";
 import { ROLE_CONST } from "@/types/user.types";
+import FCMService from "@/services/fcm.service";
 
 const user_routes = new Elysia({ prefix: "/user" })
   .state({ id: 0, role: "" })
@@ -40,6 +41,7 @@ const user_routes = new Elysia({ prefix: "/user" })
           longitude: t.Number(),
         })),
         ip_address: t.Optional(t.String()),
+        fcm_token: t.Optional(t.String()),
       }),
     }
   )
@@ -97,6 +99,39 @@ const user_routes = new Elysia({ prefix: "/user" })
           type: ["image/jpeg", "image/jpg", "image/png", "image/webp"],
           maxSize: 5 * 1024 * 1024, // 5MB
         }),
+      }),
+    }
+  )
+
+  .post("/update-fcm-token", async ({ set, store, body }) => {
+    try {
+      const result = await FCMService.updateUserFCMToken(store.id, body.fcm_token);
+      
+      if (result) {
+        set.status = 200;
+        return {
+          success: true,
+          message: "FCM token updated successfully",
+        };
+      } else {
+        set.status = 500;
+        return {
+          success: false,
+          message: "Failed to update FCM token",
+        };
+      }
+    } catch (error: any) {
+      console.error("Error updating FCM token:", error);
+      set.status = 500;
+      return {
+        success: false,
+        message: "Internal server error",
+      };
+    }
+  },
+    {
+      body: t.Object({
+        fcm_token: t.String(),
       }),
     }
   )

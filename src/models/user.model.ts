@@ -18,6 +18,7 @@ const user_model = pgTable("users", {
   location: jsonb(), // { latitude: number, longitude: number }
   ip_address: varchar({ length: 50 }), // To accommodate IPv6 addresses
   permissions: jsonb(), // Array of permitted routes for sub-admins: ["dashboard", "manage-groups", "manage-chats", "admin-management"]
+  fcm_token: text(), // Firebase Cloud Messaging token for push notifications
 });
 
 type UserType = InferSelectModel<typeof user_model>;
