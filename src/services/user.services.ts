@@ -233,6 +233,21 @@ export const get_all_users = async () => {
 export const get_available_users = async (self_id: number, phone_numbers: string[]) => {
   // console.log("phone_numbers ->", phone_numbers)
 
+  const [self] = await db
+    .select()
+    .from(user_model)
+    .where(eq(user_model.id, self_id))
+    .limit(1);
+
+  if (!self) {
+    return {
+      success: false,
+      code: 404,
+      message: "User not found",
+      data: null,
+    };
+  }
+
   if (phone_numbers.length === 0) {
     return {
       success: false,
@@ -240,8 +255,12 @@ export const get_available_users = async (self_id: number, phone_numbers: string
       message: "No phone numbers provided",
     };
   }
+
+  const default_country_code = parse_phone(self.phone!).code;
+
   // console.log("phone_numbers ->", phone_numbers)
-  const cleaned_phone_numbers = phone_numbers.map((phone) => phone.replace(" ", ""));
+  // const cleaned_phone_numbers = phone_numbers.map((phone) => phone.replace(" ", ""));
+  const parsed_phone_numbers = phone_numbers.map((phone) => parse_phone(phone, default_country_code).concatinated);
   // console.log("cleaned_phone_numbers ->", cleaned_phone_numbers)
   // console.log("parsed_phone_numbers ->", parsed_phone_numbers)
 
@@ -256,7 +275,7 @@ export const get_available_users = async (self_id: number, phone_numbers: string
       })
       .from(user_model)
       .where(and(
-        inArray(user_model.phone, cleaned_phone_numbers),
+        inArray(user_model.phone, parsed_phone_numbers),
         ne(user_model.id, self_id)
       ));
 

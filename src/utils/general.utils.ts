@@ -41,13 +41,13 @@ const compare_password = async (password: string, hashed_password: string) => {
 };
 
 
-function parse_phone(input: string) {
+function parse_phone(input: string, default_country_code?: string) {
   const phone = parsePhoneNumberFromString(input);
 
   if (!phone) return {
     code: "",
     phone: input,
-    concatinated: input.replace(" ", ""),
+    concatinated: `+${default_country_code}${input.replace(" ", "")}`,
   };
 
   return {

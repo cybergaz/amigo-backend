@@ -954,6 +954,7 @@ const web_socket = new Elysia()
           case 'call:decline':
             if (message.callId) {
               const result = await CallService.decline_call(message.callId, user_id, message.payload?.reason);
+              console.log("result ->", result)
 
               if (result.success) {
                 const active_call = CallService.get_user_active_call(user_id);
