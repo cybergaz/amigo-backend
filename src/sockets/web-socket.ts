@@ -884,7 +884,7 @@ const web_socket = new Elysia()
               // check if user is in the conversation_connections
 
               const conv_connections = Array.from(conversation_connections.get(message.conversation_id) || []);
-              const inside_the_selected_convesation = conv_connections.map(id => {
+              const inside_the_selected_convesation = conv_connections.filter(id => {
                 if (connections.get(id)?.active_conversation_id === message.conversation_id) {
                   return id
                 }
@@ -1008,7 +1008,7 @@ const web_socket = new Elysia()
                 }, user_id);
 
                 const conv_connections = Array.from(conversation_connections.get(message.conversation_id) || []);
-                const inside_the_selected_convesation = conv_connections.map(id => {
+                const inside_the_selected_convesation = conv_connections.filter(id => {
                   if (connections.get(id)?.active_conversation_id === message.conversation_id) {
                     return id
                   }
