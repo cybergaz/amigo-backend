@@ -20,9 +20,11 @@ const user_routes = new Elysia({ prefix: "/user" })
       store.id = state_result.data.id;
       store.role = state_result.data.role;
 
+      console.log("updating ip")
       // Update IP address if available
       if (state_result.data.ip_address) {
         await db.update(user_model).set({ ip_address: state_result.data.ip_address }).where(eq(user_model.id, state_result.data.id))
+        console.log("updated ip")
       }
     }
   })
