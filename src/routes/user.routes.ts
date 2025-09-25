@@ -4,11 +4,14 @@ import { get_all_users } from "@/services/user.services";
 import { app_middleware } from "@/middleware";
 import { ROLE_CONST } from "@/types/user.types";
 import FCMService from "@/services/fcm.service";
+import db from "@/config/db";
+import { user_model } from "@/models/user.model";
+import { eq } from "drizzle-orm";
 
 const user_routes = new Elysia({ prefix: "/user" })
   .state({ id: 0, role: "" })
   .guard({
-    beforeHandle({ cookie, set, store, headers }) {
+    async beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
 
       set.status = state_result.code;
@@ -16,6 +19,11 @@ const user_routes = new Elysia({ prefix: "/user" })
 
       store.id = state_result.data.id;
       store.role = state_result.data.role;
+
+      // Update IP address if available
+      if (state_result.data.ip_address) {
+        await db.update(user_model).set({ ip_address: state_result.data.ip_address }).where(eq(user_model.id, state_result.data.id))
+      }
     }
   })
 
@@ -106,7 +114,7 @@ const user_routes = new Elysia({ prefix: "/user" })
   .post("/update-fcm-token", async ({ set, store, body }) => {
     try {
       const result = await FCMService.updateUserFCMToken(store.id, body.fcm_token);
-      
+
       if (result) {
         set.status = 200;
         return {

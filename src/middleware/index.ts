@@ -27,9 +27,7 @@ export const authenticate_jwt = (access_token: string) => {
 
 export const app_middleware = ({ cookie, headers, allowed }: ElysiaMiddlewareType) => {
   let access_token = String(cookie.access_token) || String(headers["authorization"]?.replace("Bearer ", "") ?? "");
-  const ip = headers["origin"] || headers["host"]
-  console.log("headers ->", headers)
-  console.log("ip ->", ip)
+  const ip = headers["x-forwarded-for"]?.split(",")[0] || headers["x-real-ip"]
 
   if (!access_token) {
     return {
@@ -61,7 +59,11 @@ export const app_middleware = ({ cookie, headers, allowed }: ElysiaMiddlewareTyp
     success: middleware_response.success,
     code: middleware_response.code,
     message: middleware_response.message,
-    data: middleware_response.data
+    data: {
+      id: middleware_response.data.id,
+      role: middleware_response.data.role,
+      ip_address: ip,
+    }
   };
 }
 

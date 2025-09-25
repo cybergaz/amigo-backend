@@ -33,7 +33,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       }
 
       const result = await get_all_admins();
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -60,12 +60,12 @@ const admin_routes = new Elysia({ prefix: "/admin" })
         };
       }
 
-      const { email, password, permissions } = body as { 
-        email: string; 
-        password: string; 
-        permissions: string[] 
+      const { email, password, permissions } = body as {
+        email: string;
+        password: string;
+        permissions: string[]
       };
-      
+
       if (!email || !password || !permissions || !Array.isArray(permissions)) {
         set.status = 400;
         return {
@@ -77,7 +77,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       }
 
       const result = await create_admin_user(email, password, permissions);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -111,7 +111,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       }
 
       const { id, permissions } = body as { id: number; permissions: string[] };
-      
+
       if (!id || !permissions || !Array.isArray(permissions)) {
         set.status = 400;
         return {
@@ -123,7 +123,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       }
 
       const result = await update_admin_permissions(id, permissions);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -156,7 +156,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       }
 
       const { id, active } = body as { id: number; active: boolean };
-      
+
       if (!id || typeof active !== 'boolean') {
         set.status = 400;
         return {
@@ -179,7 +179,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       }
 
       const result = await update_admin_status(id, active);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -201,7 +201,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .get("/user-permissions", async ({ set, store }) => {
     try {
       const result = await get_user_permissions(store.id);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -222,7 +222,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       const search = query.search as string || '';
 
       const result = await get_all_users_paginated(page, limit, search);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -239,7 +239,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .get("/dashboard-stats", async ({ set, store }) => {
     try {
       const result = await get_dashboard_stats();
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -256,7 +256,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .put("/update-user-role", async ({ body, set, store }) => {
     try {
       const { id, role } = body as { id: number; role: string };
-      
+
       if (!id || !role) {
         set.status = 400;
         return {
@@ -268,7 +268,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       }
 
       const result = await update_user_role(id, role as any);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -285,7 +285,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .put("/update-user-call-access", async ({ body, set, store }) => {
     try {
       const { id, call_access } = body as { id: number; call_access: boolean };
-      
+
       if (!id || typeof call_access !== 'boolean') {
         set.status = 400;
         return {
@@ -297,7 +297,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       }
 
       const result = await update_user_call_access(id, call_access);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -330,11 +330,11 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       // Process groups
       if (allGroups.success && allGroups.data) {
         totalGroups = allGroups.data.length;
-        adminManagedGroups = allGroups.data.filter((group: any) => 
+        adminManagedGroups = allGroups.data.filter((group: any) =>
           group.createrId === store.id // Admin created groups
         ).length;
         userCreatedGroups = totalGroups - adminManagedGroups;
-        
+
         // Calculate total members from groups
         totalMembers += allGroups.data.reduce((sum: number, group: any) => sum + group.memberCount, 0);
       }
@@ -385,7 +385,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     try {
       const type = (query.type as string) || "all";
       const result = await get_all_conversations_admin(type);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -403,15 +403,15 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     try {
       const page = Number(query.page) || 1;
       const limit = Number(query.limit) || 10;
-      
+
       const result = await get_all_conversations_admin("dm");
-      
+
       if (result.success && result.data) {
         // Apply pagination
         const startIndex = (page - 1) * limit;
         const endIndex = startIndex + limit;
         const paginatedData = result.data.slice(startIndex, endIndex);
-        
+
         set.status = 200;
         return {
           success: true,
@@ -429,7 +429,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
           }
         };
       }
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -446,7 +446,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .get("/chat-management/group-details/:conversation_id", async ({ set, store, params }) => {
     try {
       const result = await get_conversation_members_admin(params.conversation_id);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -467,11 +467,11 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .post("/chat-management/add-member", async ({ set, store, body }) => {
     try {
       const result = await add_new_member(
-        body.conversation_id, 
-        body.user_ids, 
+        body.conversation_id,
+        body.user_ids,
         body.role || "member"
       );
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -494,7 +494,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .delete("/chat-management/remove-member", async ({ set, store, body }) => {
     try {
       const result = await remove_member(body.conversation_id, body.user_id);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -517,13 +517,13 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     try {
       const page = Number(query.page) || 1;
       const limit = Number(query.limit) || 20;
-      
+
       const result = await get_conversation_history_admin(
         params.conversation_id,
         page,
         limit
       );
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -548,7 +548,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .get("/chat-management/communities", async ({ set, store }) => {
     try {
       const result = await get_communities(store.id);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -565,7 +565,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .get("/chat-management/community-groups/:community_id", async ({ set, store, params }) => {
     try {
       const result = await get_community_groups(params.community_id, store.id);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
@@ -597,7 +597,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       }
 
       const result = await permanently_delete_message_admin(params.message_id);
-      
+
       set.status = result.code;
       return result;
     } catch (error) {
