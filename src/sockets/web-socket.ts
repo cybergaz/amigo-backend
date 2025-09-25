@@ -566,6 +566,7 @@ const web_socket = new Elysia()
 
               // if (membership.length > 0) {
               join_conversation(user_id, message.conversation_id);
+              join_conversation(message.data.recipient_id, message.conversation_id);
               send_to_user(user_id, {
                 type: 'join_conversation',
                 data: { success: true },
