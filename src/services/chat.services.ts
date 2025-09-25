@@ -626,13 +626,20 @@ const get_conversation_history = async (
     const members = await db
       .select({
         user_id: conversation_member_model.user_id,
+        name: user_model.name,
+        profile_pic: user_model.profile_pic,
         last_read_message_id: conversation_member_model.last_read_message_id,
         last_delivered_message_id: conversation_member_model.last_delivered_message_id,
       })
       .from(conversation_member_model)
+      .leftJoin(
+        user_model,
+        eq(user_model.id, conversation_member_model.user_id)
+      )
       .where(
         and(
           eq(conversation_member_model.conversation_id, conversation_id),
+          eq(conversation_member_model.deleted, false)
         )
       );
 
