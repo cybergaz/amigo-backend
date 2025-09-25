@@ -884,14 +884,20 @@ const web_socket = new Elysia()
               // check if user is in the conversation_connections
 
               const conv_connections = Array.from(conversation_connections.get(message.conversation_id) || []);
-              console.log("sending online status ->", conv_connections)
+              const inside_the_selected_convesation = conv_connections.map(id => {
+                if (connections.get(id)?.active_conversation_id === message.conversation_id) {
+                  return id
+                }
+              });
+              console.log("sending online status ->", inside_the_selected_convesation)
+
               // Update online status in the database
               // await update_user_details(message.user_id, { online_status: message.data?.online_status, last_seen: new Date() });
               // Broadcast to conversation members
               broadcast_to_conversation(message.conversation_id, {
                 type: 'online_status',
                 data: {
-                  online_in_conversation: conv_connections
+                  online_in_conversation: inside_the_selected_convesation
                 },
                 conversation_id: message.conversation_id,
               });
