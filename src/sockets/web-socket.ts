@@ -1006,6 +1006,22 @@ const web_socket = new Elysia()
                   conversation_id: message.conversation_id,
                   timestamp: new Date().toISOString()
                 }, user_id);
+
+                const conv_connections = Array.from(conversation_connections.get(message.conversation_id) || []);
+                const inside_the_selected_convesation = conv_connections.map(id => {
+                  if (connections.get(id)?.active_conversation_id === message.conversation_id) {
+                    return id
+                  }
+                });
+                console.log("sending online status ->", inside_the_selected_convesation)
+
+                broadcast_to_conversation(message.conversation_id, {
+                  type: 'online_status',
+                  data: {
+                    online_in_conversation: inside_the_selected_convesation
+                  },
+                  conversation_id: message.conversation_id,
+                });
               }
             }
             break;
