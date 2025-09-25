@@ -4,14 +4,11 @@ import { get_all_users } from "@/services/user.services";
 import { app_middleware } from "@/middleware";
 import { ROLE_CONST } from "@/types/user.types";
 import FCMService from "@/services/fcm.service";
-import db from "@/config/db";
-import { user_model } from "@/models/user.model";
-import { eq } from "drizzle-orm";
 
 const user_routes = new Elysia({ prefix: "/user" })
   .state({ id: 0, role: "" })
   .guard({
-    async beforeHandle({ cookie, set, store, headers }) {
+    beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
 
       set.status = state_result.code;
@@ -19,13 +16,6 @@ const user_routes = new Elysia({ prefix: "/user" })
 
       store.id = state_result.data.id;
       store.role = state_result.data.role;
-
-      console.log("updating ip")
-      // Update IP address if available
-      if (state_result.data.ip_address) {
-        await db.update(user_model).set({ ip_address: state_result.data.ip_address }).where(eq(user_model.id, state_result.data.id))
-        console.log("updated ip")
-      }
     }
   })
 
@@ -36,6 +26,7 @@ const user_routes = new Elysia({ prefix: "/user" })
   })
 
   .post("/update-user", async ({ set, store, body }) => {
+    console.log("body ->", body)
     const user_Details = await update_user_details(store.id, body);
     set.status = user_Details.code;
     return user_Details;
