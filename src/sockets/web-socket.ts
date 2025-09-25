@@ -27,7 +27,7 @@ const conversation_connections = new Map<number, Set<number>>(); // conversation
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'create_new_chat' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'active_in_conversation' | 'inactive_in_conversation' | 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed' | 'call:merge' | 'call:merge_accepted' | 'call:merge_declined' | 'call:participant_joined' | 'call:participant_left' | 'call:participant_removed' | 'call:remove_participant';
+  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'create_new_chat' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'online_status' | 'active_in_conversation' | 'inactive_in_conversation' | 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed' | 'call:merge' | 'call:merge_accepted' | 'call:merge_declined' | 'call:participant_joined' | 'call:participant_left' | 'call:participant_removed' | 'call:remove_participant';
   data?: any;
   conversation_id?: number;
   message_ids?: number[];
@@ -165,8 +165,8 @@ const broadcast_to_conversation = async (conversation_id: number, message: WSMes
 
   console.log(`broadcasting to conversation ID || ${conversation_id} ->`, message)
   // console.log("message ->", message)
-  console.log("connnections :", connections)
-  console.log("conversation_connections :", conversation_connections)
+  // console.log("connnections :", connections)
+  // console.log("conversation_connections :", conversation_connections)
   const conv_connections = conversation_connections.get(conversation_id);
   // console.log("connections ->", connections)
   // console.log("conversation_connections ->", conversation_connections)
@@ -521,7 +521,6 @@ const web_socket = new Elysia()
     },
 
     message: async (ws, message) => {
-      console.log("message came ->", message)
 
       try {
         const user_id = getUserId(ws);
@@ -566,7 +565,8 @@ const web_socket = new Elysia()
 
               // if (membership.length > 0) {
               join_conversation(user_id, message.conversation_id);
-              join_conversation(message.data.recipient_id, message.conversation_id);
+              join_conversation(Number(message.data.recipient_id), message.conversation_id);
+
               send_to_user(user_id, {
                 type: 'join_conversation',
                 data: { success: true },
@@ -878,6 +878,26 @@ const web_socket = new Elysia()
           //   }
           //
           //   break;
+
+          case 'online_status':
+            if (message.conversation_id) {
+              // check if user is in the conversation_connections
+
+              const conv_connections = Array.from(conversation_connections.get(message.conversation_id) || []);
+              console.log("sending online status ->", conv_connections)
+              // Update online status in the database
+              // await update_user_details(message.user_id, { online_status: message.data?.online_status, last_seen: new Date() });
+              // Broadcast to conversation members
+              broadcast_to_conversation(message.conversation_id, {
+                type: 'online_status',
+                data: {
+                  online_in_conversation: conv_connections
+                },
+                conversation_id: message.conversation_id,
+              });
+            }
+
+            break;
 
           case 'active_in_conversation':
             if (message.conversation_id) {
