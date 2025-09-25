@@ -111,6 +111,7 @@ export const find_user_by_phone = async (phone: string) => {
         .where(eq(user_model.phone, phone))
         .limit(1)
     )[0];
+
     if (!existing_user) {
       return { success: false, code: 404, message: "No Such User" };
     }

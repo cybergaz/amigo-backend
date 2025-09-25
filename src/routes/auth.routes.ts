@@ -8,6 +8,16 @@ import Elysia, { t } from "elysia";
 const auth_routes = new Elysia({ prefix: "/auth" })
 
   .post("/generate-signup-otp/:phone", async ({ set, params }) => {
+    const existing_user_res = await find_user_by_phone(params.phone);
+    if (existing_user_res.success) {
+      set.status = 409;
+      return {
+        success: false,
+        code: 409,
+        message: "User already exists with this phone number.",
+      };
+    }
+
     const otp_res = await generate_otp(params.phone);
 
     set.status = otp_res.code;

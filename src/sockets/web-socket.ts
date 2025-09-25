@@ -27,7 +27,7 @@ const conversation_connections = new Map<number, Set<number>>(); // conversation
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'active_in_conversation' | 'inactive_in_conversation' | 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed' | 'call:merge' | 'call:merge_accepted' | 'call:merge_declined' | 'call:participant_joined' | 'call:participant_left' | 'call:participant_removed' | 'call:remove_participant';
+  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'create_new_chat' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'active_in_conversation' | 'inactive_in_conversation' | 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed' | 'call:merge' | 'call:merge_accepted' | 'call:merge_declined' | 'call:participant_joined' | 'call:participant_left' | 'call:participant_removed' | 'call:remove_participant';
   data?: any;
   conversation_id?: number;
   message_ids?: number[];
@@ -87,6 +87,7 @@ const add_connection = async (user_id: number, ws: ElysiaWS) => {
     .from(conversation_member_model)
     .where(eq(conversation_member_model.user_id, user_id));
 
+  console.log("memberships ->", memberships)
   // Close existing connection if any
   if (connections.has(user_id)) {
     const existing = connections.get(user_id);
@@ -164,8 +165,8 @@ const broadcast_to_conversation = async (conversation_id: number, message: WSMes
 
   console.log(`broadcasting to conversation ID || ${conversation_id} ->`, message)
   // console.log("message ->", message)
-  // console.log("connnections :", connections)
-  // console.log("conversation_connections :", conversation_connections)
+  console.log("connnections :", connections)
+  console.log("conversation_connections :", conversation_connections)
   const conv_connections = conversation_connections.get(conversation_id);
   // console.log("connections ->", connections)
   // console.log("conversation_connections ->", conversation_connections)
@@ -545,6 +546,7 @@ const web_socket = new Elysia()
 
           case 'join_conversation':
             if (message.conversation_id) {
+              console.log("join_conversation ->", message.conversation_id)
               // -----------------------------------------------------------
               // TEMPORARY BYPASS AUTHORIZATION CHECK (FOR TESTING ONLY)
               // -----------------------------------------------------------
@@ -559,6 +561,8 @@ const web_socket = new Elysia()
               //     )
               //   )
               //   .limit(1);
+
+              // add_connection(user_id, ws);
 
               // if (membership.length > 0) {
               join_conversation(user_id, message.conversation_id);
