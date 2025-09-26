@@ -2,7 +2,7 @@ import { authenticate_jwt } from '@/middleware';
 import { Elysia, t } from 'elysia';
 import db from '@/config/db';
 import { message_model, conversation_model, conversation_member_model } from '@/models/chat.model';
-import { eq, and, or, sql } from 'drizzle-orm';
+import { eq, and, or, sql, desc } from 'drizzle-orm';
 import { ElysiaWS } from 'elysia/dist/ws';
 import { WebSocketData, TypedElysiaWS } from '@/types/elysia.types';
 import { user_model } from '@/models/user.model';
@@ -11,6 +11,7 @@ import { update_user_details } from '@/services/user.services';
 import { CallService } from '@/services/call.service';
 import { CallSignalingMessage } from '@/types/call.types';
 import FCMService from '@/services/fcm.service';
+import { call_model } from '@/models/call.model';
 
 // Connection management
 interface UserConnection {
@@ -500,6 +501,35 @@ const web_socket = new Elysia()
           data: { message: 'Connected to chat server' },
           timestamp: new Date().toISOString()
         });
+
+        // send pending calls to the user
+        const [last_pending_call] =
+          await db
+            .select()
+            .from(call_model)
+            .innerJoin(user_model, eq(call_model.caller_id, user_model.id))
+            .where(
+              and(
+                eq(call_model.callee_id, user_id),
+                eq(call_model.status, 'initiated')
+              ))
+            .orderBy(desc(call_model.id))
+            .limit(1);
+
+        if (last_pending_call) {
+          send_to_user(user_id, {
+            type: 'call:ringing',
+            callId: last_pending_call.calls.id,
+            from: last_pending_call.calls.caller_id,
+            to: user_id,
+            payload: {
+              callerName: last_pending_call.users.name,
+              callerProfilePic: last_pending_call.users.profile_pic,
+            },
+            timestamp: last_pending_call.calls.started_at?.toISOString()
+          });
+        }
+
 
         // Notify all users about the new online user
         broadcast_to_all(
@@ -1061,7 +1091,7 @@ const web_socket = new Elysia()
                 });
 
                 // Send push notification if user is offline
-                if (!ringSent) {
+                if (ringSent) {
                   try {
                     // Get caller details for notification
                     const caller = await db
