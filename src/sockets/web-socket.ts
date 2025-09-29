@@ -595,6 +595,14 @@ const web_socket = new Elysia()
 
               // if (membership.length > 0) {
               join_conversation(user_id, message.conversation_id);
+              message.data.recipient_id.forEach((element: number) => {
+                console.log("recipient_id ->", element)
+                if (Number(element) !== user_id) {
+                  join_conversation(Number(element), message.conversation_id!)
+                }
+
+              });
+              // message.data.recipient_id.map((id: number) => Number(id) !== user_id ? join_conversation(Number(id), message.conversation_id!) : null)
               join_conversation(Number(message.data.recipient_id), message.conversation_id);
 
               send_to_user(user_id, {
@@ -1070,7 +1078,7 @@ const web_socket = new Elysia()
                 // console.log(`[WS] Call initiation successful, callId: ${callId}`);
 
                 // Send acknowledgment to caller
-                const ackSent = await send_to_user(user_id, {
+                await send_to_user(user_id, {
                   type: 'call:init',
                   callId,
                   from: user_id,
@@ -1091,7 +1099,7 @@ const web_socket = new Elysia()
                 });
 
                 // Send push notification if user is offline
-                if (ringSent) {
+                if (!ringSent) {
                   try {
                     // Get caller details for notification
                     const caller = await db
@@ -1102,6 +1110,16 @@ const web_socket = new Elysia()
 
                     const callerName = caller[0]?.name || 'Unknown';
                     const callerProfilePic = caller[0]?.profile_pic!;
+
+                    await FCMService.sendBulkMessageNotifications(
+
+                      [message.to],
+                      message.conversation_id!.toString(),
+                      user_id.toString(),
+                      "testing user X",
+                      "calling you",
+                      "call"
+                    );
 
                     await FCMService.sendCallNotification(message.to, {
                       callId: callId!.toString(),
