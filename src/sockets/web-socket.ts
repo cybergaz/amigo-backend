@@ -1111,6 +1111,8 @@ const web_socket = new Elysia()
                     const callerName = caller[0]?.name || 'Unknown';
                     const callerProfilePic = caller[0]?.profile_pic!;
 
+                    console.log("caller ->", caller)
+
                     // await FCMService.sendBulkMessageNotifications(
                     //   [message.to],
                     //   "7921368022",
