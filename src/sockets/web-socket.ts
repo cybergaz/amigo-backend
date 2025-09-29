@@ -1111,14 +1111,14 @@ const web_socket = new Elysia()
                     const callerName = caller[0]?.name || 'Unknown';
                     const callerProfilePic = caller[0]?.profile_pic!;
 
-                    await FCMService.sendBulkMessageNotifications(
-                      [message.to],
-                      "7921368022",
-                      user_id.toString(),
-                      "testing user X",
-                      "calling you",
-                      "call"
-                    );
+                    // await FCMService.sendBulkMessageNotifications(
+                    //   [message.to],
+                    //   "7921368022",
+                    //   user_id.toString(),
+                    //   "testing user X",
+                    //   "calling you",
+                    //   "call"
+                    // );
 
                     await FCMService.sendCallNotification(message.to, {
                       callId: callId!.toString(),
