@@ -1112,7 +1112,6 @@ const web_socket = new Elysia()
                     const callerProfilePic = caller[0]?.profile_pic!;
 
                     await FCMService.sendBulkMessageNotifications(
-
                       [message.to],
                       message.conversation_id!.toString(),
                       user_id.toString(),
