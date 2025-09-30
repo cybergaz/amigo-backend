@@ -75,10 +75,10 @@ export class FCMService {
 
       const message: admin.messaging.Message = {
         token: fcmToken,
-        notification: {
-          title: payload.title,
-          body: payload.body,
-        },
+        // notification: {
+        //   title: payload.title,
+        //   body: payload.body,
+        // },
         data: {
           type: payload.type,
           ...payload.data,
@@ -160,10 +160,10 @@ export class FCMService {
       // Special message structure for call notifications with action buttons
       const message: admin.messaging.Message = {
         token: fcmToken,
-        notification: {
-          title: `Incoming ${data.callType} call`,
-          body: `${data.callerName} is calling you`
-        },
+        // notification: {
+        //   title: `Incoming ${data.callType} call`,
+        //   body: `${data.callerName} is calling you`
+        // },
         data: {
           type: 'call',
           callId: data.callId,
