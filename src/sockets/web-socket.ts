@@ -1143,13 +1143,13 @@ const web_socket = new Elysia()
                     //   "call"
                     // );
 
-                    // await FCMService.sendCallNotification(message.to, {
-                    //   callId: callId!.toString(),
-                    //   callerId: user_id.toString(),
-                    //   callerName,
-                    //   callerProfilePic,
-                    //   callType: message.payload?.callType || 'audio',
-                    // });
+                    await FCMService.sendCallNotification(message.to, {
+                      callId: callId!.toString(),
+                      callerId: user_id.toString(),
+                      callerName,
+                      callerProfilePic,
+                      callType: message.payload?.callType || 'audio',
+                    });
                   } catch (error) {
                     console.error(`[WS] Error sending call push notification:`, error);
                   }
