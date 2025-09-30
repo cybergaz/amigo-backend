@@ -11,7 +11,6 @@ import { update_user_details } from '@/services/user.services';
 import { CallService } from '@/services/call.service';
 import { CallSignalingMessage } from '@/types/call.types';
 import FCMService from '@/services/fcm.service';
-import { WebSocketNotificationService } from '@/services/websocket-notification.service';
 
 // Connection management
 interface UserConnection {
@@ -776,7 +775,7 @@ const web_socket = new Elysia()
                 for (let i = 0; i < message.data.target_conversation_ids.length; i++) {
                   const target_conversation_id = message.data.target_conversation_ids[i];
                   const forwarded_message = forward_res.data[i];
-                  
+
                   broadcast_to_conversation(target_conversation_id, {
                     type: 'message_forward',
                     data: {
@@ -1067,11 +1066,28 @@ const web_socket = new Elysia()
               const result = await CallService.accept_call(message.callId, user_id);
 
               if (result.success) {
-                // Send WebSocket notifications
-                await WebSocketNotificationService.sendCallAcceptNotification(
-                  message.callId, 
-                  user_id
-                );
+                // Notify both parties
+                const active_call = CallService.get_user_active_call(user_id);
+                if (active_call) {
+                  // Notify caller
+                  send_to_user(active_call.caller_id, {
+                    type: 'call:accept',
+                    callId: message.callId,
+                    from: user_id,
+                    to: active_call.caller_id,
+                    timestamp: new Date().toISOString()
+                  });
+
+                  // Acknowledge to callee
+                  send_to_user(user_id, {
+                    type: 'call:accept',
+                    callId: message.callId,
+                    from: user_id,
+                    to: active_call.caller_id,
+                    data: { success: true },
+                    timestamp: new Date().toISOString()
+                  });
+                }
               } else {
                 send_to_user(user_id, {
                   type: 'error',
@@ -1084,31 +1100,74 @@ const web_socket = new Elysia()
 
           case 'call:decline':
             if (message.callId) {
+              const active_call = CallService.get_user_active_call(user_id);
               const result = await CallService.decline_call(message.callId, user_id, message.payload?.reason);
 
               if (result.success) {
-                // Send WebSocket notifications
-                await WebSocketNotificationService.sendCallDeclineNotification(
-                  message.callId, 
-                  user_id, 
-                  message.payload?.reason
-                );
+                if (active_call) {
+                  // Notify caller
+                  const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
+                  send_to_user(active_call.caller_id, {
+                    type: 'call:decline',
+                    callId: message.callId,
+                    from: user_id,
+                    to: other_user,
+                    payload: message.payload,
+                    timestamp: new Date().toISOString()
+                  });
+                  send_to_user(user_id, {
+                    type: 'call:decline',
+                    callId: message.callId,
+                    data: { success: true, reason: message.payload?.reason },
+                    timestamp: new Date().toISOString()
+                  });
+
+                  await FCMService.sendNotificationToUser(other_user, {
+                    title: "Call Ended",
+                    body: `User declined your call`,
+                    type: 'call_end',
+                  })
+                }
               }
             }
             break;
 
           case 'call:end':
             if (message.callId) {
+              // Get active call first before ending it
+              const active_call = CallService.get_user_active_call(user_id);
+
               const result = await CallService.end_call(message.callId, user_id, message.payload?.reason);
 
               if (result.success) {
-                // Send WebSocket notifications
-                await WebSocketNotificationService.sendCallEndNotification(
-                  message.callId, 
-                  user_id, 
-                  message.payload?.reason,
-                  result.data?.duration_seconds
-                );
+                // Find the other party and notify them
+                if (active_call) {
+                  const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
+
+                  // console.log(`[WS] Call ended: ${message.callId}, notifying user ${other_user}`);
+
+                  send_to_user(other_user, {
+                    type: 'call:end',
+                    callId: message.callId,
+                    from: user_id,
+                    to: other_user,
+                    payload: {
+                      reason: message.payload?.reason,
+                      duration: result.data?.duration_seconds
+                    },
+                    timestamp: new Date().toISOString()
+                  });
+
+                  // Acknowledge to sender
+                  send_to_user(user_id, {
+                    type: 'call:end',
+                    callId: message.callId,
+                    data: { success: true, duration: result.data?.duration_seconds },
+                    timestamp: new Date().toISOString()
+                  });
+                } else {
+                  console.warn(`[WS] No active call found for user ${user_id} when ending call ${message.callId}`);
+                }
               } else {
                 console.error(`[WS] Failed to end call ${message.callId}: ${result.error}`);
               }
