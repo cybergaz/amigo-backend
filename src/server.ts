@@ -11,6 +11,7 @@ import call_routes from "./routes/call.routes";
 import web_socket from "./sockets/web-socket";
 import { hash_password, parse_phone } from "./utils/general.utils";
 import admin_routes from "./routes/admin.routes";
+import unprotected_call_routes from "./routes/unprotected-calls.routes";
 
 const SERVER_PORT = process.env.SERVER_PORT || 5000;
 if (!SERVER_PORT) {
@@ -29,6 +30,7 @@ const app = new Elysia({ prefix: "/api" })
   .use(community_routes)
   .use(call_routes)
   .use(admin_routes)
+  .use(unprotected_call_routes)
   .use(web_socket)
   .listen(SERVER_PORT);
 
