@@ -503,32 +503,32 @@ const web_socket = new Elysia()
         });
 
         // send pending calls to the user
-        // const [last_pending_call] =
-        //   await db
-        //     .select()
-        //     .from(call_model)
-        //     .innerJoin(user_model, eq(call_model.caller_id, user_model.id))
-        //     .where(
-        //       and(
-        //         eq(call_model.callee_id, user_id),
-        //         eq(call_model.status, 'initiated')
-        //       ))
-        //     .orderBy(desc(call_model.id))
-        //     .limit(1);
-        //
-        // if (last_pending_call) {
-        //   send_to_user(user_id, {
-        //     type: 'call:ringing',
-        //     callId: last_pending_call.calls.id,
-        //     from: last_pending_call.calls.caller_id,
-        //     to: user_id,
-        //     payload: {
-        //       callerName: last_pending_call.users.name,
-        //       callerProfilePic: last_pending_call.users.profile_pic,
-        //     },
-        //     timestamp: last_pending_call.calls.started_at?.toISOString()
-        //   });
-        // }
+        const [last_pending_call] =
+          await db
+            .select()
+            .from(call_model)
+            .innerJoin(user_model, eq(call_model.caller_id, user_model.id))
+            .where(
+              and(
+                eq(call_model.callee_id, user_id),
+                eq(call_model.status, 'initiated')
+              ))
+            .orderBy(desc(call_model.id))
+            .limit(1);
+
+        if (last_pending_call) {
+          send_to_user(user_id, {
+            type: 'call:ringing',
+            callId: last_pending_call.calls.id,
+            from: last_pending_call.calls.caller_id,
+            to: user_id,
+            payload: {
+              callerName: last_pending_call.users.name,
+              callerProfilePic: last_pending_call.users.profile_pic,
+            },
+            timestamp: last_pending_call.calls.started_at?.toISOString()
+          });
+        }
 
         // const active_call = CallService.get_user_active_call(user_id);
         // if (active_call?.status === "answered") {
