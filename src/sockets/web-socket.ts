@@ -531,7 +531,7 @@ const web_socket = new Elysia()
         }
 
         const active_call = CallService.get_user_active_call(user_id);
-        if (active_call) {
+        if (active_call?.status === "answered") {
           // Notify caller
           send_to_user(active_call.caller_id, {
             type: 'call:accept',

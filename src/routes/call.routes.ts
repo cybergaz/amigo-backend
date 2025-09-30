@@ -75,7 +75,11 @@ const call_routes = new Elysia({ prefix: "/call" })
   })
 
   .put("/accept", async ({ set, store, body }) => {
+    console.log("--------------------------------------------------------------------")
+    console.log("--------------------------------------------------------------------")
     console.log("body ->", body)
+    console.log("--------------------------------------------------------------------")
+    console.log("--------------------------------------------------------------------")
     const result = await CallService.accept_call(body.calleId, store.id)
     set.status = result.code
     return result
