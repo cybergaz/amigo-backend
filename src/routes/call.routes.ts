@@ -92,8 +92,5 @@ const call_routes = new Elysia({ prefix: "/call" })
 //   }
 // )
 //
-// .put("/decline", async ({ set, store, query }) => {
-//   console.log('call declined and saved in DB', query);
-// })
 
 export default call_routes;

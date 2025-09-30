@@ -160,22 +160,22 @@ export class FCMService {
       // Special message structure for call notifications with action buttons
       const message: admin.messaging.Message = {
         token: fcmToken,
-        // notification: {
-        //   title: `Incoming ${data.callType} call`,
-        //   body: `${data.callerName} is calling you`
-        // },
-        // data: {
-        //   type: 'call',
-        //   callId: data.callId,
-        //   callerId: data.callerId,
-        //   callerName: data.callerName,
-        //   callType: data.callType,
-        //   callerProfilePic: data.callerProfilePic || '',
-        //   // title: `Incoming ${data.callType} call`,
-        //   // body: `${data.callerName} is calling you`,
-        //   // Add action data for Flutter to handle
-        //   click_action: 'FLUTTER_NOTIFICATION_CLICK',
-        // },
+        notification: {
+          title: `Incoming ${data.callType} call`,
+          body: `${data.callerName} is trying to reach you`
+        },
+        data: {
+          type: 'call',
+          callId: data.callId,
+          callerId: data.callerId,
+          callerName: data.callerName,
+          callType: data.callType,
+          callerProfilePic: data.callerProfilePic || '',
+          // title: `Incoming ${data.callType} call`,
+          // body: `${data.callerName} is calling you`,
+          // Add action data for Flutter to handle
+          click_action: 'FLUTTER_NOTIFICATION_CLICK',
+        },
         android: {
           priority: 'high',
           ttl: 30000, // 30 seconds for call notifications
