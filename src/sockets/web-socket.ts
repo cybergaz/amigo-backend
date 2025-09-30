@@ -503,54 +503,54 @@ const web_socket = new Elysia()
         });
 
         // send pending calls to the user
-        const [last_pending_call] =
-          await db
-            .select()
-            .from(call_model)
-            .innerJoin(user_model, eq(call_model.caller_id, user_model.id))
-            .where(
-              and(
-                eq(call_model.callee_id, user_id),
-                eq(call_model.status, 'initiated')
-              ))
-            .orderBy(desc(call_model.id))
-            .limit(1);
+        // const [last_pending_call] =
+        //   await db
+        //     .select()
+        //     .from(call_model)
+        //     .innerJoin(user_model, eq(call_model.caller_id, user_model.id))
+        //     .where(
+        //       and(
+        //         eq(call_model.callee_id, user_id),
+        //         eq(call_model.status, 'initiated')
+        //       ))
+        //     .orderBy(desc(call_model.id))
+        //     .limit(1);
+        //
+        // if (last_pending_call) {
+        //   send_to_user(user_id, {
+        //     type: 'call:ringing',
+        //     callId: last_pending_call.calls.id,
+        //     from: last_pending_call.calls.caller_id,
+        //     to: user_id,
+        //     payload: {
+        //       callerName: last_pending_call.users.name,
+        //       callerProfilePic: last_pending_call.users.profile_pic,
+        //     },
+        //     timestamp: last_pending_call.calls.started_at?.toISOString()
+        //   });
+        // }
 
-        if (last_pending_call) {
-          send_to_user(user_id, {
-            type: 'call:ringing',
-            callId: last_pending_call.calls.id,
-            from: last_pending_call.calls.caller_id,
-            to: user_id,
-            payload: {
-              callerName: last_pending_call.users.name,
-              callerProfilePic: last_pending_call.users.profile_pic,
-            },
-            timestamp: last_pending_call.calls.started_at?.toISOString()
-          });
-        }
-
-        const active_call = CallService.get_user_active_call(user_id);
-        if (active_call?.status === "answered") {
-          // Notify caller
-          send_to_user(active_call.caller_id, {
-            type: 'call:accept',
-            callId: active_call.id,
-            from: user_id,
-            to: active_call.caller_id,
-            timestamp: new Date().toISOString()
-          });
-
-          // Acknowledge to callee
-          send_to_user(user_id, {
-            type: 'call:accept',
-            callId: active_call.id,
-            from: user_id,
-            to: active_call.caller_id,
-            data: { success: true },
-            timestamp: new Date().toISOString()
-          });
-        }
+        // const active_call = CallService.get_user_active_call(user_id);
+        // if (active_call?.status === "answered") {
+        //   // Notify caller
+        //   send_to_user(active_call.caller_id, {
+        //     type: 'call:accept',
+        //     callId: active_call.id,
+        //     from: user_id,
+        //     to: active_call.caller_id,
+        //     timestamp: new Date().toISOString()
+        //   });
+        //
+        //   // Acknowledge to callee
+        //   send_to_user(user_id, {
+        //     type: 'call:accept',
+        //     callId: active_call.id,
+        //     from: user_id,
+        //     to: active_call.caller_id,
+        //     data: { success: true },
+        //     timestamp: new Date().toISOString()
+        //   });
+        // }
 
         // Notify all users about the new online user
         broadcast_to_all(
@@ -1143,13 +1143,13 @@ const web_socket = new Elysia()
                     //   "call"
                     // );
 
-                    await FCMService.sendCallNotification(message.to, {
-                      callId: callId!.toString(),
-                      callerId: user_id.toString(),
-                      callerName,
-                      callerProfilePic,
-                      callType: message.payload?.callType || 'audio',
-                    });
+                    // await FCMService.sendCallNotification(message.to, {
+                    //   callId: callId!.toString(),
+                    //   callerId: user_id.toString(),
+                    //   callerName,
+                    //   callerProfilePic,
+                    //   callType: message.payload?.callType || 'audio',
+                    // });
                   } catch (error) {
                     console.error(`[WS] Error sending call push notification:`, error);
                   }

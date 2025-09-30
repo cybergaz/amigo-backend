@@ -70,30 +70,30 @@ const call_routes = new Elysia({ prefix: "/call" })
     }
   })
 
-  .get("/status", async ({ set, store, query }) => {
-    console.log('[CALL ROUTES] /status called with query:', query);
-  })
-
-  .put("/accept", async ({ set, store, body }) => {
-    console.log("--------------------------------------------------------------------")
-    console.log("--------------------------------------------------------------------")
-    console.log("body ->", body)
-    console.log("--------------------------------------------------------------------")
-    console.log("--------------------------------------------------------------------")
-    const result = await CallService.accept_call(body.calleId, store.id)
-    set.status = result.code
-    return result
-  },
-    {
-      body: t.Object({
-        callID: t.Number(),
-        calleId: t.Number()
-      })
-    }
-  )
-
-  .put("/decline", async ({ set, store, query }) => {
-    console.log('call declined and saved in DB', query);
-  })
+// .get("/status", async ({ set, store, query }) => {
+//   console.log('[CALL ROUTES] /status called with query:', query);
+// })
+//
+// .put("/accept", async ({ set, store, body }) => {
+//   console.log("--------------------------------------------------------------------")
+//   console.log("--------------------------------------------------------------------")
+//   console.log("body ->", body)
+//   console.log("--------------------------------------------------------------------")
+//   console.log("--------------------------------------------------------------------")
+//   const result = await CallService.accept_call(body.calleId, store.id)
+//   set.status = result.code
+//   return result
+// },
+//   {
+//     body: t.Object({
+//       callID: t.Number(),
+//       calleId: t.Number()
+//     })
+//   }
+// )
+//
+// .put("/decline", async ({ set, store, query }) => {
+//   console.log('call declined and saved in DB', query);
+// })
 
 export default call_routes;
