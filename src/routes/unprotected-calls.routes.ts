@@ -15,22 +15,18 @@ const unprotected_call_routes = new Elysia({ prefix: "/call" })
       return { success: false, error: 'Call not found' };
     }
 
-    const result = await CallService.decline_call(Number(params.call_id), call_info.callee_id, body?.reason);
+    const result = await CallService.decline_call(Number(params.call_id), call_info.callee_id, "declined");
 
     if (result.success) {
       // Send WebSocket notifications
       await WebSocketNotificationService.sendCallDeclineNotification(
         Number(params.call_id), 
         call_info.callee_id, 
-        body?.reason
+        "declined"
       );
     }
 
     return result;
-  }, {
-    body: t.Object({
-      reason: t.Optional(t.String())
-    })
-  })
+  },)
 
 export default unprotected_call_routes;
