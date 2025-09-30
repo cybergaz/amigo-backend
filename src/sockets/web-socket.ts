@@ -1249,6 +1249,13 @@ const web_socket = new Elysia()
                     data: { success: true, reason: message.payload?.reason },
                     timestamp: new Date().toISOString()
                   });
+
+                  await FCMService.sendNotificationToUser(other_user, {
+                    title: "Call Ended",
+                    body: `${message.payload?.reason || 'User declined your call'}`,
+                    type: 'call_end',
+                  }
+                  )
                 }
               }
             }
