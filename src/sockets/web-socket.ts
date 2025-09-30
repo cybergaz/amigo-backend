@@ -530,8 +530,27 @@ const web_socket = new Elysia()
           });
         }
 
-        console.log('if there is any accepted or declined call send the user joined call info')
+        const active_call = CallService.get_user_active_call(user_id);
+        if (active_call) {
+          // Notify caller
+          send_to_user(active_call.caller_id, {
+            type: 'call:accept',
+            callId: active_call.id,
+            from: user_id,
+            to: active_call.caller_id,
+            timestamp: new Date().toISOString()
+          });
 
+          // Acknowledge to callee
+          send_to_user(user_id, {
+            type: 'call:accept',
+            callId: active_call.id,
+            from: user_id,
+            to: active_call.caller_id,
+            data: { success: true },
+            timestamp: new Date().toISOString()
+          });
+        }
 
         // Notify all users about the new online user
         broadcast_to_all(
