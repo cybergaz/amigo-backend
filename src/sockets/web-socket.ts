@@ -2,7 +2,7 @@ import { authenticate_jwt } from '@/middleware';
 import { Elysia, t } from 'elysia';
 import db from '@/config/db';
 import { message_model, conversation_model, conversation_member_model } from '@/models/chat.model';
-import { eq, and, or, sql, desc } from 'drizzle-orm';
+import { eq, and, or, sql } from 'drizzle-orm';
 import { ElysiaWS } from 'elysia/dist/ws';
 import { WebSocketData, TypedElysiaWS } from '@/types/elysia.types';
 import { user_model } from '@/models/user.model';
@@ -11,7 +11,7 @@ import { update_user_details } from '@/services/user.services';
 import { CallService } from '@/services/call.service';
 import { CallSignalingMessage } from '@/types/call.types';
 import FCMService from '@/services/fcm.service';
-import { call_model } from '@/models/call.model';
+import { WebSocketNotificationService } from '@/services/websocket-notification.service';
 
 // Connection management
 interface UserConnection {
@@ -28,7 +28,7 @@ const conversation_connections = new Map<number, Set<number>>(); // conversation
 
 // Message types for WebSocket communication
 interface WSMessage {
-  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'create_new_chat' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'online_status' | 'active_in_conversation' | 'inactive_in_conversation' | 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed' | 'call:merge' | 'call:merge_accepted' | 'call:merge_declined' | 'call:participant_joined' | 'call:participant_left' | 'call:participant_removed' | 'call:remove_participant';
+  type: 'message' | 'typing' | 'user_online' | 'user_offline' | 'read_receipt' | 'join_conversation' | 'leave_conversation' | 'error' | 'ping' | 'pong' | 'message_pin' | 'message_star' | 'message_reply' | 'message_forward' | 'message_delete' | 'media' | 'message_delivery_receipt' | 'active_in_conversation' | 'inactive_in_conversation' | 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed';
   data?: any;
   conversation_id?: number;
   message_ids?: number[];
@@ -88,7 +88,6 @@ const add_connection = async (user_id: number, ws: ElysiaWS) => {
     .from(conversation_member_model)
     .where(eq(conversation_member_model.user_id, user_id));
 
-  console.log("memberships ->", memberships)
   // Close existing connection if any
   if (connections.has(user_id)) {
     const existing = connections.get(user_id);
@@ -502,56 +501,6 @@ const web_socket = new Elysia()
           timestamp: new Date().toISOString()
         });
 
-        // send pending calls to the user
-        const [last_pending_call] =
-          await db
-            .select()
-            .from(call_model)
-            .innerJoin(user_model, eq(call_model.caller_id, user_model.id))
-            .where(
-              and(
-                eq(call_model.callee_id, user_id),
-                eq(call_model.status, 'initiated')
-              ))
-            .orderBy(desc(call_model.id))
-            .limit(1);
-
-        if (last_pending_call) {
-          send_to_user(user_id, {
-            type: 'call:ringing',
-            callId: last_pending_call.calls.id,
-            from: last_pending_call.calls.caller_id,
-            to: user_id,
-            payload: {
-              callerName: last_pending_call.users.name,
-              callerProfilePic: last_pending_call.users.profile_pic,
-            },
-            timestamp: last_pending_call.calls.started_at?.toISOString()
-          });
-        }
-
-        // const active_call = CallService.get_user_active_call(user_id);
-        // if (active_call?.status === "answered") {
-        //   // Notify caller
-        //   send_to_user(active_call.caller_id, {
-        //     type: 'call:accept',
-        //     callId: active_call.id,
-        //     from: user_id,
-        //     to: active_call.caller_id,
-        //     timestamp: new Date().toISOString()
-        //   });
-        //
-        //   // Acknowledge to callee
-        //   send_to_user(user_id, {
-        //     type: 'call:accept',
-        //     callId: active_call.id,
-        //     from: user_id,
-        //     to: active_call.caller_id,
-        //     data: { success: true },
-        //     timestamp: new Date().toISOString()
-        //   });
-        // }
-
         // Notify all users about the new online user
         broadcast_to_all(
           {
@@ -572,6 +521,7 @@ const web_socket = new Elysia()
     },
 
     message: async (ws, message) => {
+      console.log("message came ->", message)
 
       try {
         const user_id = getUserId(ws);
@@ -596,7 +546,6 @@ const web_socket = new Elysia()
 
           case 'join_conversation':
             if (message.conversation_id) {
-              console.log("join_conversation ->", message.conversation_id)
               // -----------------------------------------------------------
               // TEMPORARY BYPASS AUTHORIZATION CHECK (FOR TESTING ONLY)
               // -----------------------------------------------------------
@@ -612,20 +561,8 @@ const web_socket = new Elysia()
               //   )
               //   .limit(1);
 
-              // add_connection(user_id, ws);
-
               // if (membership.length > 0) {
               join_conversation(user_id, message.conversation_id);
-              message.data.recipient_id.forEach((element: number) => {
-                console.log("recipient_id ->", element)
-                if (Number(element) !== user_id) {
-                  join_conversation(Number(element), message.conversation_id!)
-                }
-
-              });
-              // message.data.recipient_id.map((id: number) => Number(id) !== user_id ? join_conversation(Number(id), message.conversation_id!) : null)
-              join_conversation(Number(message.data.recipient_id), message.conversation_id);
-
               send_to_user(user_id, {
                 type: 'join_conversation',
                 data: { success: true },
@@ -839,7 +776,7 @@ const web_socket = new Elysia()
                 for (let i = 0; i < message.data.target_conversation_ids.length; i++) {
                   const target_conversation_id = message.data.target_conversation_ids[i];
                   const forwarded_message = forward_res.data[i];
-
+                  
                   broadcast_to_conversation(target_conversation_id, {
                     type: 'message_forward',
                     data: {
@@ -938,32 +875,6 @@ const web_socket = new Elysia()
           //
           //   break;
 
-          case 'online_status':
-            if (message.conversation_id) {
-              // check if user is in the conversation_connections
-
-              const conv_connections = Array.from(conversation_connections.get(message.conversation_id) || []);
-              const inside_the_selected_convesation = conv_connections.filter(id => {
-                if (connections.get(id)?.active_conversation_id === message.conversation_id) {
-                  return id
-                }
-              });
-              console.log("sending online status ->", inside_the_selected_convesation)
-
-              // Update online status in the database
-              // await update_user_details(message.user_id, { online_status: message.data?.online_status, last_seen: new Date() });
-              // Broadcast to conversation members
-              broadcast_to_conversation(message.conversation_id, {
-                type: 'online_status',
-                data: {
-                  online_in_conversation: inside_the_selected_convesation
-                },
-                conversation_id: message.conversation_id,
-              });
-            }
-
-            break;
-
           case 'active_in_conversation':
             if (message.conversation_id) {
               const connection = connections.get(user_id);
@@ -1019,7 +930,7 @@ const web_socket = new Elysia()
                       type: 'read_receipt',
                       data: {
                         user_id,
-                        message_id: null,
+                        message_id: latest_message.id,
                         read_all: true, // Indicates user read all messages up to this point
                         user_active: true // User is currently active in conversation
                       },
@@ -1040,47 +951,20 @@ const web_socket = new Elysia()
               const connection = connections.get(user_id);
               if (connection && connection.active_conversation_id === message.conversation_id) {
                 connection.active_conversation_id = undefined;
-
-                const [latest_message] = await db
-                  .select({ id: message_model.id })
-                  .from(message_model)
-                  .where(
-                    and(
-                      eq(message_model.conversation_id, message.conversation_id),
-                      eq(message_model.deleted, false)
-                    )
-                  )
-                  .orderBy(sql`${message_model.id} DESC`)
-                  .limit(1);
+                // console.log(user ${user_id} is no longer viewing ${message.conversation_id});
 
                 // Send read receipt indicating user is no longer active
                 broadcast_to_conversation(message.conversation_id, {
                   type: 'read_receipt',
                   data: {
                     user_id,
-                    message_id: latest_message.id,
+                    message_id: null,
                     read_all: false, // User is no longer reading messages
                     user_active: false // User is no longer active in conversation
                   },
                   conversation_id: message.conversation_id,
                   timestamp: new Date().toISOString()
                 }, user_id);
-
-                const conv_connections = Array.from(conversation_connections.get(message.conversation_id) || []);
-                const inside_the_selected_convesation = conv_connections.filter(id => {
-                  if (connections.get(id)?.active_conversation_id === message.conversation_id) {
-                    return id
-                  }
-                });
-                console.log("sending online status ->", inside_the_selected_convesation)
-
-                broadcast_to_conversation(message.conversation_id, {
-                  type: 'online_status',
-                  data: {
-                    online_in_conversation: inside_the_selected_convesation
-                  },
-                  conversation_id: message.conversation_id,
-                });
               }
             }
             break;
@@ -1099,7 +983,7 @@ const web_socket = new Elysia()
                 // console.log(`[WS] Call initiation successful, callId: ${callId}`);
 
                 // Send acknowledgment to caller
-                await send_to_user(user_id, {
+                const ackSent = await send_to_user(user_id, {
                   type: 'call:init',
                   callId,
                   from: user_id,
@@ -1131,17 +1015,6 @@ const web_socket = new Elysia()
 
                     const callerName = caller[0]?.name || 'Unknown';
                     const callerProfilePic = caller[0]?.profile_pic!;
-
-                    console.log("caller ->", caller)
-
-                    // await FCMService.sendBulkMessageNotifications(
-                    //   [message.to],
-                    //   "7921368022",
-                    //   user_id.toString(),
-                    //   "testing user X",
-                    //   "calling you",
-                    //   "call"
-                    // );
 
                     await FCMService.sendCallNotification(message.to, {
                       callId: callId!.toString(),
@@ -1194,28 +1067,11 @@ const web_socket = new Elysia()
               const result = await CallService.accept_call(message.callId, user_id);
 
               if (result.success) {
-                // Notify both parties
-                const active_call = CallService.get_user_active_call(user_id);
-                if (active_call) {
-                  // Notify caller
-                  send_to_user(active_call.caller_id, {
-                    type: 'call:accept',
-                    callId: message.callId,
-                    from: user_id,
-                    to: active_call.caller_id,
-                    timestamp: new Date().toISOString()
-                  });
-
-                  // Acknowledge to callee
-                  send_to_user(user_id, {
-                    type: 'call:accept',
-                    callId: message.callId,
-                    from: user_id,
-                    to: active_call.caller_id,
-                    data: { success: true },
-                    timestamp: new Date().toISOString()
-                  });
-                }
+                // Send WebSocket notifications
+                await WebSocketNotificationService.sendCallAcceptNotification(
+                  message.callId, 
+                  user_id
+                );
               } else {
                 send_to_user(user_id, {
                   type: 'error',
@@ -1228,193 +1084,33 @@ const web_socket = new Elysia()
 
           case 'call:decline':
             if (message.callId) {
-              const active_call = CallService.get_user_active_call(user_id);
               const result = await CallService.decline_call(message.callId, user_id, message.payload?.reason);
 
               if (result.success) {
-                if (active_call) {
-                  // Notify caller
-                  const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
-                  send_to_user(active_call.caller_id, {
-                    type: 'call:decline',
-                    callId: message.callId,
-                    from: user_id,
-                    to: other_user,
-                    payload: message.payload,
-                    timestamp: new Date().toISOString()
-                  });
-                  send_to_user(user_id, {
-                    type: 'call:decline',
-                    callId: message.callId,
-                    data: { success: true, reason: message.payload?.reason },
-                    timestamp: new Date().toISOString()
-                  });
-
-                  await FCMService.sendNotificationToUser(other_user, {
-                    title: "Call Ended",
-                    body: `${message.payload?.reason || 'User declined your call'}`,
-                    type: 'call_end',
-                  }
-                  )
-                }
+                // Send WebSocket notifications
+                await WebSocketNotificationService.sendCallDeclineNotification(
+                  message.callId, 
+                  user_id, 
+                  message.payload?.reason
+                );
               }
             }
             break;
 
           case 'call:end':
             if (message.callId) {
-              // Get active call first before ending it
-              const active_call = CallService.get_user_active_call(user_id);
-
               const result = await CallService.end_call(message.callId, user_id, message.payload?.reason);
 
               if (result.success) {
-                // Find the other party and notify them
-                if (active_call) {
-                  const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
-
-                  // console.log(`[WS] Call ended: ${message.callId}, notifying user ${other_user}`);
-
-                  send_to_user(other_user, {
-                    type: 'call:end',
-                    callId: message.callId,
-                    from: user_id,
-                    to: other_user,
-                    payload: {
-                      reason: message.payload?.reason,
-                      duration: result.data?.duration_seconds
-                    },
-                    timestamp: new Date().toISOString()
-                  });
-
-                  // Acknowledge to sender
-                  send_to_user(user_id, {
-                    type: 'call:end',
-                    callId: message.callId,
-                    data: { success: true, duration: result.data?.duration_seconds },
-                    timestamp: new Date().toISOString()
-                  });
-                } else {
-                  console.warn(`[WS] No active call found for user ${user_id} when ending call ${message.callId}`);
-                }
+                // Send WebSocket notifications
+                await WebSocketNotificationService.sendCallEndNotification(
+                  message.callId, 
+                  user_id, 
+                  message.payload?.reason,
+                  result.data?.duration_seconds
+                );
               } else {
                 console.error(`[WS] Failed to end call ${message.callId}: ${result.error}`);
-              }
-            }
-            break;
-
-          case 'call:merge':
-            if (message.to && message.callId && message.payload) {
-              console.log(`[WS] Processing call:merge from ${user_id} to ${message.to}`);
-
-              // Check if target user is online
-              if (!connections.has(message.to)) {
-                send_to_user(user_id, {
-                  type: 'error',
-                  data: { message: 'User is not online', code: 'USER_OFFLINE' },
-                  timestamp: new Date().toISOString()
-                });
-                break;
-              }
-
-              // Send merge call request to target user
-              send_to_user(message.to, {
-                type: 'call:merge',
-                callId: message.callId,
-                from: user_id,
-                to: message.to,
-                payload: message.payload,
-                timestamp: new Date().toISOString()
-              });
-
-              // Acknowledge to sender
-              send_to_user(user_id, {
-                type: 'call:merge',
-                callId: message.callId,
-                data: { success: true },
-                timestamp: new Date().toISOString()
-              });
-            }
-            break;
-
-          case 'call:merge_accept':
-            if (message.callId) {
-              console.log(`[WS] User ${user_id} accepted merge call ${message.callId}`);
-
-              // Notify the original caller about merge acceptance
-              const active_call = CallService.get_user_active_call(user_id);
-              if (active_call) {
-                send_to_user(active_call.caller_id, {
-                  type: 'call:merge_accepted',
-                  callId: message.callId,
-                  from: user_id,
-                  to: active_call.caller_id,
-                  payload: {
-                    userId: user_id,
-                    userName: message.payload?.userName || 'Unknown',
-                    userProfilePic: message.payload?.userProfilePic
-                  },
-                  timestamp: new Date().toISOString()
-                });
-              }
-            }
-            break;
-
-          case 'call:merge_decline':
-            if (message.callId) {
-              console.log(`[WS] User ${user_id} declined merge call ${message.callId}`);
-
-              // Notify the original caller about merge decline
-              const active_call = CallService.get_user_active_call(user_id);
-              if (active_call) {
-                send_to_user(active_call.caller_id, {
-                  type: 'call:merge_declined',
-                  callId: message.callId,
-                  from: user_id,
-                  to: active_call.caller_id,
-                  payload: {
-                    userId: user_id,
-                    reason: message.payload?.reason || 'User declined'
-                  },
-                  timestamp: new Date().toISOString()
-                });
-              }
-            }
-            break;
-
-          case 'call:remove_participant':
-            if (message.callId && message.to) {
-              console.log(`[WS] Removing participant ${message.to} from call ${message.callId}`);
-
-              // Notify the participant that they're being removed
-              send_to_user(message.to, {
-                type: 'call:participant_removed',
-                callId: message.callId,
-                from: user_id,
-                to: message.to,
-                payload: {
-                  reason: message.payload?.reason || 'Removed from call'
-                },
-                timestamp: new Date().toISOString()
-              });
-
-              // Notify other participants
-              const active_call = CallService.get_user_active_call(user_id);
-              if (active_call) {
-                const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
-                if (other_user !== message.to) {
-                  send_to_user(other_user, {
-                    type: 'call:participant_left',
-                    callId: message.callId,
-                    from: user_id,
-                    to: other_user,
-                    payload: {
-                      userId: message.to,
-                      userName: message.payload?.userName || 'Unknown'
-                    },
-                    timestamp: new Date().toISOString()
-                  });
-                }
               }
             }
             break;
