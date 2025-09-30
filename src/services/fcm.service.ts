@@ -79,10 +79,10 @@ export class FCMService {
         //   title: payload.title,
         //   body: payload.body,
         // },
-        data: {
-          type: payload.type,
-          ...payload.data,
-        },
+        // data: {
+        //   type: payload.type,
+        //   ...payload.data,
+        // },
         android: {
           priority: 'high',
           notification: {
