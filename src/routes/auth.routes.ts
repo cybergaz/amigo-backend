@@ -251,11 +251,4 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     };
   })
 
-
-  .post("/decline", async () => {
-    console.log("--------------------------------------------------------------------")
-    console.log('called the decline endpoint');
-    console.log("--------------------------------------------------------------------")
-  })
-
 export default auth_routes;
