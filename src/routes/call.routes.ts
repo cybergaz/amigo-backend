@@ -19,9 +19,9 @@ const call_routes = new Elysia({ prefix: "/call" })
   .get("/history", async ({ set, store, query }) => {
     try {
       const limit = Math.min(parseInt(query.limit as string) || 20, 100); // Max 100 calls
-      
+
       const result = await CallService.get_call_history(store.id, limit);
-      
+
       if (result.success) {
         set.status = 200;
         return {
@@ -53,7 +53,7 @@ const call_routes = new Elysia({ prefix: "/call" })
   .get("/active", async ({ set, store }) => {
     try {
       const activeCall = CallService.get_user_active_call(store.id);
-      
+
       set.status = 200;
       return {
         success: true,
@@ -68,6 +68,28 @@ const call_routes = new Elysia({ prefix: "/call" })
         message: "Internal server error"
       };
     }
-  });
+  })
+
+  .get("/status", async ({ set, store, query }) => {
+    console.log('[CALL ROUTES] /status called with query:', query);
+  })
+
+  .put("/accept", async ({ set, store, body }) => {
+    console.log("body ->", body)
+    const result = await CallService.accept_call(body.calleId, store.id)
+    set.status = result.code
+    return result
+  },
+    {
+      body: t.Object({
+        callID: t.Number(),
+        calleId: t.Number()
+      })
+    }
+  )
+
+  .put("/decline", async ({ set, store, query }) => {
+    console.log('call declined and saved in DB', query);
+  })
 
 export default call_routes;

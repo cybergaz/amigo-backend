@@ -136,10 +136,10 @@ export class CallService {
 
       // console.log(`[CALL] Call accepted: ${call_id}`);
 
-      return { success: true };
+      return { success: true, code: 200 };
     } catch (error) {
       console.error('[CALL] Error accepting call:', error);
-      return { success: false, error: 'Failed to accept call' };
+      return { success: false, code: 500, error: 'Failed to accept call' };
     }
   }
 

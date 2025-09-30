@@ -530,6 +530,8 @@ const web_socket = new Elysia()
           });
         }
 
+        console.log('if there is any accepted or declined call send the user joined call info')
+
 
         // Notify all users about the new online user
         broadcast_to_all(
