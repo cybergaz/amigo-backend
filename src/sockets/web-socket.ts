@@ -1062,6 +1062,7 @@ const web_socket = new Elysia()
             break;
 
           case 'call:accept':
+            console.log("call accepted ->")
             if (message.callId) {
               const result = await CallService.accept_call(message.callId, user_id);
 

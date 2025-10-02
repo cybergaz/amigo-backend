@@ -1,9 +1,13 @@
+import db from "@/config/db";
+import { authenticate_jwt } from "@/middleware";
+import { user_model } from "@/models/user.model";
 import { handle_login } from "@/services/auth.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
 import { password } from "bun";
 import Elysia, { t } from "elysia";
+import { eq } from "drizzle-orm";
 
 const auth_routes = new Elysia({ prefix: "/auth" })
 
@@ -228,7 +232,11 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
   )
 
+  .post("/refresh", async ({ cookie, set }) => {
+  })
+
   .get("/logout", async ({ cookie, set }) => {
+    console.log("got a logout request")
     const existing_token = cookie["refresh_token"].value;
     const access_token = cookie["access_token"].value;
     if (!existing_token && !access_token) {
@@ -241,6 +249,16 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         message: "Already Logged Out",
       };
     }
+
+    // clean up after logout
+    const info = authenticate_jwt(cookie["refresh_token"].value as string);
+    if (info.success && info.data?.id) {
+      await db
+        .update(user_model)
+        .set({ fcm_token: null, online_status: false })
+        .where(eq(user_model.id, info.data.id));
+    }
+
     cookie["refresh_token"].remove();
     cookie["access_token"].remove();
     set.status = 200;
