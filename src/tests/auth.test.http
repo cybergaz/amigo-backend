@@ -221,3 +221,8 @@ Content-Type: application/json
 ### 
 
 GET http://localhost:5000/api/admin/seed-admin HTTP/1.1
+
+
+### 
+
+GET https://api.amigochats.com/api/admin/seed-admin HTTP/1.1

@@ -16,7 +16,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       .values({
         id: create_unique_id(),
         name: "Super Admin",
-        email: "admin2@gmail.com",
+        email: "admin@gmail.com",
         role: "admin" as RoleType,
         hashed_password: "$2b$10$F0.mx/.RuN.J3NDSxzvUBOyiFYdiktAPuMCJWUs.08uOmOmNGdXpG",
         refresh_token: "temp_token_to_be_changed",
