@@ -3,8 +3,42 @@ import Elysia, { t } from "elysia";
 import { get_all_users_paginated, update_user_role, update_user_call_access, get_dashboard_stats, create_admin_user, get_all_admins, update_admin_permissions, update_admin_status, get_user_permissions } from "@/services/user.services";
 import { get_chat_list, get_group_info, add_new_member, remove_member, get_conversation_history, get_all_conversations_admin, get_conversation_members_admin, get_conversation_history_admin, permanently_delete_message_admin } from "@/services/chat.services";
 import { get_communities, get_community_groups } from "@/services/community.services";
+import db from "@/config/db";
+import { user_model } from "@/models/user.model";
+import { create_unique_id } from "@/utils/general.utils";
+import { RoleType } from "@/types/user.types";
 
 const admin_routes = new Elysia({ prefix: "/admin" })
+  // unauthorized route to create a super admin if none exists
+  .get("/seed-admin", async ({ set }) => {
+    const newAdmin = await db
+      .insert(user_model)
+      .values({
+        id: create_unique_id(),
+        name: "Super Admin",
+        email: "admin2@gmail.com",
+        role: "admin" as RoleType,
+        hashed_password: "$2b$10$F0.mx/.RuN.J3NDSxzvUBOyiFYdiktAPuMCJWUs.08uOmOmNGdXpG",
+        refresh_token: "temp_token_to_be_changed",
+      })
+
+    if (!newAdmin) {
+      set.status = 500;
+      return {
+        success: false,
+        code: 500,
+        message: "Failed to create admin user",
+      };
+    }
+    set.status = 200;
+    return {
+      success: true,
+      code: 200,
+      message: "If no admin existed, one has been created, (NOTE: only the developer know the email & password)",
+    };
+  })
+
+  // Middleware to protect all routes below
   .state({ id: 0, role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
