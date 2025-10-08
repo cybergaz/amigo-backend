@@ -16,14 +16,15 @@ import {
   update_community_group,
   get_community_groups,
   delete_community_group,
-  get_connected_communities
+  get_connected_communities,
+  get_all_community_groups
 } from "@/services/community.services";
 
 const community_routes = new Elysia({ prefix: "/community" })
   .state({ id: 0, role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
-      const state_result = app_middleware({ cookie, headers });
+      const state_result = app_middleware({ cookie, headers, allowed: ["admin", "sub_admin"] });
 
       set.status = state_result.code;
       if (!state_result.data) return state_result;
@@ -195,58 +196,10 @@ const community_routes = new Elysia({ prefix: "/community" })
   })
 
   // Get all available groups (for adding to communities)
-  .get("/available-groups", async ({ set, store }) => {
-    try {
-      // Check if user is admin or sub_admin
-      const [user] = await db
-        .select({ role: user_model.role })
-        .from(user_model)
-        .where(eq(user_model.id, store.id));
-
-      if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
-        set.status = 403;
-        return {
-          success: false,
-          code: 403,
-          message: "Only admins and sub admins can view available groups",
-          data: null,
-        };
-      }
-
-      // Get all community groups that are not deleted
-      const groups = await db
-        .select({
-          id: conversation_model.id,
-          title: conversation_model.title,
-          type: conversation_model.type,
-          created_at: conversation_model.created_at,
-          metadata: conversation_model.metadata,
-        })
-        .from(conversation_model)
-        .where(
-          and(
-            eq(conversation_model.type, "community_group"),
-            eq(conversation_model.deleted, false)
-          )
-        )
-        .orderBy(desc(conversation_model.created_at));
-
-      set.status = 200;
-      return {
-        success: true,
-        code: 200,
-        data: groups,
-      };
-    } catch (error) {
-      console.error("get_available_groups error:", error);
-      set.status = 500;
-      return {
-        success: false,
-        code: 500,
-        message: "Internal server error",
-        data: null,
-      };
-    }
+  .get("/all-groups", async ({ set }) => {
+    const comm_group_res = await get_all_community_groups()
+    set.status = comm_group_res.code;
+    return comm_group_res;
   });
 
 export default community_routes;

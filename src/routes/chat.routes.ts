@@ -154,7 +154,6 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   })
 
   .delete("/mark-as-delete-message", async ({ set, store, body }) => {
-    console.log("body ->", body)
     const delete_result = await mark_as_delete_message(body.message_ids, store.id);
     set.status = delete_result.code;
     return delete_result;

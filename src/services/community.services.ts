@@ -741,6 +741,41 @@ const delete_community_group = async (
   }
 };
 
+const get_all_community_groups = async () => {
+  try {
+    // Get all community groups that are not deleted
+    const groups = await db
+      .select({
+        id: conversation_model.id,
+        title: conversation_model.title,
+        type: conversation_model.type,
+        created_at: conversation_model.created_at,
+        metadata: conversation_model.metadata,
+      })
+      .from(conversation_model)
+      .where(
+        and(
+          eq(conversation_model.type, "community_group"),
+          eq(conversation_model.deleted, false)
+        )
+      )
+      .orderBy(desc(conversation_model.created_at));
+
+    return {
+      success: true,
+      code: 200,
+      data: groups,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: get_all_community_groups",
+      data: null,
+    };
+  }
+}
+
 export {
   create_community,
   get_communities,
@@ -754,5 +789,6 @@ export {
   get_community_groups,
   get_connected_communities,
   delete_community_group,
+  get_all_community_groups
 
 };

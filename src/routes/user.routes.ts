@@ -26,7 +26,6 @@ const user_routes = new Elysia({ prefix: "/user" })
   })
 
   .post("/update-user", async ({ set, store, body }) => {
-    console.log("body ->", body)
     const user_Details = await update_user_details(store.id, body);
     set.status = user_Details.code;
     return user_Details;
