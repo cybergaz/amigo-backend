@@ -9,6 +9,9 @@ import { password } from "bun";
 import Elysia, { t } from "elysia";
 import { eq } from "drizzle-orm";
 
+// Cookie configuration based on environment
+const COOKIE_DOMAIN = process.env.NODE_ENV === "production" ? ".amigochats.com" : undefined;
+
 const auth_routes = new Elysia({ prefix: "/auth" })
 
   .post("/generate-signup-otp/:phone", async ({ set, params }) => {
@@ -87,6 +90,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       cookie["access_token"].set({
         value: create_user_res.data.access_token,
@@ -95,6 +99,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24,
         path: "/",
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       console.log(
         `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
@@ -135,6 +140,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       cookie["access_token"].set({
         value: login_res.data.access_token,
@@ -143,6 +149,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24,
         path: "/",
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       console.log(
         `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
@@ -173,9 +180,12 @@ const auth_routes = new Elysia({ prefix: "/auth" })
 
 
   .post("/verify-email-login", async ({ body, set, cookie, headers }) => {
+    console.log(`[LOGIN] Attempt from origin: ${headers.origin || 'N/A'} | Cookie domain: ${COOKIE_DOMAIN || 'not set'}`);
+    
     const login_res = await handle_login({ email: body.email, password: body.password });
     if (login_res.success == false) {
       set.status = login_res.code;
+      console.log(`[LOGIN] Failed: ${login_res.message}`);
       return login_res;
     }
 
@@ -191,8 +201,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
-        // domain: "ui.gosecureserver.in",
-        // partitioned: true,
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
 
       cookie["access_token"].set({
@@ -202,11 +211,10 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24,
         path: "/",
-        // domain: "ui.gosecureserver.in",
-        // partitioned: true,
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       console.log(
-        `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
+        `[LOGIN] ✅ Success! Set cookies with domain: ${COOKIE_DOMAIN || 'default'} | User: ${login_res.data.email}`
       );
     }
 
@@ -269,6 +277,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       cookie["access_token"].set({
         value: refresh_res.data.access_token,
@@ -277,6 +286,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         sameSite: "none",
         maxAge: 60 * 60 * 24,
         path: "/",
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
     }
 
@@ -308,8 +318,24 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         .where(eq(user_model.id, info.data.id));
     }
 
-    cookie["refresh_token"].remove();
-    cookie["access_token"].remove();
+    cookie["refresh_token"].set({
+      value: "",
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      maxAge: 0,
+      path: "/",
+      ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
+    });
+    cookie["access_token"].set({
+      value: "",
+      httpOnly: true,
+      secure: true,
+      sameSite: "none",
+      maxAge: 0,
+      path: "/",
+      ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
+    });
     set.status = 200;
     console.log(`[SERVER]   Logged Out : ${new Date().toLocaleString()}`);
     return {
