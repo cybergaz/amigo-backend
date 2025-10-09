@@ -10,7 +10,14 @@ import Elysia, { t } from "elysia";
 import { eq } from "drizzle-orm";
 
 // Cookie configuration based on environment
-const COOKIE_DOMAIN = process.env.NODE_ENV === "production" ? ".amigochats.com" : undefined;
+// Use COOKIE_DOMAIN env var or detect production from FRONTEND_URL
+const isProduction = process.env.FRONTEND_URL?.includes("amigochats.com") || 
+                     process.env.COOKIE_DOMAIN === ".amigochats.com" ||
+                     process.env.NODE_ENV === "production";
+
+const COOKIE_DOMAIN = isProduction ? ".amigochats.com" : undefined;
+
+console.log(`🍪 Cookie Config: isProduction=${isProduction} | COOKIE_DOMAIN=${COOKIE_DOMAIN || 'not set'} | FRONTEND_URL=${process.env.FRONTEND_URL}`);
 
 const auth_routes = new Elysia({ prefix: "/auth" })
 
