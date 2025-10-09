@@ -31,7 +31,7 @@ export const app_middleware = ({ cookie, headers, allowed }: ElysiaMiddlewareTyp
   if (!access_token) {
     return {
       success: false,
-      code: 404,
+      code: 401,
       message: "No Access Token in Cookies",
     };
   }

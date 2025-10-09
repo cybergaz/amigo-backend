@@ -777,7 +777,7 @@ const get_all_conversations_admin = async (type?: string) => {
       .where(whereCondition)
       .orderBy(desc(conversation_model.last_message_at));
 
-    // Get member counts for each conversation
+    // Get member counts and participant details for each conversation
     const conversationsWithMembers = await Promise.all(
       conversations.map(async (conv) => {
         const memberCount = await db
@@ -789,6 +789,50 @@ const get_all_conversations_admin = async (type?: string) => {
               eq(conversation_member_model.deleted, false)
             )
           );
+
+        // For DM conversations, get both participants
+        if (conv.type === "dm") {
+          const participants = await db
+            .select({
+              userId: user_model.id,
+              userName: user_model.name,
+              userProfilePic: user_model.profile_pic,
+              userEmail: user_model.email,
+            })
+            .from(conversation_member_model)
+            .innerJoin(
+              user_model,
+              eq(user_model.id, conversation_member_model.user_id)
+            )
+            .where(
+              and(
+                eq(conversation_member_model.conversation_id, conv.conversationId),
+                eq(conversation_member_model.deleted, false)
+              )
+            )
+            .limit(2);
+
+          // Determine participant1 (creator) and participant2 (other user)
+          const participant1 = participants.find(p => p.userId === conv.createrId) || participants[0];
+          const participant2 = participants.find(p => p.userId !== conv.createrId) || participants[1];
+
+          return {
+            ...conv,
+            memberCount: memberCount[0]?.count || 0,
+            participant1: participant1 ? {
+              userId: participant1.userId,
+              userName: participant1.userName,
+              userProfilePic: participant1.userProfilePic,
+              userEmail: participant1.userEmail,
+            } : null,
+            participant2: participant2 ? {
+              userId: participant2.userId,
+              userName: participant2.userName,
+              userProfilePic: participant2.userProfilePic,
+              userEmail: participant2.userEmail,
+            } : null,
+          };
+        }
 
         return {
           ...conv,

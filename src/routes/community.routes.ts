@@ -17,7 +17,9 @@ import {
   get_community_groups,
   delete_community_group,
   get_connected_communities,
-  get_all_community_groups
+  get_all_community_groups,
+  create_standalone_comminity_group,
+  add_group_to_multiple_communities
 } from "@/services/community.services";
 
 const community_routes = new Elysia({ prefix: "/community" })
@@ -200,6 +202,33 @@ const community_routes = new Elysia({ prefix: "/community" })
     const comm_group_res = await get_all_community_groups()
     set.status = comm_group_res.code;
     return comm_group_res;
+  })
+
+  .post("/create-standalone-group", async ({ set, store, body }) => {
+    const stand_group_res = await create_standalone_comminity_group(store.id, body)
+    set.status = stand_group_res.code;
+    return stand_group_res;
+  }, {
+    body: t.Object({
+      title: t.String({ minLength: 1, maxLength: 255 }),
+      active_time_slots: t.Array(t.Object({
+        start_time: t.String({ pattern: "^([01]?[0-9]|2[0-3]):[0-5][0-9]$" }), // HH:MM format
+        end_time: t.String({ pattern: "^([01]?[0-9]|2[0-3]):[0-5][0-9]$" })    // HH:MM format
+      })),
+      timezone: t.Optional(t.String()),
+    })
+  })
+
+  // Add group to multiple communities at once
+  .post("/add-group-to-communities", async ({ set, store, body }) => {
+    const result = await add_group_to_multiple_communities(body.group_id, store.id, body.community_ids);
+    set.status = result.code;
+    return result;
+  }, {
+    body: t.Object({
+      group_id: t.Number(),
+      community_ids: t.Array(t.Number())
+    })
   });
 
 export default community_routes;

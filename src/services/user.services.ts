@@ -46,7 +46,7 @@ export const create_user = async ({
         id: user_id,
         name,
         role,
-        phone,
+        phone: phone.replace(" ", ""),
         hashed_password,
         refresh_token,
         call_access: true,
@@ -827,6 +827,77 @@ export const get_user_permissions = async (id: number) => {
       success: false,
       code: 500,
       message: "Failed to fetch user permissions",
+      data: null,
+    };
+  }
+};
+
+export const delete_user_permanently = async (user_id: number) => {
+  try {
+    // Check if user exists
+    const existingUser = await db
+      .select()
+      .from(user_model)
+      .where(eq(user_model.id, user_id));
+
+    if (existingUser.length === 0) {
+      return {
+        success: false,
+        code: 404,
+        message: "User not found",
+        data: null,
+      };
+    }
+
+    const user = existingUser[0];
+
+    // Prevent deletion of admin users
+    if (user.role === "admin" || user.role === "sub_admin") {
+      return {
+        success: false,
+        code: 403,
+        message: "Cannot delete admin or sub-admin users. Please change their role first.",
+        data: null,
+      };
+    }
+
+    // Delete user's profile image from S3 if exists
+    if (user.profile_pic) {
+      try {
+        await delete_image_from_s3(user.profile_pic);
+      } catch (error) {
+        console.error("Error deleting profile image from S3:", error);
+        // Continue with user deletion even if S3 deletion fails
+      }
+    }
+
+    // Delete the user permanently from database
+    const deletedUser = await db
+      .delete(user_model)
+      .where(eq(user_model.id, user_id))
+      .returning();
+
+    if (deletedUser.length === 0) {
+      return {
+        success: false,
+        code: 500,
+        message: "Failed to delete user",
+        data: null,
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "User deleted permanently and successfully",
+      data: { id: user_id, name: user.name },
+    };
+  } catch (error: any) {
+    console.error("Error deleting user:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Failed to delete user",
       data: null,
     };
   }

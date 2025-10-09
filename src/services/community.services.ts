@@ -310,18 +310,18 @@ const add_community_groups = async (
 ) => {
   try {
     // Check if user is admin or sub_admin
-    const [user] = await db
-      .select({ role: user_model.role })
-      .from(user_model)
-      .where(eq(user_model.id, admin_user_id));
-
-    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
-      return {
-        success: false,
-        code: 403,
-        message: "Only admins and sub admins can manage community groups",
-      };
-    }
+    // const [user] = await db
+    //   .select({ role: user_model.role })
+    //   .from(user_model)
+    //   .where(eq(user_model.id, admin_user_id));
+    //
+    // if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+    //   return {
+    //     success: false,
+    //     code: 403,
+    //     message: "Only admins and sub admins can manage community groups",
+    //   };
+    // }
 
     // Get current community
     const [community] = await db
@@ -433,19 +433,6 @@ const create_community_group = async (
   data: CreateCommunityGroupRequest
 ) => {
   try {
-    // Check if user is admin or sub_admin
-    const [user] = await db
-      .select({ role: user_model.role })
-      .from(user_model)
-      .where(eq(user_model.id, admin_user_id));
-
-    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
-      return {
-        success: false,
-        code: 403,
-        message: "Only admins and sub admins can create community groups",
-      };
-    }
 
     // Create community group metadata
     const groupMetadata: CommunityGroupMetadata = {
@@ -776,6 +763,148 @@ const get_all_community_groups = async () => {
   }
 }
 
+const create_standalone_comminity_group = async (
+  admin_user_id: number,
+  data: Pick<CreateCommunityGroupRequest, "title" | "active_time_slots" | "timezone" | "active_days">,
+) => {
+  try {
+    // Find all community groups that do not have a community_id in metadata
+
+    const [group] = await db
+      .insert(conversation_model)
+      .values({
+        id: create_unique_id(),
+        creater_id: admin_user_id,
+        type: "community_group",
+        title: data.title,
+        metadata: {
+          active_time_slots: data.active_time_slots,
+          timezone: data.timezone || "UTC",
+        },
+      })
+      .returning();
+
+    if (!group) {
+      return {
+        success: false,
+        code: 500,
+        message: "Failed to create standalone community group",
+      };
+    }
+
+    return {
+      success: true,
+      code: 201,
+      message: "Standalone community group created successfully",
+      data: group,
+    }
+
+  }
+  catch (error) {
+    console.error("add_standalone_comminity_group error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: add_standalone_comminity_group",
+    };
+  }
+}
+
+// Add group to multiple communities at once
+const add_group_to_multiple_communities = async (
+  group_id: number,
+  admin_user_id: number,
+  community_ids: number[]
+) => {
+  try {
+    // Check if user is admin or sub_admin
+    const [user] = await db
+      .select({ role: user_model.role })
+      .from(user_model)
+      .where(eq(user_model.id, admin_user_id));
+
+    if (!user || (user.role !== "admin" && user.role !== "sub_admin")) {
+      return {
+        success: false,
+        code: 403,
+        message: "Only admins and sub admins can manage community groups",
+      };
+    }
+
+    // Verify the group exists
+    const [group] = await db
+      .select({ id: conversation_model.id })
+      .from(conversation_model)
+      .where(
+        and(
+          eq(conversation_model.id, group_id),
+          eq(conversation_model.deleted, false)
+        )
+      );
+
+    if (!group) {
+      return {
+        success: false,
+        code: 404,
+        message: "Group not found",
+      };
+    }
+
+    // Add the group to each community
+    let addedToCommunities = 0;
+    const errors: string[] = [];
+
+    for (const community_id of community_ids) {
+      // Get current community
+      const [community] = await db
+        .select({ group_ids: community_model.group_ids })
+        .from(community_model)
+        .where(eq(community_model.id, community_id));
+
+      if (!community) {
+        errors.push(`Community ${community_id} not found`);
+        continue;
+      }
+
+      // Check if group is already in community
+      const currentGroupIds = community.group_ids || [];
+      if (currentGroupIds.includes(group_id)) {
+        errors.push(`Group already exists in community ${community_id}`);
+        continue;
+      }
+
+      // Add group to community
+      const newGroupIds = [...currentGroupIds, group_id];
+      await db
+        .update(community_model)
+        .set({
+          group_ids: newGroupIds,
+          updated_at: new Date()
+        })
+        .where(eq(community_model.id, community_id));
+
+      addedToCommunities++;
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: `Group added to ${addedToCommunities} ${addedToCommunities === 1 ? 'community' : 'communities'}`,
+      data: {
+        added_to_communities: addedToCommunities,
+        errors: errors.length > 0 ? errors : undefined
+      },
+    };
+  } catch (error) {
+    console.error("add_group_to_multiple_communities error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: add_group_to_multiple_communities",
+    };
+  }
+}
+
 export {
   create_community,
   get_communities,
@@ -789,6 +918,7 @@ export {
   get_community_groups,
   get_connected_communities,
   delete_community_group,
-  get_all_community_groups
-
+  get_all_community_groups,
+  create_standalone_comminity_group,
+  add_group_to_multiple_communities
 };

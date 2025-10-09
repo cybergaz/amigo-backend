@@ -1,7 +1,7 @@
 import db from "@/config/db";
 import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
-import { handle_login } from "@/services/auth.service";
+import { handle_login, handle_refresh_token } from "@/services/auth.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
@@ -93,7 +93,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         httpOnly: true,
         secure: true,
         sameSite: "none",
-        maxAge: 60 * 60 * 24 * 7,
+        maxAge: 60 * 60 * 24,
         path: "/",
       });
       console.log(
@@ -141,7 +141,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         httpOnly: true,
         secure: true,
         sameSite: "none",
-        maxAge: 60 * 60 * 24 * 7,
+        maxAge: 60 * 60 * 24,
         path: "/",
       });
       console.log(
@@ -186,9 +186,9 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     ) {
       cookie["refresh_token"].set({
         value: login_res.data.refresh_token,
-        // httpOnly: true,
-        // secure: true,
-        // sameSite: "none",
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
         path: "/",
         // domain: "ui.gosecureserver.in",
@@ -197,9 +197,9 @@ const auth_routes = new Elysia({ prefix: "/auth" })
 
       cookie["access_token"].set({
         value: login_res.data.access_token,
-        // httpOnly: true,
-        // secure: true,
-        // sameSite: "none",
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
         maxAge: 60 * 60 * 24,
         path: "/",
         // domain: "ui.gosecureserver.in",
@@ -233,6 +233,53 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/refresh", async ({ cookie, set }) => {
+    const existing_token = cookie["refresh_token"].value;
+    if (!existing_token) {
+      set.status = 404;
+      return {
+        success: false,
+        code: 404,
+        message: "No Refresh Token in Cookies",
+      };
+    }
+
+    const info = authenticate_jwt(existing_token as string);
+
+    if (!info.success || !info.data?.id) {
+      set.status = info.code;
+      return info;
+    }
+
+    const refresh_res = await handle_refresh_token(existing_token as string);
+
+    if (!refresh_res.success) {
+      set.status = refresh_res.code;
+      return refresh_res;
+    }
+
+    if (
+      refresh_res.success &&
+      refresh_res.data?.refresh_token &&
+      refresh_res.data?.access_token
+    ) {
+      cookie["refresh_token"].set({
+        value: refresh_res.data.refresh_token,
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        maxAge: 60 * 60 * 24 * 7,
+      });
+      cookie["access_token"].set({
+        value: refresh_res.data.access_token,
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        maxAge: 60 * 60 * 24,
+      });
+    }
+
+    set.status = refresh_res.code;
+    return refresh_res
   })
 
   .get("/logout", async ({ cookie, set }) => {

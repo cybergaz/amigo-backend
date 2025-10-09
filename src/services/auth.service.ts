@@ -91,4 +91,46 @@ const handle_login = async ({
   }
 };
 
-export { handle_login };
+const handle_refresh_token = async (token: string) => {
+  try {
+    const [user] = await db
+      .select()
+      .from(user_model)
+      .where(eq(user_model.refresh_token, token))
+      .limit(1)
+
+    if (!user) {
+      return {
+        success: false,
+        code: 404,
+        message: "Invalid refresh token",
+      };
+    }
+
+    const access_token = generate_jwt(user.id, user.role || false);
+    const refresh_token = generate_refresh_jwt(user.id, user.role);
+    await db
+      .update(user_model)
+      .set({ refresh_token })
+      .where(eq(user_model.id, user.id));
+
+    return {
+      success: true,
+      code: 200,
+      message: "Token refreshed successfully",
+      data: {
+        access_token,
+        refresh_token,
+      },
+    };
+  } catch (error: any) {
+    console.error("Refresh token error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Internal server error during token refresh",
+    };
+  }
+};
+
+export { handle_login, handle_refresh_token };
