@@ -268,6 +268,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         secure: true,
         sameSite: "none",
         maxAge: 60 * 60 * 24 * 7,
+        path: "/",
       });
       cookie["access_token"].set({
         value: refresh_res.data.access_token,
@@ -275,6 +276,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         secure: true,
         sameSite: "none",
         maxAge: 60 * 60 * 24,
+        path: "/",
       });
     }
 
