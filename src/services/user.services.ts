@@ -37,8 +37,8 @@ export const create_user = async ({
       hashed_password = await hash_password(password);
     }
 
-    const access_token = generate_jwt(user_id, role);
-    const refresh_token = generate_refresh_jwt(user_id, role);
+    const access_token = generate_jwt(user_id, role, "7d");
+    const refresh_token = generate_refresh_jwt(user_id, role, "90d");
 
     await db
       .insert(user_model)

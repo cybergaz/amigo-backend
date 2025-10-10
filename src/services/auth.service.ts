@@ -59,8 +59,8 @@ const handle_login = async ({
       }
     }
 
-    const access_token = generate_jwt(user.id, user.role || false);
-    const refresh_token = generate_refresh_jwt(user.id, user.role);
+    const access_token = generate_jwt(user.id, user.role || false, "7d");
+    const refresh_token = generate_refresh_jwt(user.id, user.role, "90d");
 
     await db
       .update(user_model)
@@ -109,6 +109,7 @@ const handle_refresh_token = async (token: string) => {
 
     const access_token = generate_jwt(user.id, user.role || false);
     const refresh_token = generate_refresh_jwt(user.id, user.role);
+
     await db
       .update(user_model)
       .set({ refresh_token })
@@ -133,4 +134,47 @@ const handle_refresh_token = async (token: string) => {
   }
 };
 
-export { handle_login, handle_refresh_token };
+const handle_refresh_token_mobile = async (token: string) => {
+  try {
+    const [user] = await db
+      .select()
+      .from(user_model)
+      .where(eq(user_model.refresh_token, token))
+      .limit(1)
+
+    if (!user) {
+      return {
+        success: false,
+        code: 404,
+        message: "Invalid refresh token",
+      };
+    }
+
+    const access_token = generate_jwt(user.id, user.role || false, "7d");
+    const refresh_token = generate_refresh_jwt(user.id, user.role, "90d");
+
+    await db
+      .update(user_model)
+      .set({ refresh_token })
+      .where(eq(user_model.id, user.id));
+
+    return {
+      success: true,
+      code: 200,
+      message: "Token refreshed successfully",
+      data: {
+        access_token,
+        refresh_token,
+      },
+    };
+  } catch (error: any) {
+    console.error("Refresh token error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Internal server error during token refresh",
+    };
+  }
+};
+
+export { handle_login, handle_refresh_token, handle_refresh_token_mobile };

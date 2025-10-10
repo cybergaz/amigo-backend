@@ -1,7 +1,7 @@
 import db from "@/config/db";
 import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
-import { handle_login, handle_refresh_token } from "@/services/auth.service";
+import { handle_login, handle_refresh_token, handle_refresh_token_mobile } from "@/services/auth.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
@@ -11,13 +11,13 @@ import { eq } from "drizzle-orm";
 
 // Cookie configuration based on environment
 // Use COOKIE_DOMAIN env var or detect production from FRONTEND_URL
-const isProduction = process.env.FRONTEND_URL?.includes("amigochats.com") || 
-                     process.env.COOKIE_DOMAIN === ".amigochats.com" ||
-                     process.env.NODE_ENV === "production";
+const isProduction = process.env.FRONTEND_URL?.includes("amigochats.com") ||
+  process.env.COOKIE_DOMAIN === ".amigochats.com" ||
+  process.env.NODE_ENV === "production";
 
 const COOKIE_DOMAIN = isProduction ? ".amigochats.com" : undefined;
 
-console.log(`🍪 Cookie Config: isProduction=${isProduction} | COOKIE_DOMAIN=${COOKIE_DOMAIN || 'not set'} | FRONTEND_URL=${process.env.FRONTEND_URL}`);
+// console.log(`🍪 Cookie Config: isProduction=${isProduction} | COOKIE_DOMAIN=${COOKIE_DOMAIN || 'not set'} | FRONTEND_URL=${process.env.FRONTEND_URL}`);
 
 const auth_routes = new Elysia({ prefix: "/auth" })
 
@@ -95,7 +95,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         httpOnly: true,
         secure: true,
         sameSite: "none",
-        maxAge: 60 * 60 * 24 * 7,
+        maxAge: 60 * 60 * 24 * 90,
         path: "/",
         ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
@@ -104,18 +104,12 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         httpOnly: true,
         secure: true,
         sameSite: "none",
-        maxAge: 60 * 60 * 24,
+        maxAge: 60 * 60 * 24 * 7,
         path: "/",
         ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
-      console.log(
-        `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
-      );
     }
 
-    console.log(
-      `[SERVER]   User Created Success : ${new Date().toLocaleString()}`
-    );
     return create_user_res;
   },
     { body: VerifySignupSchema }
@@ -145,7 +139,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         httpOnly: true,
         secure: true,
         sameSite: "none",
-        maxAge: 60 * 60 * 24 * 7,
+        maxAge: 60 * 60 * 24 * 90,
         path: "/",
         ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
@@ -154,7 +148,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         httpOnly: true,
         secure: true,
         sameSite: "none",
-        maxAge: 60 * 60 * 24,
+        maxAge: 60 * 60 * 24 * 7,
         path: "/",
         ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
@@ -164,18 +158,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
 
     set.status = login_res.code;
-
     return login_res
-    // return {
-    //   success: true,
-    //   message: "Login Successful",
-    //   data: {
-    //     id: login_res.data?.id,
-    //     name: login_res.data?.name,
-    //     role: login_res.data?.role,
-    //     phone: login_res.data?.phone,
-    //   },
-    // };
   },
     {
       body: t.Object({
@@ -185,10 +168,9 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
   )
 
-
   .post("/verify-email-login", async ({ body, set, cookie, headers }) => {
     console.log(`[LOGIN] Attempt from origin: ${headers.origin || 'N/A'} | Cookie domain: ${COOKIE_DOMAIN || 'not set'}`);
-    
+
     const login_res = await handle_login({ email: body.email, password: body.password });
     if (login_res.success == false) {
       set.status = login_res.code;
@@ -259,7 +241,6 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
 
     const info = authenticate_jwt(existing_token as string);
-
     if (!info.success || !info.data?.id) {
       set.status = info.code;
       return info;
@@ -301,8 +282,60 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     return refresh_res
   })
 
+  .post("/refresh-mobile", async ({ cookie, set }) => {
+    const existing_token = cookie["refresh_token"].value;
+    if (!existing_token) {
+      set.status = 404;
+      return {
+        success: false,
+        code: 404,
+        message: "No Refresh Token in Cookies",
+      };
+    }
+
+    const info = authenticate_jwt(existing_token as string);
+    if (!info.success || !info.data?.id) {
+      set.status = info.code;
+      return info;
+    }
+
+    const refresh_res = await handle_refresh_token_mobile(existing_token as string);
+
+    if (!refresh_res.success) {
+      set.status = refresh_res.code;
+      return refresh_res;
+    }
+
+    if (
+      refresh_res.success &&
+      refresh_res.data?.refresh_token &&
+      refresh_res.data?.access_token
+    ) {
+      cookie["refresh_token"].set({
+        value: refresh_res.data.refresh_token,
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        maxAge: 60 * 60 * 24 * 90,
+        path: "/",
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
+      });
+      cookie["access_token"].set({
+        value: refresh_res.data.access_token,
+        httpOnly: true,
+        secure: true,
+        sameSite: "none",
+        maxAge: 60 * 60 * 24 * 7,
+        path: "/",
+        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
+      });
+    }
+
+    set.status = refresh_res.code;
+    return refresh_res
+  })
+
   .get("/logout", async ({ cookie, set }) => {
-    console.log("got a logout request")
     const existing_token = cookie["refresh_token"].value;
     const access_token = cookie["access_token"].value;
     if (!existing_token && !access_token) {

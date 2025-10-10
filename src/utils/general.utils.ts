@@ -1,4 +1,5 @@
 import jwt from "jsonwebtoken";
+import type { StringValue } from "ms";
 import bcrypt from "bcryptjs";
 import { customAlphabet } from "nanoid";
 import { parsePhoneNumberFromString } from "libphonenumber-js";
@@ -20,19 +21,19 @@ const hash_password = async (password: string): Promise<string> => {
 };
 
 
-const generate_jwt = (id: number, role: string) => {
+const generate_jwt = (id: number, role: string, time: StringValue = "1d") => {
   return jwt.sign({
     id,
     role,
   },
     process.env.ACCESS_KEY || "heymama", {
-    expiresIn: "1d",
+    expiresIn: time,
   });
 };
 
-const generate_refresh_jwt = (id: number, role: string) => {
+const generate_refresh_jwt = (id: number, role: string, time: StringValue = "7d") => {
   return jwt.sign({ id, role }, process.env.ACCESS_KEY || "heymama", {
-    expiresIn: "7d",
+    expiresIn: time,
   });
 };
 

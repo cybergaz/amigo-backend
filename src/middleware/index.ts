@@ -7,20 +7,20 @@ import { eq } from "drizzle-orm";
 
 const secretKey = process.env.ACCESS_KEY || "heymama";
 
-export const authenticate_jwt = (access_token: string) => {
+export const authenticate_jwt = (token: string) => {
   try {
-    const decoded = jwt.verify(access_token, secretKey);
+    const decoded = jwt.verify(token, secretKey);
     return {
       success: true,
       code: 200,
-      message: "Valid Access Token",
+      message: "Valid Token",
       data: decoded as { id: number; role: RoleType },
     };
   } catch (err) {
     return {
       success: false,
       code: 401,
-      message: "Inalid Access Token",
+      message: "Inalid Token",
     };
   }
 };
