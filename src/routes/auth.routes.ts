@@ -19,6 +19,39 @@ const COOKIE_DOMAIN = isProduction ? ".amigochats.com" : undefined;
 
 // console.log(`🍪 Cookie Config: isProduction=${isProduction} | COOKIE_DOMAIN=${COOKIE_DOMAIN || 'not set'} | FRONTEND_URL=${process.env.FRONTEND_URL}`);
 
+// Helper function to detect if request is from mobile app
+function isMobileApp(userAgent?: string): boolean {
+  if (!userAgent) return false;
+  return userAgent.toLowerCase().includes('amigo-mobile-app') ||
+    userAgent.toLowerCase().includes('dart') ||
+    userAgent.toLowerCase().includes('flutter');
+}
+
+// Helper function to get cookie config based on client type
+function getCookieConfig(userAgent?: string) {
+  const isMobile = isMobileApp(userAgent);
+
+  // For mobile apps, don't set domain to allow cookies to work with any URL
+  if (isMobile) {
+    return {
+      httpOnly: true,
+      secure: true,
+      sameSite: "none" as const,
+      path: "/",
+      // No domain for mobile apps - allows cookies to work with IP or domain
+    };
+  }
+
+  // For web apps, use the configured domain
+  return {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none" as const,
+    path: "/",
+    ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
+  };
+}
+
 const auth_routes = new Elysia({ prefix: "/auth" })
 
   .post("/generate-signup-otp/:phone", async ({ set, params }) => {
@@ -63,7 +96,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
   )
 
-  .post("/verify-signup-otp", async ({ body, set, cookie }) => {
+  .post("/verify-signup-otp", async ({ body, set, cookie, headers }) => {
     const { phone, name, password, role, otp } = body;
 
     const otpResponse = await verify_otp(otp, phone);
@@ -90,24 +123,22 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       create_user_res.data?.refresh_token &&
       create_user_res.data?.access_token
     ) {
+      const userAgent = headers['user-agent'];
+      const cookieConfig = getCookieConfig(userAgent);
+
       cookie["refresh_token"].set({
         value: create_user_res.data.refresh_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        ...cookieConfig,
         maxAge: 60 * 60 * 24 * 90,
-        path: "/",
-        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       cookie["access_token"].set({
         value: create_user_res.data.access_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        ...cookieConfig,
         maxAge: 60 * 60 * 24 * 7,
-        path: "/",
-        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
+      console.log(
+        `[SERVER]   Set Tokens to Cookies (${isMobileApp(userAgent) ? 'Mobile' : 'Web'}) : ${new Date().toLocaleString()}`
+      );
     }
 
     return create_user_res;
@@ -115,7 +146,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     { body: VerifySignupSchema }
   )
 
-  .post("/verify-login-otp", async ({ body, set, cookie }) => {
+  .post("/verify-login-otp", async ({ body, set, cookie, headers }) => {
     const otpResponse = await verify_otp(body.otp, body.phone);
 
     if (!otpResponse.success) {
@@ -134,26 +165,21 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       login_res.data?.refresh_token &&
       login_res.data?.access_token
     ) {
+      const userAgent = headers['user-agent'];
+      const cookieConfig = getCookieConfig(userAgent);
+
       cookie["refresh_token"].set({
         value: login_res.data.refresh_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        ...cookieConfig,
         maxAge: 60 * 60 * 24 * 90,
-        path: "/",
-        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       cookie["access_token"].set({
         value: login_res.data.access_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        ...cookieConfig,
         maxAge: 60 * 60 * 24 * 7,
-        path: "/",
-        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       console.log(
-        `[SERVER]   Set Tokens to Cookies : ${new Date().toLocaleString()}`
+        `[SERVER]   Set Tokens to Cookies (${isMobileApp(userAgent) ? 'Mobile' : 'Web'}) : ${new Date().toLocaleString()}`
       );
     }
 
@@ -169,7 +195,8 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/verify-email-login", async ({ body, set, cookie, headers }) => {
-    console.log(`[LOGIN] Attempt from origin: ${headers.origin || 'N/A'} | Cookie domain: ${COOKIE_DOMAIN || 'not set'}`);
+    const userAgent = headers['user-agent'];
+    console.log(`[LOGIN] Attempt from origin: ${headers.origin || 'N/A'} | User-Agent: ${userAgent} | Client: ${isMobileApp(userAgent) ? 'Mobile' : 'Web'}`);
 
     const login_res = await handle_login({ email: body.email, password: body.password });
     if (login_res.success == false) {
@@ -183,43 +210,26 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       login_res.data?.refresh_token &&
       login_res.data?.access_token
     ) {
+      const cookieConfig = getCookieConfig(userAgent);
+
       cookie["refresh_token"].set({
         value: login_res.data.refresh_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        ...cookieConfig,
         maxAge: 60 * 60 * 24 * 7,
-        path: "/",
-        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
 
       cookie["access_token"].set({
         value: login_res.data.access_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        ...cookieConfig,
         maxAge: 60 * 60 * 24,
-        path: "/",
-        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       console.log(
-        `[LOGIN] ✅ Success! Set cookies with domain: ${COOKIE_DOMAIN || 'default'} | User: ${login_res.data.email}`
+        `[LOGIN] ✅ Success! Set cookies for ${isMobileApp(userAgent) ? 'Mobile App' : 'Web (domain: ' + (COOKIE_DOMAIN || 'default') + ')'} | User: ${login_res.data.email}`
       );
     }
 
     set.status = login_res.code;
-
     return login_res
-    // return {
-    //   success: true,
-    //   message: "Login Successful",
-    //   data: {
-    //     id: login_res.data?.id,
-    //     name: login_res.data?.name,
-    //     role: login_res.data?.role,
-    //     phone: login_res.data?.phone,
-    //   },
-    // };
   },
     {
       body: t.Object({
@@ -229,7 +239,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
   )
 
-  .post("/refresh", async ({ cookie, set }) => {
+  .post("/refresh", async ({ cookie, set, headers }) => {
     const existing_token = cookie["refresh_token"].value;
     if (!existing_token) {
       set.status = 404;
@@ -258,23 +268,18 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       refresh_res.data?.refresh_token &&
       refresh_res.data?.access_token
     ) {
+      const userAgent = headers['user-agent'];
+      const cookieConfig = getCookieConfig(userAgent);
+
       cookie["refresh_token"].set({
         value: refresh_res.data.refresh_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        ...cookieConfig,
         maxAge: 60 * 60 * 24 * 7,
-        path: "/",
-        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
       cookie["access_token"].set({
         value: refresh_res.data.access_token,
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
+        ...cookieConfig,
         maxAge: 60 * 60 * 24,
-        path: "/",
-        ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });
     }
 
@@ -335,7 +340,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     return refresh_res
   })
 
-  .get("/logout", async ({ cookie, set }) => {
+  .get("/logout", async ({ cookie, set, headers }) => {
     const existing_token = cookie["refresh_token"].value;
     const access_token = cookie["access_token"].value;
     if (!existing_token && !access_token) {
@@ -358,23 +363,18 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         .where(eq(user_model.id, info.data.id));
     }
 
+    const userAgent = headers['user-agent'];
+    const cookieConfig = getCookieConfig(userAgent);
+
     cookie["refresh_token"].set({
       value: "",
-      httpOnly: true,
-      secure: true,
-      sameSite: "none",
+      ...cookieConfig,
       maxAge: 0,
-      path: "/",
-      ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
     });
     cookie["access_token"].set({
       value: "",
-      httpOnly: true,
-      secure: true,
-      sameSite: "none",
+      ...cookieConfig,
       maxAge: 0,
-      path: "/",
-      ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
     });
     set.status = 200;
     console.log(`[SERVER]   Logged Out : ${new Date().toLocaleString()}`);
