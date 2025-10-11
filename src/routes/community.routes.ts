@@ -26,7 +26,7 @@ const community_routes = new Elysia({ prefix: "/community" })
   .state({ id: 0, role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
-      const state_result = app_middleware({ cookie, headers, allowed: ["admin", "sub_admin"] });
+      const state_result = app_middleware({ cookie, headers });
 
       set.status = state_result.code;
       if (!state_result.data) return state_result;
