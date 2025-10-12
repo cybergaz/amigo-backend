@@ -7,7 +7,7 @@ import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
 import { password } from "bun";
 import Elysia, { t } from "elysia";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 // Cookie configuration based on environment
 // Use COOKIE_DOMAIN env var or detect production from FRONTEND_URL
@@ -382,6 +382,32 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       success: true,
       message: "Logged Out Successfully",
     };
+  })
+
+  .get("/clear-db", async ({ params, set }) => {
+    try {
+      await db.execute(sql`
+  DO $$ DECLARE
+      r RECORD;
+  BEGIN
+      FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
+          EXECUTE 'DROP TABLE IF EXISTS "' || r.tablename || '" CASCADE';
+      END LOOP;
+  END $$;
+`);
+      set.status = 200;
+      return {
+        success: true,
+        message: "dropped DB",
+      };
+    } catch (error) {
+      set.status = 500;
+      return {
+        success: false,
+        message: "Error dropping users table",
+        error: (error as Error).message,
+      }
+    }
   })
 
 export default auth_routes;
