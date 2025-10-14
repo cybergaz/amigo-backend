@@ -226,3 +226,8 @@ GET http://localhost:5000/api/admin/seed-admin HTTP/1.1
 ### 
 
 GET https://api.amigochats.com/api/admin/seed-admin HTTP/1.1
+
+
+### 
+
+GET https://api.amigochats.com/api/auth/clear-db HTTP/1.1

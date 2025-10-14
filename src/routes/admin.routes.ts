@@ -1,7 +1,7 @@
 import { app_middleware } from "@/middleware";
 import Elysia, { t } from "elysia";
 import { get_all_users_paginated, update_user_role, update_user_call_access, get_dashboard_stats, create_admin_user, get_all_admins, update_admin_permissions, update_admin_status, get_user_permissions, delete_user_permanently } from "@/services/user.services";
-import { get_chat_list, get_group_info, add_new_member, remove_member, get_conversation_history, get_all_conversations_admin, get_conversation_members_admin, get_conversation_history_admin, permanently_delete_message_admin } from "@/services/chat.services";
+import { get_chat_list, get_group_info, add_new_member, remove_member, get_conversation_history, get_all_conversations_admin, get_conversation_members_admin, get_conversation_history_admin, hard_delete_message, hard_delete_chat, revive_chat } from "@/services/chat.services";
 import { get_communities, get_community_groups } from "@/services/community.services";
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
@@ -446,7 +446,66 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   .get("/chat-management/groups", async ({ set, store, query }) => {
     try {
       const type = (query.type as string) || "all";
+      const page = Number(query.page) || 1;
+      const limit = Number(query.limit) || 20;
+      const search = (query.search as string) || '';
+      const showDeleted = query.showDeleted === 'true';
+
       const result = await get_all_conversations_admin(type);
+
+      if (result.success && result.data) {
+        let filteredData = result.data;
+
+        // Filter by deleted status
+        if (showDeleted) {
+          // Show ONLY deleted groups
+          filteredData = filteredData.filter((group: any) => group.deleted);
+        } else {
+          // Show ONLY non-deleted groups
+          filteredData = filteredData.filter((group: any) => !group.deleted);
+        }
+
+        // Apply search filter if search query exists
+        if (search && search.trim() !== '') {
+          const searchLower = search.toLowerCase().trim();
+          filteredData = filteredData.filter((group: any) => {
+            // Search by group title
+            const title = group.title?.toLowerCase() || '';
+
+            // Search by conversation ID
+            const conversationId = group.conversationId?.toString() || '';
+
+            // Search by creator name
+            const creatorName = group.createrName?.toLowerCase() || '';
+
+            return title.includes(searchLower) ||
+              conversationId.includes(searchLower) ||
+              creatorName.includes(searchLower);
+          });
+        }
+
+        // Apply pagination
+        const startIndex = (page - 1) * limit;
+        const endIndex = startIndex + limit;
+        const paginatedData = filteredData.slice(startIndex, endIndex);
+
+        set.status = 200;
+        return {
+          success: true,
+          code: 200,
+          data: {
+            groups: paginatedData,
+            pagination: {
+              currentPage: page,
+              totalPages: Math.ceil(filteredData.length / limit),
+              totalCount: filteredData.length,
+              limit,
+              hasNextPage: page < Math.ceil(filteredData.length / limit),
+              hasPreviousPage: page > 1,
+            }
+          }
+        };
+      }
 
       set.status = result.code;
       return result;
@@ -686,7 +745,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
         };
       }
 
-      const result = await permanently_delete_message_admin(params.message_id);
+      const result = await hard_delete_message(params.message_id);
 
       set.status = result.code;
       return result;
@@ -705,73 +764,20 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     })
   })
 
-  .delete("/chat-management/soft-delete-dm/:conversation_id", async ({ set, store, params }) => {
-    try {
-      const conversationId = params.conversation_id;
+  .delete("/chat-management/hard-delete-chat/:conversation_id", async ({ set, store, params }) => {
+    const delete_result = await hard_delete_chat(params.conversation_id);
+    set.status = delete_result.code;
+    return delete_result;
+  }, {
+    params: t.Object({
+      conversation_id: t.Number()
+    })
+  })
 
-      // Verify conversation exists and is a DM
-      const [conversation] = await db
-        .select({
-          id: conversation_model.id,
-          type: conversation_model.type,
-        })
-        .from(conversation_model)
-        .where(eq(conversation_model.id, conversationId));
-
-      if (!conversation) {
-        set.status = 404;
-        return {
-          success: false,
-          code: 404,
-          message: "Conversation not found",
-          data: null,
-        };
-      }
-
-      if (conversation.type !== "dm") {
-        set.status = 400;
-        return {
-          success: false,
-          code: 400,
-          message: "Only DM conversations can be soft deleted",
-          data: null,
-        };
-      }
-
-      // Soft delete the conversation
-      const result = await db
-        .update(conversation_model)
-        .set({ deleted: true })
-        .where(eq(conversation_model.id, conversationId))
-        .returning();
-
-      if (result.length === 0) {
-        set.status = 500;
-        return {
-          success: false,
-          code: 500,
-          message: "Failed to delete conversation",
-          data: null,
-        };
-      }
-
-      set.status = 200;
-      return {
-        success: true,
-        code: 200,
-        message: "DM conversation marked as deleted",
-        data: result[0],
-      };
-    } catch (error) {
-      console.error("Soft delete DM error:", error);
-      set.status = 500;
-      return {
-        success: false,
-        code: 500,
-        message: "Internal server error",
-        data: null,
-      };
-    }
+  .post("/chat-management/revive-chat/:conversation_id", async ({ set, store, params }) => {
+    const revive_result = await revive_chat(params.conversation_id);
+    set.status = revive_result.code;
+    return revive_result;
   }, {
     params: t.Object({
       conversation_id: t.Number()

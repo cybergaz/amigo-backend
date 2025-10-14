@@ -7,11 +7,15 @@ import {
   add_new_member,
   remove_member,
   update_group_title,
-  delete_conversation,
   get_conversation_history,
-  mark_as_delete_message,
-  mark_as_delete_conversation,
-  get_group_info
+  get_group_info,
+  promote_to_admin,
+  demote_to_member,
+  hard_delete_chat,
+  soft_delete_chat,
+  soft_delete_message,
+  revive_chat,
+  dm_delete_status
 } from "@/services/chat.services";
 import {
   pin_message,
@@ -103,6 +107,28 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     })
   })
 
+  .post("/promote-to-admin", async ({ set, store, body }) => {
+    const promotion_result = await promote_to_admin(body.conversation_id, body.user_id);
+    set.status = promotion_result.code;
+    return promotion_result;
+  }, {
+    body: t.Object({
+      conversation_id: t.Number(),
+      user_id: t.Number(),
+    })
+  })
+
+  .post("/demote-to-member", async ({ set, store, body }) => {
+    const promotion_result = await demote_to_member(body.conversation_id, body.user_id);
+    set.status = promotion_result.code;
+    return promotion_result;
+  }, {
+    body: t.Object({
+      conversation_id: t.Number(),
+      user_id: t.Number(),
+    })
+  })
+
   .put("/update-group-title", async ({ set, store, body }) => {
     const title_result = await update_group_title(body.conversation_id, body.title);
     set.status = title_result.code;
@@ -133,8 +159,8 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     })
   })
 
-  .delete("/delete-conversation/:conversation_id", async ({ set, store, params }) => {
-    const delete_result = await delete_conversation(params.conversation_id, store.id);
+  .delete("/soft-delete-chat/:conversation_id", async ({ set, store, params }) => {
+    const delete_result = await soft_delete_chat(params.conversation_id, store.id);
     set.status = delete_result.code;
     return delete_result;
   }, {
@@ -143,8 +169,8 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     })
   })
 
-  .delete("/mark-as-delete-conversation/:conversation_id", async ({ set, store, params }) => {
-    const delete_result = await mark_as_delete_conversation(params.conversation_id, store.id);
+  .delete("/soft-delete-dm/:conversation_id", async ({ set, store, params }) => {
+    const delete_result = await dm_delete_status(params.conversation_id, store.id, true);
     set.status = delete_result.code;
     return delete_result;
   }, {
@@ -153,8 +179,18 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     })
   })
 
-  .delete("/mark-as-delete-message", async ({ set, store, body }) => {
-    const delete_result = await mark_as_delete_message(body.message_ids, store.id);
+  .post("/revive-chat/:conversation_id", async ({ set, store, params }) => {
+    const delete_result = await dm_delete_status(params.conversation_id, store.id, false);
+    set.status = delete_result.code;
+    return delete_result;
+  }, {
+    params: t.Object({
+      conversation_id: t.Number()
+    })
+  })
+
+  .delete("/soft-delete-message", async ({ set, store, body }) => {
+    const delete_result = await soft_delete_message(body.message_ids, store.id);
     set.status = delete_result.code;
     return delete_result;
   }, {

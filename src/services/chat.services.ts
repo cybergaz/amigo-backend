@@ -148,13 +148,18 @@ const get_chat_list = async (user_id: number, type: string) => {
         and(
           inArray(conversation_model.id, conversationIds),
           eq(conversation_member_model.user_id, user_id), // Get user's own membership record
-          type !== "all" ?
-            type === "group"
-              ? eq(conversation_model.type, "group")
-              : type === "community_group"
-                ? eq(conversation_model.type, "community_group")
-                : eq(conversation_model.type, "dm")
-            : eq(conversation_model.deleted, false)
+          // type !== "all" ?
+          type === "group"
+            ? eq(conversation_model.type, "group")
+            : type === "community_group"
+              ? eq(conversation_model.type, "community_group")
+              : type === "deleted_dm"
+                ? and(eq(conversation_model.type, "dm"), eq(conversation_member_model.deleted, true))
+                : and(eq(conversation_model.type, "dm"), eq(conversation_member_model.deleted, false)),
+          // : eq(conversation_model.type, "dm")
+          // : eq(conversation_model.deleted, false),
+          // eq(conversation_member_model.deleted, false),
+          eq(conversation_model.deleted, false),
         )
       )
       .orderBy(desc(conversation_model.last_message_at));
@@ -462,6 +467,84 @@ const remove_member = async (
   }
 };
 
+const promote_to_admin = async (
+  conversation_id: number,
+  user_id: number,
+) => {
+  try {
+    const [member] = await db
+      .update(conversation_member_model)
+      .set({ role: "admin" })
+      .where(
+        and(
+          eq(conversation_member_model.conversation_id, conversation_id),
+          eq(conversation_member_model.user_id, user_id)
+        )
+      )
+      .returning();
+
+    if (!member) {
+      return {
+        success: false,
+        code: 404,
+        message: "Member not found in the conversation",
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Member promoted to admin successfully",
+      data: member,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : promote_to_admin",
+    };
+  }
+}
+
+const demote_to_member = async (
+  conversation_id: number,
+  user_id: number,
+) => {
+  try {
+    const [member] = await db
+      .update(conversation_member_model)
+      .set({ role: "member" })
+      .where(
+        and(
+          eq(conversation_member_model.conversation_id, conversation_id),
+          eq(conversation_member_model.user_id, user_id)
+        )
+      )
+      .returning();
+
+    if (!member) {
+      return {
+        success: false,
+        code: 404,
+        message: "Member not found in the conversation",
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Member demoted to member successfully",
+      data: member,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : demote_to_member",
+    };
+  }
+}
+
 const update_group_title = async (
   conversation_id: number,
   title: string
@@ -496,24 +579,42 @@ const update_group_title = async (
   }
 }
 
-const delete_conversation = async (conversation_id: number, user_id: number) => {
+const soft_delete_chat = async (conversation_id: number, user_id: number) => {
   try {
+    const [conversation] = await db
+      .update(conversation_model)
+      .set({ deleted: true })
+      .where(eq(conversation_model.id, conversation_id))
+      .returning();
 
-    // check if user role is admin
-    const [membership] = await db
-      .select({ role: user_model.role })
-      .from(user_model)
-      .where(eq(user_model.id, user_id));
-
-    if (!membership || membership.role !== "admin") {
+    if (!conversation) {
       return {
         success: false,
-        code: 403,
-        message: "You do not have permission to delete a conversation",
+        code: 404,
+        message: "Conversation not found",
+        data: { conversation_id, deleted: false },
       };
     }
 
+    return {
+      success: true,
+      code: 200,
+      message: "Conversation soft deleted successfully",
+      data: conversation
+    };
 
+  } catch (error) {
+    console.error("delete conversation error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : soft_delete_conversation",
+    };
+  }
+};
+
+const hard_delete_chat = async (conversation_id: number) => {
+  try {
     const [conversation] = await db
       .delete(conversation_model)
       .where(eq(conversation_model.id, conversation_id))
@@ -540,17 +641,84 @@ const delete_conversation = async (conversation_id: number, user_id: number) => 
     return {
       success: false,
       code: 500,
-      message: "ERROR : delete_conversation",
+      message: "ERROR : hard_delete_conversation",
     };
   }
 };
 
-const mark_as_delete_conversation = async (conversation_id: number, user_id: number) => {
+const revive_chat = async (conversation_id: number) => {
+  try {
+    // Verify conversation exists
+    const [conversation] = await db
+      .select({
+        id: conversation_model.id,
+        deleted: conversation_model.deleted,
+      })
+      .from(conversation_model)
+      .where(eq(conversation_model.id, conversation_id));
+
+    if (!conversation) {
+      return {
+        success: false,
+        code: 404,
+        message: "Conversation not found",
+        data: null,
+      };
+    }
+
+    if (!conversation.deleted) {
+      return {
+        success: false,
+        code: 400,
+        message: "Conversation is not deleted",
+        data: null,
+      };
+    }
+
+    // Revive the conversation by setting deleted to false
+    const result = await db
+      .update(conversation_model)
+      .set({ deleted: false })
+      .where(eq(conversation_model.id, conversation_id))
+      .returning();
+
+    if (result.length === 0) {
+      return {
+        success: false,
+        code: 500,
+        message: "Failed to revive conversation",
+        data: null,
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Conversation revived successfully",
+      data: result[0],
+    };
+  } catch (error) {
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : revive_chat",
+      data: null,
+    };
+  }
+}
+
+
+const dm_delete_status = async (conversation_id: number, user_id: number, status: boolean) => {
   try {
     const [conversation] = await db
       .update(conversation_member_model)
-      .set({ deleted: true })
-      .where(eq(conversation_member_model.id, conversation_id))
+      .set({ deleted: status })
+      .where(
+        and(
+          eq(conversation_member_model.conversation_id, conversation_id),
+          eq(conversation_member_model.user_id, user_id)
+        )
+      )
       .returning();
 
     if (!conversation) {
@@ -565,21 +733,20 @@ const mark_as_delete_conversation = async (conversation_id: number, user_id: num
     return {
       success: true,
       code: 200,
-      message: "Conversation marked as deleted successfully",
+      message: `Conversation ${status ? "deleted" : "revived"} successfully`,
       data: conversation
     };
 
   } catch (error) {
-    console.error("delete conversation error", error);
     return {
       success: false,
       code: 500,
-      message: "ERROR : mark_as_delete_conversation",
+      message: "ERROR : dm_delete_status",
     };
   }
 };
 
-const mark_as_delete_message = async (message_ids: number[], user_id: number) => {
+const soft_delete_message = async (message_ids: number[], user_id: number) => {
   try {
     const messages = await db
       .update(message_model)
@@ -611,6 +778,38 @@ const mark_as_delete_message = async (message_ids: number[], user_id: number) =>
       success: false,
       code: 500,
       message: "ERROR : mark_as_delete_message",
+    };
+  }
+};
+
+const hard_delete_message = async (message_id: number) => {
+  try {
+    // Check if user is super admin (this should be verified at route level)
+    const result = await db
+      .delete(message_model)
+      .where(eq(message_model.id, message_id))
+      .returning();
+
+    if (result.length === 0) {
+      return {
+        success: false,
+        code: 404,
+        message: "Message not found",
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Message permanently deleted",
+      data: result[0],
+    };
+  } catch (error) {
+    console.error("permanently_delete_message_admin error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : permanently_delete_message_admin",
     };
   }
 };
@@ -746,11 +945,11 @@ const get_conversation_history = async (
 // Admin-specific functions for managing all chats
 const get_all_conversations_admin = async (type?: string) => {
   try {
-    let whereCondition = eq(conversation_model.deleted, false);
+    let whereCondition
 
     if (type && type !== "all") {
       whereCondition = and(
-        eq(conversation_model.deleted, false),
+        // eq(conversation_model.deleted, false),
         eq(conversation_model.type, type as ChatType)
       )!;
     }
@@ -764,6 +963,7 @@ const get_all_conversations_admin = async (type?: string) => {
         lastMessageAt: conversation_model.last_message_at,
         created_at: conversation_model.created_at,
         createrId: conversation_model.creater_id,
+        deleted: conversation_model.deleted,
 
         // Creator info
         createrName: user_model.name,
@@ -972,37 +1172,6 @@ const get_conversation_history_admin = async (
   }
 };
 
-const permanently_delete_message_admin = async (message_id: number) => {
-  try {
-    // Check if user is super admin (this should be verified at route level)
-    const result = await db
-      .delete(message_model)
-      .where(eq(message_model.id, message_id))
-      .returning();
-
-    if (result.length === 0) {
-      return {
-        success: false,
-        code: 404,
-        message: "Message not found",
-      };
-    }
-
-    return {
-      success: true,
-      code: 200,
-      message: "Message permanently deleted",
-      data: result[0],
-    };
-  } catch (error) {
-    console.error("permanently_delete_message_admin error", error);
-    return {
-      success: false,
-      code: 500,
-      message: "ERROR : permanently_delete_message_admin",
-    };
-  }
-};
 
 export {
   create_chat,
@@ -1011,13 +1180,17 @@ export {
   create_group,
   add_new_member,
   remove_member,
+  promote_to_admin,
+  demote_to_member,
   update_group_title,
-  delete_conversation,
-  mark_as_delete_conversation,
-  mark_as_delete_message,
+  soft_delete_chat,
+  hard_delete_chat,
+  revive_chat,
+  dm_delete_status,
+  soft_delete_message,
+  hard_delete_message,
   get_conversation_history,
   get_all_conversations_admin,
   get_conversation_members_admin,
   get_conversation_history_admin,
-  permanently_delete_message_admin
 };
