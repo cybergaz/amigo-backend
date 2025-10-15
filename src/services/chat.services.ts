@@ -11,7 +11,7 @@ import {
   ChatType,
 } from "@/types/chat.types";
 import { create_dm_key, create_unique_id } from "@/utils/general.utils";
-import { and, arrayContains, asc, desc, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { and, arrayContains, asc, desc, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
 
 const create_chat = async (sender_id: number, receiver_id: number) => {
   try {
@@ -84,6 +84,12 @@ const create_chat = async (sender_id: number, receiver_id: number) => {
       type: "system",
       body: "chat initiated",
     });
+    // await db.insert(message_model).values({
+    //   conversation_id: chat.id,
+    //   sender_id: sender_id,
+    //   type: "system",
+    //   body: "chat initiated 2",
+    // });
     // -----------------------------------------------------------------------------------
     // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
     // -----------------------------------------------------------------------------------
@@ -148,17 +154,15 @@ const get_chat_list = async (user_id: number, type: string) => {
         and(
           inArray(conversation_model.id, conversationIds),
           eq(conversation_member_model.user_id, user_id), // Get user's own membership record
-          // type !== "all" ?
-          type === "group"
-            ? eq(conversation_model.type, "group")
-            : type === "community_group"
-              ? eq(conversation_model.type, "community_group")
-              : type === "deleted_dm"
-                ? and(eq(conversation_model.type, "dm"), eq(conversation_member_model.deleted, true))
-                : and(eq(conversation_model.type, "dm"), eq(conversation_member_model.deleted, false)),
-          // : eq(conversation_model.type, "dm")
-          // : eq(conversation_model.deleted, false),
-          // eq(conversation_member_model.deleted, false),
+          type !== "all" ?
+            type === "group"
+              ? eq(conversation_model.type, "group")
+              : type === "community_group"
+                ? eq(conversation_model.type, "community_group")
+                : type === "deleted_dm"
+                  ? and(eq(conversation_model.type, "dm"), eq(conversation_member_model.deleted, true))
+                  : and(eq(conversation_model.type, "dm"), eq(conversation_member_model.deleted, false))
+            : eq(conversation_model.deleted, false),
           eq(conversation_model.deleted, false),
         )
       )
@@ -827,6 +831,7 @@ const get_conversation_history = async (
         user_id: conversation_member_model.user_id,
         name: user_model.name,
         profile_pic: user_model.profile_pic,
+        joining_date: conversation_member_model.joined_at,
         last_read_message_id: conversation_member_model.last_read_message_id,
         last_delivered_message_id: conversation_member_model.last_delivered_message_id,
       })
@@ -857,6 +862,8 @@ const get_conversation_history = async (
         message: "You are not a member of this conversation",
       };
     }
+
+    const user_joining_date = members.find(m => m.user_id === user_id)?.joining_date;
 
     // Calculate offset for pagination
     const offset = (page - 1) * limit;
@@ -892,7 +899,8 @@ const get_conversation_history = async (
             eq(message_model.conversation_id, conversation_id),
             arrayContains(message_model.forwarded_to, [conversation_id]),
           ),
-          eq(message_model.deleted, false)
+          eq(message_model.deleted, false),
+          user_joining_date ? gt(message_model.created_at, user_joining_date) : undefined
         )
       )
       .orderBy(desc(message_model.created_at))

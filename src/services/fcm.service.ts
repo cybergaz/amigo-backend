@@ -1,7 +1,8 @@
 import admin from 'firebase-admin';
-import { eq } from 'drizzle-orm';
+import { eq, and } from 'drizzle-orm';
 import db from '@/config/db';
 import { user_model } from '@/models/user.model';
+import { conversation_member_model } from '@/models/chat.model';
 
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
@@ -63,11 +64,15 @@ export class FCMService {
       const user = await db
         .select({ fcm_token: user_model.fcm_token })
         .from(user_model)
-        .where(eq(user_model.id, userId))
+        .leftJoin(
+          conversation_member_model,
+          eq(user_model.id, conversation_member_model.user_id)
+        )
+        .where(and(eq(user_model.id, userId), eq(conversation_member_model.deleted, false), payload.data?.conversationId ? eq(conversation_member_model.conversation_id, Number(payload.data?.conversationId)) : undefined))
         .limit(1);
 
       if (user.length === 0 || !user[0].fcm_token) {
-        console.log(`[FCM] No FCM token found for user ${userId}`);
+        console.log(`[FCM] No FCM token found for user ${userId} or user is not a member of the conversation`);
         return false;
       }
 

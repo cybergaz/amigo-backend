@@ -15,6 +15,7 @@ export const S3_FOLDERS = {
 
 // File type mappings
 export const FILE_TYPE_MAPPINGS = {
+
   // Images
   "image/jpeg": S3_FOLDERS.IMAGES,
   "image/jpg": S3_FOLDERS.IMAGES,
@@ -22,6 +23,7 @@ export const FILE_TYPE_MAPPINGS = {
   "image/webp": S3_FOLDERS.IMAGES,
   "image/gif": S3_FOLDERS.IMAGES,
   "image/heif": S3_FOLDERS.IMAGES,
+  "image/heic": S3_FOLDERS.IMAGES,
   "image/svg+xml": S3_FOLDERS.IMAGES,
 
   // Audio files
@@ -58,6 +60,7 @@ export const FILE_TYPE_MAPPINGS = {
   "application/zip": S3_FOLDERS.DOCS,
   "application/x-rar-compressed": S3_FOLDERS.DOCS,
   "application/x-7z-compressed": S3_FOLDERS.DOCS,
+
 } as const;
 
 export type FileType = keyof typeof FILE_TYPE_MAPPINGS;
