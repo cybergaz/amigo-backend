@@ -900,7 +900,7 @@ const get_conversation_history = async (
             arrayContains(message_model.forwarded_to, [conversation_id]),
           ),
           eq(message_model.deleted, false),
-          user_joining_date ? gt(message_model.created_at, user_joining_date) : undefined
+          // user_joining_date ? gt(message_model.created_at, user_joining_date) : undefined
         )
       )
       .orderBy(desc(message_model.created_at))
