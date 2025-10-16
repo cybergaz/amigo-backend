@@ -22,7 +22,6 @@ export const conversation_member_model = pgTable("conversation_members", {
   role: varchar({ enum: CHAT_ROLE_CONST }),
   unread_count: integer().default(0),
   joined_at: timestamp().defaultNow(),
-  removed_at: timestamp(),
   deleted: boolean().default(false).notNull(),
   // // per-member settings
   // settings: jsonb("settings"),
