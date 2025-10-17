@@ -257,8 +257,9 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       const page = Number(query.page) || 1;
       const limit = Number(query.limit) || 10;
       const search = query.search as string || '';
+      const role = query.role as string || 'all';
 
-      const result = await get_all_users_paginated(page, limit, search);
+      const result = await get_all_users_paginated(page, limit, search, role);
 
       set.status = result.code;
       return result;

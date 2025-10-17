@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "app_version" char(10);

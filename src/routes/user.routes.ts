@@ -42,6 +42,7 @@ const user_routes = new Elysia({ prefix: "/user" })
         })),
         ip_address: t.Optional(t.String()),
         fcm_token: t.Optional(t.String()),
+        app_version: t.Optional(t.String()),
       }),
     }
   )

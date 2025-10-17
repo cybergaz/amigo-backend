@@ -899,8 +899,14 @@ const get_conversation_history = async (
             eq(message_model.conversation_id, conversation_id),
             arrayContains(message_model.forwarded_to, [conversation_id]),
           ),
-          eq(message_model.deleted, false),
-          // user_joining_date ? gt(message_model.created_at, user_joining_date) : undefined
+          or(
+            and(
+              eq(message_model.sender_id, user_id),
+              eq(message_model.deleted, false)
+            ),
+            ne(message_model.sender_id, user_id)
+          ),
+          user_joining_date ? gt(message_model.created_at, user_joining_date) : undefined
         )
       )
       .orderBy(desc(message_model.created_at))
@@ -1075,6 +1081,7 @@ const get_conversation_members_admin = async (conversation_id: number) => {
         role: conversation_member_model.role,
         joinedAt: conversation_member_model.joined_at,
         unreadCount: conversation_member_model.unread_count,
+        user_role: user_model.role
       })
       .from(conversation_member_model)
       .innerJoin(

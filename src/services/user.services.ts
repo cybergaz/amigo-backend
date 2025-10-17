@@ -306,7 +306,7 @@ export const get_available_users = async (self_id: number, phone_numbers: string
   }
 };
 
-export const get_all_users_paginated = async (page: number = 1, limit: number = 10, search: string = '') => {
+export const get_all_users_paginated = async (page: number = 1, limit: number = 10, search: string = '', role: string) => {
   try {
     const offset = (page - 1) * limit;
 
@@ -314,9 +314,9 @@ export const get_all_users_paginated = async (page: number = 1, limit: number = 
     const searchCondition = search
       ? or(
         ilike(user_model.name, `%${search}%`),
-        ilike(user_model.phone, `%${search}%`)
+        ilike(user_model.phone, `%${search}%`),
       )
-      : undefined;
+      : role !== "all" ? eq(user_model.role, role as RoleType) : undefined
 
     // Get total count with search filter
     const totalCountResult = await db
@@ -341,12 +341,15 @@ export const get_all_users_paginated = async (page: number = 1, limit: number = 
         online_status: user_model.online_status,
         location: user_model.location,
         ip_address: user_model.ip_address,
+        app_version: user_model.app_version,
       })
       .from(user_model)
       .where(searchCondition)
       .orderBy(user_model.created_at)
       .limit(limit)
       .offset(offset);
+    console.log("users ->", users)
+    console.log("role ->", role)
 
     const totalPages = Math.ceil(totalCount / limit);
 
