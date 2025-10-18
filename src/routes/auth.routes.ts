@@ -67,6 +67,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
 
     const otp_res = await generate_otp(params.phone);
+    console.log('[SIGNUP OTP] response:', otp_res);
 
     set.status = otp_res.code;
     return otp_res;
@@ -81,12 +82,14 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   .post("/generate-login-otp/:phone", async ({ set, params }) => {
     console.log(`[LOGIN OTP] Requested for phone: ${params.phone} at ${new Date().toLocaleString()}`);
     const existing_user_res = await find_user_by_phone(params.phone);
+    console.log("existing_user_res ->", existing_user_res)
     if (!existing_user_res?.success) {
       set.status = existing_user_res?.code;
       return existing_user_res;
     }
 
     const otp_res = await generate_otp(params.phone);
+    console.log('[LOGIN OTP] response:', otp_res);
 
     set.status = otp_res.code;
     return otp_res;
@@ -103,6 +106,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     const { phone, name, password, role, otp } = body;
 
     const otpResponse = await verify_otp(otp, phone);
+    console.log("otpResponse ->", otpResponse)
     if (otpResponse.success == false) {
       set.status = otpResponse.code;
       return otpResponse;
@@ -114,6 +118,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       role,
       phone,
     });
+    console.log("create_user_res ->", create_user_res)
     if (!create_user_res?.success) {
       set.status = create_user_res?.code;
       return create_user_res;
@@ -152,6 +157,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   .post("/verify-login-otp", async ({ body, set, cookie, headers }) => {
     console.log(`[LOGIN] OTP Verification Attempt for phone: ${body.phone} at ${new Date().toLocaleString()}`);
     const otpResponse = await verify_otp(body.otp, body.phone);
+    console.log("otpResponse ->", otpResponse)
 
     if (!otpResponse.success) {
       set.status = otpResponse.code;
@@ -187,6 +193,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       );
     }
 
+
     set.status = login_res.code;
     return login_res
   },
@@ -203,6 +210,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     console.log(`[LOGIN] Attempt from origin: ${headers.origin || 'N/A'} | User-Agent: ${userAgent} | Client: ${isMobileApp(userAgent) ? 'Mobile' : 'Web'}`);
 
     const login_res = await handle_login({ email: body.email, password: body.password });
+    console.log("login_res ->", login_res)
     if (login_res.success == false) {
       set.status = login_res.code;
       console.log(`[LOGIN] Failed: ${login_res.message}`);
@@ -231,6 +239,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         `[LOGIN] ✅ Success! Set cookies for ${isMobileApp(userAgent) ? 'Mobile App' : 'Web (domain: ' + (COOKIE_DOMAIN || 'default') + ')'} | User: ${login_res.data.email}`
       );
     }
+    console.log("login_res ->", login_res)
 
     set.status = login_res.code;
     return login_res
