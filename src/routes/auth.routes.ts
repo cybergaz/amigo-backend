@@ -55,6 +55,7 @@ function getCookieConfig(userAgent?: string) {
 const auth_routes = new Elysia({ prefix: "/auth" })
 
   .post("/generate-signup-otp/:phone", async ({ set, params }) => {
+    console.log(`[SIGNUP OTP] Requested for phone: ${params.phone} at ${new Date().toLocaleString()}`);
     const existing_user_res = await find_user_by_phone(params.phone);
     if (existing_user_res.success) {
       set.status = 409;
@@ -78,6 +79,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/generate-login-otp/:phone", async ({ set, params }) => {
+    console.log(`[LOGIN OTP] Requested for phone: ${params.phone} at ${new Date().toLocaleString()}`);
     const existing_user_res = await find_user_by_phone(params.phone);
     if (!existing_user_res?.success) {
       set.status = existing_user_res?.code;
@@ -97,6 +99,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/verify-signup-otp", async ({ body, set, cookie, headers }) => {
+    console.log(`[SIGNUP] Attempt for phone: ${body.phone} at ${new Date().toLocaleString()}`);
     const { phone, name, password, role, otp } = body;
 
     const otpResponse = await verify_otp(otp, phone);
@@ -147,6 +150,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/verify-login-otp", async ({ body, set, cookie, headers }) => {
+    console.log(`[LOGIN] OTP Verification Attempt for phone: ${body.phone} at ${new Date().toLocaleString()}`);
     const otpResponse = await verify_otp(body.otp, body.phone);
 
     if (!otpResponse.success) {
