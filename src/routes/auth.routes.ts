@@ -376,6 +376,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       ...cookieConfig,
       maxAge: 0,
     });
+
     set.status = 200;
     console.log(`[SERVER]   Logged Out : ${new Date().toLocaleString()}`);
     return {

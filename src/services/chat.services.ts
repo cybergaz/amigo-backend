@@ -885,14 +885,14 @@ const get_conversation_history = async (
         forwarded_count: message_model.forwarded_to,
 
         // Sender information
-        // sender_name: user_model.name,
-        // sender_profile_pic: user_model.profile_pic,
+        sender_name: user_model.name,
+        sender_profile_pic: user_model.profile_pic,
       })
       .from(message_model)
-      // .innerJoin(
-      //   user_model,
-      //   eq(user_model.id, message_model.sender_id)
-      // )
+      .innerJoin(
+        user_model,
+        eq(user_model.id, message_model.sender_id)
+      )
       .where(
         and(
           or(

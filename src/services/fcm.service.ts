@@ -71,8 +71,13 @@ export class FCMService {
         .where(and(eq(user_model.id, userId), eq(conversation_member_model.deleted, false), payload.data?.conversationId ? eq(conversation_member_model.conversation_id, Number(payload.data?.conversationId)) : undefined))
         .limit(1);
 
-      if (user.length === 0 || !user[0].fcm_token) {
-        console.log(`[FCM] No FCM token found for user ${userId} or user is not a member of the conversation`);
+      if (user.length === 0) {
+        console.log(`[FCM] ${userId} is not a member of the conversation ${payload.data?.conversationId}`);
+        return false;
+      }
+
+      if (!user[0].fcm_token) {
+        console.log(`[FCM] No FCM token found for user ${userId}`);
         return false;
       }
 
@@ -111,8 +116,12 @@ export class FCMService {
       const response = await admin.messaging().send(message);
       console.log(`[FCM] Successfully sent notification to user ${userId}: ${response}`);
       return true;
-    } catch (error) {
-      console.error(`[FCM] Error sending notification to user ${userId}:`, error);
+    } catch (error: any) {
+      if (error.code === 'messaging/registration-token-not-registered') {
+        console.error(`[FCM] Error sending notification to user ${userId}: Invalid FCM Token`);
+      } else {
+        console.error(`[FCM] Error sending notification to user ${userId}: `, error);
+      }
       return false;
     }
   }
@@ -125,7 +134,7 @@ export class FCMService {
     data: MessageNotificationData
   ): Promise<boolean> {
     const payload: NotificationPayload = {
-      title: `New message from ${data.senderName}`,
+      title: `${data.senderName}`,
       body: this._formatMessageBody(data.messageBody, data.messageType),
       type: 'message',
       data: {
@@ -234,34 +243,7 @@ export class FCMService {
     }
   }
 
-  /**
-   * Send notification to multiple users
-   */
-  async sendNotificationToUsers(
-    userIds: number[],
-    payload: NotificationPayload
-  ): Promise<{ success: number; failed: number }> {
-    let success = 0;
-    let failed = 0;
-
-    const promises = userIds.map(async (userId) => {
-      const result = await this.sendNotificationToUser(userId, payload);
-      if (result) {
-        success++;
-      } else {
-        failed++;
-      }
-    });
-
-    await Promise.all(promises);
-
-    console.log(`[FCM] Sent notifications: ${success} success, ${failed} failed`);
-    return { success, failed };
-  }
-
-  /**
-   * Update user's FCM token
-   */
+  // Update user's FCM token
   async updateUserFCMToken(userId: number, fcmToken: string): Promise<boolean> {
     try {
       await db
@@ -351,9 +333,9 @@ export class FCMService {
     const messageId = Date.now().toString(); // Use timestamp as message ID for notifications
 
     const promises = userIds.map(async (userId) => {
-      if (userId.toString() === senderId) {
-        return; // Don't send notification to sender
-      }
+
+      // Don't send notification to sender
+      if (userId.toString() === senderId) return;
 
       const data: MessageNotificationData = {
         conversationId,

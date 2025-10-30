@@ -68,7 +68,7 @@ Content-Type: application/json
 
 {
   "otp": 123456,
-  "phone": "+919876543210"
+  "phone": "+918534946840"
 }
 
 
@@ -231,3 +231,14 @@ GET https://api.amigochats.com/api/admin/seed-admin HTTP/1.1
 ### 
 
 GET https://api.amigochats.com/api/auth/clear-db HTTP/1.1
+
+
+### 
+
+POST https://api.amigochats.com/api/auth/verify-login-otp HTTP/1.1
+Content-Type: application/json
+
+{
+  "otp": 123456,
+  "phone": "+918534946840"
+}

@@ -13,9 +13,9 @@ import { hash_password, parse_phone } from "./utils/general.utils";
 import admin_routes from "./routes/admin.routes";
 import unprotected_call_routes from "./routes/unprotected-calls.routes";
 
-const SERVER_PORT = process.env.SERVER_PORT || 5000;
-if (!SERVER_PORT) {
-  throw new Error("SERVER_PORT environment variable is not set");
+const SERVER_PORT = parseInt(process.env.SERVER_PORT || "5000");
+if (!SERVER_PORT || isNaN(SERVER_PORT)) {
+  throw new Error("SERVER_PORT environment variable is not set or invalid");
 }
 const app = new Elysia({ prefix: "/api" })
   .get("/", () => "Elysia Server is running")
@@ -35,7 +35,18 @@ const app = new Elysia({ prefix: "/api" })
   .listen(SERVER_PORT);
 
 console.log(
-  `🦊 Elysia is running at port ${app.server?.port}`
+  `🦊 Elysia is running at port ${app.server?.port} (PID: ${process.pid})`
 );
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down gracefully');
+  process.exit(0);
+});
 
 // console.log(((await hash_password("Admin@123"))))

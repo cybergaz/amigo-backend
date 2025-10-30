@@ -10,6 +10,7 @@ interface ElysiaMiddlewareType {
 // WebSocket data interface for type safety
 interface WebSocketData {
   user_id?: number;
+  user_name?: string;
   request: Request;
   query: {
     token?: string;
