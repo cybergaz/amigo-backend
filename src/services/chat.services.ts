@@ -12,6 +12,7 @@ import {
 } from "@/types/chat.types";
 import { create_dm_key, create_unique_id } from "@/utils/general.utils";
 import { and, arrayContains, asc, desc, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
+import { send_to_user } from "@/sockets/web-socket";
 
 const create_chat = async (sender_id: number, receiver_id: number) => {
   try {
@@ -94,6 +95,31 @@ const create_chat = async (sender_id: number, receiver_id: number) => {
     // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
     // -----------------------------------------------------------------------------------
 
+    // Send notification to receiver about new DM
+    try {
+      // Get sender info for notification
+      const [sender] = await db
+        .select({ name: user_model.name, profile_pic: user_model.profile_pic })
+        .from(user_model)
+        .where(eq(user_model.id, sender_id))
+        .limit(1);
+
+      // Get conversation details for receiver
+      const conversationData = await getConversationDetailsForUser(chat.id, receiver_id);
+
+      if (conversationData) {
+        await send_to_user(receiver_id, {
+          type: 'conversation_added',
+          conversation_id: chat.id,
+          data: conversationData,
+          timestamp: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      console.error('Error sending conversation_added notification for DM:', error);
+      // Don't fail the request if notification fails
+    }
+
     return {
       success: true,
       code: 200,
@@ -166,7 +192,10 @@ const get_chat_list = async (user_id: number, type: string) => {
           eq(conversation_model.deleted, false),
         )
       )
-      .orderBy(desc(conversation_model.last_message_at));
+      .orderBy(
+        desc(conversation_model.last_message_at),
+        // desc(conversation_member_model.joined_at),
+      )
 
     // For groups and community groups, we don't need the other user info
     // For DMs, we need to get the other user's info separately
@@ -339,6 +368,24 @@ const create_group = async (
       }))
     );
 
+    // Send notification to all members about the new group
+    try {
+      for (const memberId of uniqueMemberIds) {
+        const conversationData = await getConversationDetailsForUser(chat.id, memberId);
+        if (conversationData) {
+          await send_to_user(memberId, {
+            type: 'conversation_added',
+            conversation_id: chat.id,
+            data: conversationData,
+            timestamp: new Date().toISOString()
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Error sending conversation_added notification for group:', error);
+      // Don't fail the request if notification fails
+    }
+
     return {
       success: true,
       code: 200,
@@ -409,6 +456,24 @@ const add_new_member = async (
           }))
         )
         .returning();
+    }
+
+    // Send notification to newly added members
+    try {
+      for (const newMemberId of eligibleIds) {
+        const conversationData = await getConversationDetailsForUser(conversation_id, newMemberId);
+        if (conversationData) {
+          await send_to_user(newMemberId, {
+            type: 'conversation_added',
+            conversation_id: conversation_id,
+            data: conversationData,
+            timestamp: new Date().toISOString()
+          });
+        }
+      }
+    } catch (error) {
+      console.error('Error sending conversation_added notification for new members:', error);
+      // Don't fail the request if notification fails
     }
 
     return {
@@ -1184,6 +1249,118 @@ const get_conversation_history_admin = async (
       code: 500,
       message: "ERROR : get_conversation_history_admin",
     };
+  }
+};
+
+// Helper function to get conversation details for a specific user
+// Returns data in the same format as get_chat_list for consistency
+const getConversationDetailsForUser = async (conversation_id: number, user_id: number) => {
+  try {
+    const [chat] = await db
+      .select({
+        conversationId: conversation_model.id,
+        type: conversation_model.type,
+        title: conversation_model.title,
+        metadata: conversation_model.metadata,
+        lastMessageAt: conversation_model.last_message_at,
+        role: conversation_member_model.role,
+        unreadCount: conversation_member_model.unread_count,
+        joinedAt: conversation_member_model.joined_at,
+        userId: user_model.id,
+        userName: user_model.name,
+        onlineStatus: user_model.online_status,
+        lastSeen: user_model.last_seen,
+        userProfilePic: user_model.profile_pic,
+      })
+      .from(conversation_member_model)
+      .innerJoin(
+        conversation_model,
+        eq(conversation_model.id, conversation_member_model.conversation_id)
+      )
+      .leftJoin(
+        user_model,
+        and(
+          eq(user_model.id, conversation_member_model.user_id),
+          ne(user_model.id, user_id)
+        )
+      )
+      .where(
+        and(
+          eq(conversation_model.id, conversation_id),
+          eq(conversation_member_model.user_id, user_id)
+        )
+      )
+      .limit(1);
+
+    if (!chat) return null;
+
+    // For DMs, get the other user's info
+    if (chat.type === "dm" && !chat.userId) {
+      const [otherUser] = await db
+        .select({
+          userId: user_model.id,
+          userName: user_model.name,
+          onlineStatus: user_model.online_status,
+          lastSeen: user_model.last_seen,
+          userProfilePic: user_model.profile_pic,
+        })
+        .from(conversation_member_model)
+        .innerJoin(user_model, eq(user_model.id, conversation_member_model.user_id))
+        .where(
+          and(
+            eq(conversation_member_model.conversation_id, conversation_id),
+            ne(conversation_member_model.user_id, user_id)
+          )
+        )
+        .limit(1);
+
+      return {
+        ...chat,
+        userId: otherUser?.userId || null,
+        userName: otherUser?.userName || null,
+        onlineStatus: otherUser?.onlineStatus || "offline",
+        lastSeen: otherUser?.lastSeen || null,
+        userProfilePic: otherUser?.userProfilePic || null,
+      };
+    }
+
+    // For groups, clear user info
+    if (chat.type === "group" || chat.type === "community_group") {
+      // Also get group members for groups
+      const members = await db
+        .select({
+          userId: user_model.id,
+          userName: user_model.name,
+          userProfilePic: user_model.profile_pic,
+          role: conversation_member_model.role,
+          joinedAt: conversation_member_model.joined_at,
+        })
+        .from(conversation_member_model)
+        .innerJoin(user_model, eq(user_model.id, conversation_member_model.user_id))
+        .where(eq(conversation_member_model.conversation_id, conversation_id))
+        .orderBy(asc(conversation_member_model.joined_at));
+
+      return {
+        ...chat,
+        userId: null,
+        userName: null,
+        onlineStatus: "offline",
+        lastSeen: null,
+        userProfilePic: null,
+        members: members.map(m => ({
+          userId: m.userId,
+          name: m.userName,
+          profilePic: m.userProfilePic,
+          role: m.role,
+          joinedAt: m.joinedAt,
+        })),
+      };
+    }
+
+    return chat;
+  } catch (error) {
+    console.error('Error getting conversation details:', error);
+    return null;
   }
 };
 

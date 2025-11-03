@@ -50,7 +50,8 @@ interface WSMessage {
   | 'call:init'
   | 'call:offer'
   | 'call:answer'
-  | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed';
+  | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed'
+  | 'conversation_added';
 
   data?: any;
   conversation_id?: number;
@@ -136,9 +137,7 @@ const add_connection = async (user_id: number, ws: ElysiaWS) => {
   memberships.forEach(row => {
     join_conversation(user_id, row.conversation_id);
   })
-  // console.log('ws connection : ')
-  // console.log("connections ->", connections)
-  // console.log("conversation_connections ->", conversation_connections)
+
   console.log(`[WS] User ${user_id} connected. Total connections: ${connections.size}`);
 };
 
@@ -188,21 +187,12 @@ const leave_conversation = (user_id: number, conversation_id: number) => {
         conversation_connections.delete(conversation_id);
       }
     }
-
-    console.log(`[WS] User ${user_id} left conversation ${conversation_id}`);
   }
 };
 
 const broadcast_to_conversation = async (conversation_id: number, message: WSMessage, exclude_user?: number, message_id?: number, included_user?: number) => {
 
-  console.log(`broadcasting to conversation ID || ${conversation_id} ->`, message)
-  // console.log("message ->", message)
-  // console.log("connnections :", connections)
-  // console.log("conversation_connections :", conversation_connections)
   const conv_connections = conversation_connections.get(conversation_id);
-  console.log("conv_connections ->", conv_connections)
-  // console.log("connections ->", connections)
-  // console.log("conversation_connections ->", conversation_connections)
   if (!conv_connections) return;
 
   const message_str = JSON.stringify(message);
@@ -227,10 +217,8 @@ const broadcast_to_conversation = async (conversation_id: number, message: WSMes
 
     const connection = connections.get(user_id);
     // send message to online users, else increase the unread count in the database
-    console.log(user_id, "ready state", connection?.ws.readyState)
     if (connection && connection.ws.readyState === 1) {
       try {
-        console.log(`sending to user ID || ${user_id} ->`, message)
         connection.ws.send(message_str);
         sent_count++;
         delivered_count++;
@@ -335,8 +323,6 @@ const broadcast_to_conversation = async (conversation_id: number, message: WSMes
     )
 
   const offline_member_ids = offline_members.map(m => m.user_id);
-  console.log("offline_member_ids ->", offline_member_ids)
-
 
   // Send push notifications to offline users for message notifications
   // Only send for actual message types, not call signaling
@@ -415,7 +401,7 @@ const broadcast_to_conversation = async (conversation_id: number, message: WSMes
 
   // Send delivery/read receipt back to sender if message_id is provided
   if (included_user && message_id) {
-    send_delivery_receipt(included_user, conversation_id, message_id, message.data.optimistic_id, delivery_status);
+    await send_delivery_receipt(included_user, conversation_id, message_id, message.data.optimistic_id, delivery_status);
   }
 };
 
@@ -443,13 +429,12 @@ const send_to_user = async (user_id: number, message: WSMessage) => {
     //   messageType: message.data?.type || 'text'
     // })
     //
-    console.warn(`[WS] Cannot send ${message.type} to user ${user_id} - not connected or connection not ready`);
-    console.warn(`[WS] Connection exists: ${!!connection}, ReadyState: ${connection?.ws.readyState}`);
+    console.warn(`[WS] Cannot send ${message.type} to user ${user_id} - not connected or ready state is not 1`);
   }
   return false;
 };
 
-const send_delivery_receipt = (
+const send_delivery_receipt = async (
   sender_id: number,
   conversation_id: number,
   message_id: number,
@@ -472,12 +457,11 @@ const send_delivery_receipt = (
     timestamp: new Date().toISOString()
   };
 
-  send_to_user(sender_id, receipt_message);
+  await send_to_user(sender_id, receipt_message);
   // console.log(`[WS] Sent delivery receipt to sender ${sender_id} for message ${message_id}`);
 };
 
 const broadcast_to_all = (message: WSMessage) => {
-  console.log("broadcasting to all ->", message)
   const message_str = JSON.stringify(message);
   connections.forEach((connection, user_id) => {
     if (connection.ws.readyState === 1) {
@@ -557,10 +541,10 @@ const web_socket = new Elysia()
         // and store them in either connections.conversations or a new Map,
         // and then send the message to all the conversation IDs (idk how will you find sockets for them)
         // -----------------------------------------------------------------------
-        add_connection(user_id, ws);
+        await add_connection(user_id, ws);
 
         // Send welcome message
-        send_to_user(user_id, {
+        await send_to_user(user_id, {
           type: 'message',
           data: { message: 'Connected to chat server' },
           timestamp: new Date().toISOString()
@@ -605,10 +589,11 @@ const web_socket = new Elysia()
 
         switch (message.type) {
           case 'ping':
-            send_to_user(user_id, { type: 'pong', data: message.data || {}, timestamp: new Date().toISOString() });
+            await send_to_user(user_id, { type: 'pong', data: message.data || {}, timestamp: new Date().toISOString() });
             break;
 
           case 'join_conversation':
+            // console.log("[WS] Received join_conversation:", message);
             if (message.conversation_id) {
 
               // -----------------------------------------------------------
@@ -640,7 +625,7 @@ const web_socket = new Elysia()
                   // )
                 }
               }
-              send_to_user(user_id, {
+              await send_to_user(user_id, {
                 type: 'join_conversation',
                 data: { success: true },
                 conversation_id: message.conversation_id,
@@ -674,7 +659,7 @@ const web_socket = new Elysia()
                 connection.active_conversation_id = undefined;
               }
 
-              send_to_user(user_id, {
+              await send_to_user(user_id, {
                 type: 'leave_conversation',
                 data: { conversation_id: message.conversation_id, success: true },
                 conversation_id: message.conversation_id,
@@ -684,6 +669,7 @@ const web_socket = new Elysia()
             break;
 
           case 'message':
+            // console.log("[WS] Received message:", message);
             if (message.conversation_id && message.data) {
               // Save message to database
               const new_message = await db
@@ -742,6 +728,7 @@ const web_socket = new Elysia()
             break;
 
           case 'typing':
+            // console.log("[WS] Received typing:", message);
             if (message.conversation_id) {
               broadcast_to_conversation(message.conversation_id, {
                 type: 'typing',
@@ -993,8 +980,8 @@ const web_socket = new Elysia()
           //   break;
 
           case 'active_in_conversation':
+            // console.log("[WS] Received active_in_conversation:", message);
             if (message.conversation_id) {
-              console.log("active in conversation conversation_id ->", message.conversation_id)
               const connection = connections.get(user_id);
               if (connection) {
                 const wasActive = connection.active_conversation_id === message.conversation_id;
@@ -1153,7 +1140,7 @@ const web_socket = new Elysia()
               } else {
                 // console.log(`[WS] Call initiation failed: ${result.error} (${result.code})`);
                 // Send error to caller
-                send_to_user(user_id, {
+                await send_to_user(user_id, {
                   type: 'error',
                   data: { message: result.error, code: result.code },
                   timestamp: new Date().toISOString()
@@ -1169,7 +1156,7 @@ const web_socket = new Elysia()
           case 'call:ice':
             // Forward WebRTC signaling between caller and callee
             if (message.callId && message.to && message.payload) {
-              send_to_user(message.to, {
+              await send_to_user(message.to, {
                 type: message.type,
                 callId: message.callId,
                 from: user_id,
@@ -1183,7 +1170,6 @@ const web_socket = new Elysia()
             break;
 
           case 'call:accept':
-            console.log("call accepted ->")
             if (message.callId) {
               const result = await CallService.accept_call(message.callId, user_id);
 
@@ -1192,7 +1178,7 @@ const web_socket = new Elysia()
                 const active_call = CallService.get_user_active_call(user_id);
                 if (active_call) {
                   // Notify caller
-                  send_to_user(active_call.caller_id, {
+                  await send_to_user(active_call.caller_id, {
                     type: 'call:accept',
                     callId: message.callId,
                     from: user_id,
@@ -1201,7 +1187,7 @@ const web_socket = new Elysia()
                   });
 
                   // Acknowledge to callee
-                  send_to_user(user_id, {
+                  await send_to_user(user_id, {
                     type: 'call:accept',
                     callId: message.callId,
                     from: user_id,
@@ -1211,7 +1197,7 @@ const web_socket = new Elysia()
                   });
                 }
               } else {
-                send_to_user(user_id, {
+                await send_to_user(user_id, {
                   type: 'error',
                   data: { message: result.error },
                   timestamp: new Date().toISOString()
@@ -1229,7 +1215,7 @@ const web_socket = new Elysia()
                 if (active_call) {
                   // Notify caller
                   const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
-                  send_to_user(active_call.caller_id, {
+                  await send_to_user(active_call.caller_id, {
                     type: 'call:decline',
                     callId: message.callId,
                     from: user_id,
@@ -1237,7 +1223,7 @@ const web_socket = new Elysia()
                     payload: message.payload,
                     timestamp: new Date().toISOString()
                   });
-                  send_to_user(user_id, {
+                  await send_to_user(user_id, {
                     type: 'call:decline',
                     callId: message.callId,
                     data: { success: true, reason: message.payload?.reason },
@@ -1268,7 +1254,7 @@ const web_socket = new Elysia()
 
                   // console.log(`[WS] Call ended: ${message.callId}, notifying user ${other_user}`);
 
-                  send_to_user(other_user, {
+                  await send_to_user(other_user, {
                     type: 'call:end',
                     callId: message.callId,
                     from: user_id,
@@ -1281,7 +1267,7 @@ const web_socket = new Elysia()
                   });
 
                   // Acknowledge to sender
-                  send_to_user(user_id, {
+                  await send_to_user(user_id, {
                     type: 'call:end',
                     callId: message.callId,
                     data: { success: true, duration: result.data?.duration_seconds },
@@ -1297,7 +1283,7 @@ const web_socket = new Elysia()
             break;
 
           default:
-            send_to_user(user_id, {
+            await send_to_user(user_id, {
               type: 'error',
               data: { message: 'Unknown message type' },
               timestamp: new Date().toISOString()
@@ -1307,7 +1293,7 @@ const web_socket = new Elysia()
         console.error('[WS] Error processing message:', error);
         const user_id = getUserId(ws);
         if (user_id) {
-          send_to_user(user_id, {
+          await send_to_user(user_id, {
             type: 'error',
             data: { message: 'Invalid message format' },
             timestamp: new Date().toISOString()
