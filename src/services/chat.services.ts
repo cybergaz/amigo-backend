@@ -896,10 +896,12 @@ const get_conversation_history = async (
       .select({
         user_id: conversation_member_model.user_id,
         name: user_model.name,
+        user_role: user_model.role,
+        group_role: conversation_member_model.role,
         profile_pic: user_model.profile_pic,
         joining_date: conversation_member_model.joined_at,
         last_read_message_id: conversation_member_model.last_read_message_id,
-        last_delivered_message_id: conversation_member_model.last_delivered_message_id,
+        lasthistory_delivered_message_id: conversation_member_model.last_delivered_message_id,
       })
       .from(conversation_member_model)
       .leftJoin(
@@ -929,8 +931,14 @@ const get_conversation_history = async (
       };
     }
 
-    const user_joining_date = members.find(m => m.user_id === user_id)?.joining_date;
-
+    const user_details = members.find(m => m.user_id === user_id);
+    if (!user_details) {
+      return {
+        success: false,
+        code: 404,
+        message: "User not found",
+      };
+    }
     // Calculate offset for pagination
     const offset = (page - 1) * limit;
 
@@ -966,13 +974,15 @@ const get_conversation_history = async (
             arrayContains(message_model.forwarded_to, [conversation_id]),
           ),
           or(
-            and(
-              eq(message_model.sender_id, user_id),
-              eq(message_model.deleted, false)
-            ),
-            ne(message_model.sender_id, user_id)
+            // and(
+            //   eq(message_model.sender_id, user_id),
+            //   eq(message_model.deleted, false)
+            // ),
+            // ne(message_model.sender_id, user_id),
+            eq(message_model.deleted, false),
+            // user_details.user_role === "admin" || user_details.user_role === "staff" ? undefined : eq(message_model.deleted, false)
           ),
-          user_joining_date ? gt(message_model.created_at, user_joining_date) : undefined
+          user_details.joining_date ? gt(message_model.created_at, user_details.joining_date) : undefined
         )
       )
       .orderBy(desc(message_model.created_at))
