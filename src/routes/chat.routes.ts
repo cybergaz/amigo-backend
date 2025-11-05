@@ -190,12 +190,13 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   })
 
   .delete("/soft-delete-message", async ({ set, store, body }) => {
-    const delete_result = await soft_delete_message(body.message_ids, store.id);
+    const delete_result = await soft_delete_message(body.message_ids, store.id, body.is_admin_or_staff || false);
     set.status = delete_result.code;
     return delete_result;
   }, {
     body: t.Object({
-      message_ids: t.Array(t.Number())
+      message_ids: t.Array(t.Number()),
+      is_admin_or_staff: t.Optional(t.Boolean())
     })
   })
 
