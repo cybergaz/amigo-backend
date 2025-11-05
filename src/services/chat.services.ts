@@ -815,14 +815,15 @@ const dm_delete_status = async (conversation_id: number, user_id: number, status
   }
 };
 
-const soft_delete_message = async (message_ids: number[], user_id: number) => {
+const soft_delete_message = async (message_ids: number[], user_id: number, is_admin_or_staff?: boolean) => {
   try {
+
     const messages = await db
       .update(message_model)
       .set({ deleted: true })
       .where(and(
         inArray(message_model.id, message_ids),
-        eq(message_model.sender_id, user_id)
+        !is_admin_or_staff ? eq(message_model.sender_id, user_id) : undefined, 
       ))
 
     if (!messages) {
