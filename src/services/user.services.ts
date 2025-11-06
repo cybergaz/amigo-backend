@@ -348,8 +348,8 @@ export const get_all_users_paginated = async (page: number = 1, limit: number = 
       .orderBy(user_model.created_at)
       .limit(limit)
       .offset(offset);
-    console.log("users ->", users)
-    console.log("role ->", role)
+    // console.log("users ->", users)
+    // console.log("role ->", role)
 
     const totalPages = Math.ceil(totalCount / limit);
 

@@ -51,7 +51,8 @@ interface WSMessage {
   | 'call:offer'
   | 'call:answer'
   | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed'
-  | 'conversation_added';
+  | 'conversation_added'
+  | 'socket_health_check';
 
   data?: any;
   conversation_id?: number;
@@ -1374,10 +1375,12 @@ export {
   connections,
   conversation_connections,
   broadcast_to_conversation,
+  broadcast_to_all,
   send_to_user,
   add_connection,
   remove_connection,
   join_conversation,
   leave_conversation
 };
+
 export default web_socket;

@@ -37,7 +37,12 @@ const unprotected_call_routes = new Elysia({ prefix: "/call" })
 
   .get("/socket/status", async ({ set, params }) => {
     console.log("testing socket status endpoint");
-    // broadcast_to_all( );
+    broadcast_to_all({
+      type: "socket_health_check",
+      data: {
+        time: Date.now()
+      }
+    });
     set.status = 200;
     return {
       success: true,
