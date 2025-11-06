@@ -20,7 +20,7 @@ if (!SERVER_PORT || isNaN(SERVER_PORT)) {
 const app = new Elysia({ prefix: "/api" })
   .get("/", () => "Elysia Server is running")
   .use(cors({
-    origin: [process.env.FRONTEND_URL || "http://localhost:3000", "https://amigochats.com", "https://www.amigochats.com", "http://52.221.96.77:5000"],
+    origin: [process.env.FRONTEND_URL || "http://localhost:3000", "https://amigochats.com", "https://www.amigochats.com", "https://admin.amigochats.com"],
     credentials: true,
   }))
   .use(auth_routes)

@@ -5,6 +5,7 @@ import db from "@/config/db";
 import { call_model } from "@/models/call.model";
 import { eq } from "drizzle-orm";
 import FCMService from '@/services/fcm.service';
+import { connections, conversation_connections, broadcast_to_all } from "@/sockets/web-socket";
 
 const unprotected_call_routes = new Elysia({ prefix: "/call" })
 
@@ -33,5 +34,20 @@ const unprotected_call_routes = new Elysia({ prefix: "/call" })
       message: "Call status retrieved successfully"
     };
   })
+
+  .get("/socket/status", async ({ set, params }) => {
+    console.log("testing socket status endpoint");
+    // broadcast_to_all( );
+    set.status = 200;
+    return {
+      success: true,
+      data: {
+        connections: connections,
+        conversation_connections: conversation_connections
+      },
+      message: "Socket status retrieved successfully"
+    };
+  })
+
 
 export default unprotected_call_routes;
