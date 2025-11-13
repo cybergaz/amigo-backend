@@ -15,13 +15,13 @@ export const call_model = pgTable("calls", {
   id: bigserial({ mode: "number" }).primaryKey(),
   caller_id: bigint({ mode: "number" }).references(() => user_model.id, { onDelete: 'cascade' }).notNull(),
   callee_id: bigint({ mode: "number" }).references(() => user_model.id, { onDelete: 'cascade' }).notNull(),
-  started_at: timestamp().defaultNow().notNull(),
-  answered_at: timestamp(),
-  ended_at: timestamp(),
+  started_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
+  answered_at: timestamp({ withTimezone: true }),
+  ended_at: timestamp({ withTimezone: true }),
   duration_seconds: integer().default(0),
   status: varchar({ enum: CALL_STATUS_CONSTS }).notNull(),
   reason: varchar(),
-  created_at: timestamp().defaultNow().notNull(),
+  created_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
 });
 
 export type CallType = InferSelectModel<typeof call_model>;

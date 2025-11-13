@@ -11,8 +11,8 @@ const user_model = pgTable("users", {
   profile_pic: text(),
   hashed_password: text(),
   refresh_token: text().notNull(),
-  created_at: timestamp().defaultNow(),
-  last_seen: timestamp().defaultNow(),
+  created_at: timestamp({ withTimezone: true }).defaultNow(),
+  last_seen: timestamp({ withTimezone: true }).defaultNow(),
   call_access: boolean().default(false),
   online_status: boolean().default(false),
   location: jsonb(), // { latitude: number, longitude: number }

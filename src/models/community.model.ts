@@ -7,8 +7,8 @@ export const community_model = pgTable("communities", {
   name: varchar({ length: 255 }).notNull(),
   group_ids: bigint({ mode: 'number' }).array(),
   metadata: jsonb(), // For additional community settings
-  created_at: timestamp().defaultNow().notNull(),
-  updated_at: timestamp().defaultNow().notNull(),
+  created_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
+  updated_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
   deleted: boolean().default(false).notNull(),
 });
 
