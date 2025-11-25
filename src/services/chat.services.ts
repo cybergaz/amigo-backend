@@ -3,16 +3,21 @@ import {
   conversation_model,
   conversation_member_model,
   message_model,
+  DBUpdateConversationType,
 } from "@/models/chat.model";
 import { user_model } from "@/models/user.model";
 import user_routes from "@/routes/user.routes";
 import {
   ChatRoleType,
   ChatType,
+  ConversationMetadata,
 } from "@/types/chat.types";
 import { create_dm_key, create_unique_id } from "@/utils/general.utils";
 import { and, arrayContains, asc, desc, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
-import { send_to_user } from "@/sockets/web-socket";
+import { redis } from "@/config/redis";
+import { broadcast_message } from "@/sockets/socket.handlers";
+import { DeleteMessagePayload, NewConversationPayload, MembersType } from "@/types/socket.types";
+import { socket_connections } from "@/sockets/socket.server";
 
 const create_chat = async (sender_id: number, receiver_id: number) => {
   try {
@@ -28,29 +33,14 @@ const create_chat = async (sender_id: number, receiver_id: number) => {
         )
       );
 
-    // const existingChat = await db
-    //   .select({ conversation_id: conversation_member_model.conversation_id })
-    //   .from(conversation_member_model)
-    //   .leftJoin(
-    //     conversation_model,
-    //     eq(conversation_member_model.conversation_id, conversation_model.id)
-    //   )
-    //   .where(
-    //     and(
-    //       eq(conversation_model.type, "dm"),
-    //       inArray(conversation_member_model.user_id, [sender_id, receiver_id])
-    //     )
-    //   )
-    //   .groupBy(conversation_member_model.conversation_id)
-    //   .having(sql`count(distinct ${conversation_member_model.user_id}) = 2`);
-
-    // console.log("existingChat ->", existingChat)
-
     if (existingChat.length > 0) {
       return {
         success: true,
         code: 200,
-        data: { id: existingChat[0].conversation_id, existing: true },
+        data: {
+          id: existingChat[0].conversation_id,
+          existing: true
+        },
       };
     }
 
@@ -76,44 +66,70 @@ const create_chat = async (sender_id: number, receiver_id: number) => {
       },
     ]);
 
-    // -----------------------------------------------------------------------------------
-    // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
-    // -----------------------------------------------------------------------------------
-    await db.insert(message_model).values({
-      conversation_id: chat.id,
-      sender_id: sender_id,
-      type: "system",
-      body: "chat initiated",
-    });
+    // // -----------------------------------------------------------------------------------
+    // // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
+    // // -----------------------------------------------------------------------------------
     // await db.insert(message_model).values({
     //   conversation_id: chat.id,
     //   sender_id: sender_id,
     //   type: "system",
-    //   body: "chat initiated 2",
+    //   body: "chat initiated",
     // });
-    // -----------------------------------------------------------------------------------
-    // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
-    // -----------------------------------------------------------------------------------
+    // // await db.insert(message_model).values({
+    // //   conversation_id: chat.id,
+    // //   sender_id: sender_id,
+    // //   type: "system",
+    // //   body: "chat initiated 2",
+    // // });
+    // // -----------------------------------------------------------------------------------
+    // // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
+    // // -----------------------------------------------------------------------------------
 
     // Send notification to receiver about new DM
     try {
       // Get sender info for notification
       const [sender] = await db
-        .select({ name: user_model.name, profile_pic: user_model.profile_pic })
+        .select({ name: user_model.name, phone: user_model.phone, profile_pic: user_model.profile_pic })
         .from(user_model)
         .where(eq(user_model.id, sender_id))
         .limit(1);
 
-      // Get conversation details for receiver
-      const conversationData = await getConversationDetailsForUser(chat.id, receiver_id);
+      if (sender) {
+        // update redis entries
+        const redis_key = `conv:${chat.id}:members`;
+        const new_members_id = [receiver_id, sender_id].map(id => id.toString());
+        await redis.sadd(redis_key, ...new_members_id);
 
-      if (conversationData) {
-        await send_to_user(receiver_id, {
-          type: 'conversation_added',
-          conversation_id: chat.id,
-          data: conversationData,
-          timestamp: new Date().toISOString()
-        });
+        // Invalidate conversation lru cache in other services
+        await redis.publish("conv:invalidate", chat.id.toString());
+
+        // mark the creater as active in conversation in socket connection if online
+        const conn = socket_connections.get(sender_id)
+        if (conn && conn.ws.readyState === 1) {
+          conn.active_conv_id = chat.id;
+        }
+
+        // Prepare payload and broadcast to online users about new conversation
+        const new_conversation_payload: NewConversationPayload = {
+          conv_id: chat.id,
+          conv_type: "dm",
+          creater_id: sender_id,
+          creater_name: sender.name,
+          creater_phone: sender.phone || "",
+          creater_pfp: sender.profile_pic || undefined,
+          joined_at: new Date(),
+        }
+
+        // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        await broadcast_message({
+          to: "users",
+          user_ids: [receiver_id],
+          message: {
+            type: "conversation:new",
+            payload: new_conversation_payload,
+            ws_timestamp: new Date()
+          },
+        })
       }
     } catch (error) {
       console.error('Error sending conversation_added notification for DM:', error);
@@ -152,6 +168,7 @@ const get_chat_list = async (user_id: number, type: string) => {
         title: conversation_model.title,
         metadata: conversation_model.metadata,
         lastMessageAt: conversation_model.last_message_at,
+        createrId: conversation_model.creater_id,
 
         role: conversation_member_model.role,
         unreadCount: conversation_member_model.unread_count,
@@ -160,9 +177,10 @@ const get_chat_list = async (user_id: number, type: string) => {
         // from user_model - for DMs, this will be the other user
         userId: user_model.id,
         userName: user_model.name,
+        userPhone: user_model.phone,
+        userProfilePic: user_model.profile_pic,
         onlineStatus: user_model.online_status,
         lastSeen: user_model.last_seen,
-        userProfilePic: user_model.profile_pic,
       })
       .from(conversation_member_model)
       .innerJoin(
@@ -201,15 +219,17 @@ const get_chat_list = async (user_id: number, type: string) => {
     // For DMs, we need to get the other user's info separately
     const processedChats = await Promise.all(
       chats.map(async (chat) => {
+        let final_chat_item: any;
         if (chat.type === "dm" && !chat.userId) {
           // Get the other user for DM
           const [otherUser] = await db
             .select({
               userId: user_model.id,
               userName: user_model.name,
+              userPhone: user_model.phone,
+              userProfilePic: user_model.profile_pic,
               onlineStatus: user_model.online_status,
               lastSeen: user_model.last_seen,
-              userProfilePic: user_model.profile_pic,
             })
             .from(conversation_member_model)
             .innerJoin(user_model, eq(user_model.id, conversation_member_model.user_id))
@@ -220,29 +240,70 @@ const get_chat_list = async (user_id: number, type: string) => {
               )
             );
 
-          return {
+          final_chat_item = {
             ...chat,
             userId: otherUser?.userId || null,
             userName: otherUser?.userName || null,
-            onlineStatus: otherUser?.onlineStatus || "offline",
-            lastSeen: otherUser?.lastSeen || null,
+            userPhone: otherUser?.userPhone || null,
             userProfilePic: otherUser?.userProfilePic || null,
+            onlineStatus: otherUser?.onlineStatus || false,
+            lastSeen: otherUser?.lastSeen || null,
           };
         }
 
         // For groups and community groups, clear user info since it's not relevant
         if (chat.type === "group" || chat.type === "community_group") {
-          return {
+          const userMemberInfo = (await db
+            .select({
+              userId: user_model.id,
+              userName: user_model.name,
+              userPhone: user_model.phone,
+              role: conversation_member_model.role,
+              joinedAt: conversation_member_model.joined_at,
+              unreadCount: conversation_member_model.unread_count
+            })
+            .from(conversation_member_model)
+            .where(and(
+              eq(conversation_member_model.conversation_id, chat.conversationId),
+              eq(conversation_member_model.user_id, user_id)
+            )))[0]
+
+          final_chat_item = {
             ...chat,
             userId: null,
             userName: null,
-            onlineStatus: "offline",
+            userPhone: null,
+            onlineStatus: false,
             lastSeen: null,
             userProfilePic: null,
+            userRole: userMemberInfo?.role || null,
+            userJoinedAt: userMemberInfo?.joinedAt || null,
+            userUnreadCount: userMemberInfo?.unreadCount || 0,
           };
         }
 
-        return chat;
+        if (chat.metadata !== null) {
+          const metadata = chat.metadata as any;
+
+          // if last_message exists in metadata, extract it if pinned message available append it as well
+          if (metadata.last_message != null) {
+            final_chat_item = {
+              ...final_chat_item,
+              lastMessageId: metadata.last_message.id,
+              lastMessageBody: metadata.last_message.body,
+              lastMessageType: metadata.last_message.type,
+            }
+          }
+
+          if (metadata.pinned_message != null) {
+            final_chat_item = {
+              ...final_chat_item,
+              pinnedMessageId: metadata.pinned_message.message_id,
+            }
+          }
+        }
+
+        return final_chat_item;
       })
     );
 
@@ -341,11 +402,64 @@ const get_group_info = async (conversation_id: number) => {
   }
 }
 
+const update_conversation = async (conv_data: DBUpdateConversationType) => {
+  try {
+    if (!conv_data.id) {
+      return {
+        success: false,
+        code: 400,
+        message: "Conversation ID is required for update",
+      }
+    }
+
+    if (conv_data.metadata) {
+      // Update conversation's last_message_at and last_message in metadata
+      const [conversation] = await db
+        .select({ metadata: conversation_model.metadata })
+        .from(conversation_model)
+        .where(eq(conversation_model.id, conv_data.id))
+        .limit(1);
+
+      if (conversation) {
+        const currentMetadata = (conversation.metadata as ConversationMetadata) || {};
+
+        conv_data.metadata = {
+          ...currentMetadata,
+          ...conv_data.metadata
+        } as ConversationMetadata;
+      }
+    }
+
+    const [updated_conversation] = await db
+      .update(conversation_model)
+      .set(conv_data)
+      .where(eq(conversation_model.id, conv_data.id))
+
+    return {
+      success: true,
+      code: 200,
+      message: "Conversation updated successfully",
+      data: updated_conversation,
+    }
+
+
+  }
+  catch (error) {
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : update_conversation",
+    }
+  }
+
+}
+
 const create_group = async (
   creater_id: number,
   title: string,
   member_ids?: number[]
 ) => {
+
   try {
     const [chat] = await db
       .insert(conversation_model)
@@ -370,17 +484,61 @@ const create_group = async (
 
     // Send notification to all members about the new group
     try {
-      for (const memberId of uniqueMemberIds) {
-        const conversationData = await getConversationDetailsForUser(chat.id, memberId);
-        if (conversationData) {
-          await send_to_user(memberId, {
-            type: 'conversation_added',
-            conversation_id: chat.id,
-            data: conversationData,
-            timestamp: new Date().toISOString()
-          });
-        }
+
+      const [creater] = await db
+        .select({
+          name: user_model.name,
+          phone: user_model.phone,
+          profile_pic: user_model.profile_pic
+        })
+        .from(user_model)
+        .where(eq(user_model.id, creater_id))
+
+      const members_res = await get_group_members(chat.id);
+      const members = members_res.success ? members_res.data : [];
+
+      // for (const memberId of uniqueMemberIds) {
+      //   const conversationData = await getConversationDetailsForUser(chat.id, memberId);
+      // }
+
+      const new_conversation_payload: NewConversationPayload = {
+        conv_id: chat.id,
+        conv_type: "group",
+        creater_id: creater_id,
+        title: title,
+        creater_name: creater.name,
+        creater_phone: creater.phone || "",
+        creater_pfp: creater.profile_pic || undefined,
+        members: members,
+        joined_at: new Date(),
       }
+
+      // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+      await broadcast_message({
+        to: "users",
+        user_ids: member_ids,
+        message: {
+          type: "conversation:new",
+          payload: new_conversation_payload,
+          ws_timestamp: new Date()
+        },
+      })
+      // if (conversationData) {
+      //   await send_to_user(memberId, {
+      //     type: 'conversation_added',
+      //     conversation_id: chat.id,
+      //     data: conversationData,
+      //     timestamp: new Date().toISOString()
+      //   });
+      // }
+
+      // update redis entries
+      const redis_key = `conv:${chat.id}:members`;
+      const new_members_id = uniqueMemberIds.map(id => id.toString());
+      await redis.sadd(redis_key, ...new_members_id);
+
+      // Invalidate conversation lru cache in other services
+      await redis.publish("conv:invalidate", chat.id.toString());
     } catch (error) {
       console.error('Error sending conversation_added notification for group:', error);
       // Don't fail the request if notification fails
@@ -401,7 +559,78 @@ const create_group = async (
   }
 };
 
+const get_group_admin = async (user_id: number) => {
+  try {
+    const [admin] = await db
+      .select({
+        role: conversation_member_model.role,
+        conversation_id: conversation_member_model.conversation_id,
+      })
+      .from(conversation_member_model)
+      .where(
+        and(
+          eq(conversation_member_model.user_id, user_id),
+          eq(conversation_member_model.role, "admin")
+        )
+      )
+      .limit(1);
 
+    if (!admin) {
+      return {
+        success: false,
+        code: 404,
+        message: "Admin info not found",
+      }
+    }
+
+    return {
+      success: true,
+      code: 200,
+      data: admin,
+    }
+
+
+  }
+  catch (error) {
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : get_group_admin_info",
+    }
+  }
+}
+
+const get_group_members = async (conversation_id: number) => {
+  try {
+    const members = await db
+      .select({
+        user_id: user_model.id,
+        user_name: user_model.name,
+        user_pfp: user_model.profile_pic,
+        role: conversation_member_model.role,
+        joined_at: conversation_member_model.joined_at,
+      })
+      .from(conversation_member_model)
+      .innerJoin(
+        user_model,
+        eq(user_model.id, conversation_member_model.user_id)
+      )
+      .where(eq(conversation_member_model.conversation_id, conversation_id))
+
+    return {
+      success: true,
+      code: 200,
+      data: members as MembersType[],
+    }
+  }
+  catch (error) {
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : get_group_members",
+    }
+  }
+}
 
 const add_new_member = async (
   conversation_id: number,
@@ -458,23 +687,31 @@ const add_new_member = async (
         .returning();
     }
 
-    // Send notification to newly added members
+    // Send websocket message to newly added member
     try {
       for (const newMemberId of eligibleIds) {
         const conversationData = await getConversationDetailsForUser(conversation_id, newMemberId);
-        if (conversationData) {
-          await send_to_user(newMemberId, {
-            type: 'conversation_added',
-            conversation_id: conversation_id,
-            data: conversationData,
-            timestamp: new Date().toISOString()
-          });
-        }
+        // if (conversationData) {
+        //   await send_to_user(newMemberId, {
+        //     type: 'conversation_added',
+        //     conversation_id: conversation_id,
+        //     data: conversationData,
+        //     timestamp: new Date().toISOString()
+        //   });
+        // }
       }
     } catch (error) {
       console.error('Error sending conversation_added notification for new members:', error);
       // Don't fail the request if notification fails
     }
+
+    // update redis entries
+    const redis_key = `conv:${conversation_id}:members`;
+    const new_members_id = eligibleIds.map(id => id.toString());
+    await redis.sadd(redis_key, ...new_members_id);
+
+    // Invalidate conversation lru cache in other services
+    await redis.publish("conv:invalidate", conversation_id.toString());
 
     return {
       success: true,
@@ -518,6 +755,13 @@ const remove_member = async (
         data: { conversation_id, user_id, removed: false },
       };
     }
+
+    // Update redis set
+    const redis_key = `chat:${conversation_id}:members`;
+    await redis.srem(redis_key, user_id.toString());
+
+    // Invalidate conversation lru cache in other services
+    await redis.publish("conv:invalidate", conversation_id.toString());
 
     return {
       success: true,
@@ -819,15 +1063,20 @@ const soft_delete_message = async (message_ids: number[], user_id: number, is_ad
   try {
     console.log("soft_delete_message called with:", { message_ids, user_id, is_admin_or_staff });
 
-    const messages = await db
-      .update(message_model)
-      .set({ deleted: true })
+    // First, get the messages to retrieve conversation_id and check if they exist
+    const messagesToDelete = await db
+      .select({
+        id: message_model.id,
+        conversation_id: message_model.conversation_id,
+      })
+      .from(message_model)
       .where(and(
         inArray(message_model.id, message_ids),
+        eq(message_model.deleted, false),
         !is_admin_or_staff ? eq(message_model.sender_id, user_id) : undefined,
-      ))
+      ));
 
-    if (!messages) {
+    if (messagesToDelete.length === 0) {
       return {
         success: false,
         code: 404,
@@ -836,11 +1085,105 @@ const soft_delete_message = async (message_ids: number[], user_id: number, is_ad
       };
     }
 
+    // Get unique conversation IDs (filter out null values)
+    const conversationIds = [...new Set(messagesToDelete.map(m => m.conversation_id).filter((id): id is number => id !== null))];
+
+    // Delete the messages
+    const deletedMessages = await db
+      .update(message_model)
+      .set({ deleted: true })
+      .where(and(
+        inArray(message_model.id, message_ids),
+        eq(message_model.deleted, false),
+        !is_admin_or_staff ? eq(message_model.sender_id, user_id) : undefined,
+      ))
+      .returning();
+
+    if (!deletedMessages || deletedMessages.length === 0) {
+      return {
+        success: false,
+        code: 404,
+        message: "Either message not found or you do not own this message",
+        data: { message_id: message_ids, deleted: false },
+      };
+    }
+
+    // Broadcast delete event to each conversation
+    for (const conversationId of conversationIds) {
+      const messagesInConversation = messagesToDelete.filter(m => m.conversation_id === conversationId);
+
+      // Broadcast delete event
+      const message_payload: DeleteMessagePayload = {
+        sender_id: user_id,
+        conv_id: conversationId,
+        message_ids: messagesInConversation.map(m => m.id),
+      };
+      // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+      await broadcast_message({
+        to: "conversation",
+        conv_id: conversationId,
+        message: {
+          type: "message:delete",
+          payload: message_payload,
+          ws_timestamp: new Date()
+        },
+        exclude_user_ids: [user_id]
+      });
+
+      // Check if any deleted message was the last_message and update if needed
+      const [conversation] = await db
+        .select()
+        .from(conversation_model)
+        .where(eq(conversation_model.id, conversationId))
+        .limit(1);
+
+      if (conversation && conversation.metadata) {
+        const metadata = conversation.metadata as any;
+        const lastMessage = metadata.last_message;
+
+        // Check if the deleted message was the last_message
+        if (lastMessage && messagesInConversation.some(m => m.id === lastMessage.id)) {
+          // Get the new last message (non-deleted)
+          const [newLastMessage] = await db
+            .select()
+            .from(message_model)
+            .where(
+              and(
+                eq(message_model.conversation_id, conversationId),
+                eq(message_model.deleted, false)
+              )
+            )
+            .orderBy(desc(message_model.created_at))
+            .limit(1);
+
+          // Update conversation metadata with new last_message or null if no messages left
+          await db
+            .update(conversation_model)
+            .set({
+              metadata: newLastMessage ? {
+                last_message: {
+                  id: newLastMessage.id,
+                  conversation_id: newLastMessage.conversation_id,
+                  sender_id: newLastMessage.sender_id,
+                  type: newLastMessage.type,
+                  body: newLastMessage.body,
+                  attachments: newLastMessage.attachments,
+                  metadata: newLastMessage.metadata,
+                  created_at: newLastMessage.created_at.toISOString(),
+                }
+              } : { last_message: null },
+              last_message_at: newLastMessage ? newLastMessage.created_at : conversation.last_message_at
+            })
+            .where(eq(conversation_model.id, conversationId));
+        }
+      }
+    }
+
     return {
       success: true,
       code: 200,
       message: "Messages marked as deleted successfully",
-      data: messages
+      data: deletedMessages
     };
 
   } catch (error) {
@@ -889,7 +1232,7 @@ const get_conversation_history = async (
   conversation_id: number,
   user_id: number,
   page: number = 1,
-  limit: number = 20
+  limit: number = 100
 ) => {
   try {
     // First, verify user is a member of this conversation
@@ -897,12 +1240,15 @@ const get_conversation_history = async (
       .select({
         user_id: conversation_member_model.user_id,
         name: user_model.name,
+        phone: user_model.phone,
         user_role: user_model.role,
         group_role: conversation_member_model.role,
         profile_pic: user_model.profile_pic,
         joining_date: conversation_member_model.joined_at,
         last_read_message_id: conversation_member_model.last_read_message_id,
         lasthistory_delivered_message_id: conversation_member_model.last_delivered_message_id,
+        is_online: user_model.online_status,
+        connection_status: user_model.connection_status,
       })
       .from(conversation_member_model)
       .leftJoin(
@@ -953,7 +1299,7 @@ const get_conversation_history = async (
         body: message_model.body,
         attachments: message_model.attachments,
         metadata: message_model.metadata,
-        edited_at: message_model.edited_at,
+        sent_at: message_model.sent_at,
         created_at: message_model.created_at,
         deleted: message_model.deleted,
         forwarded_from: message_model.forwarded_from,
@@ -1207,7 +1553,7 @@ const get_conversation_history_admin = async (
         body: message_model.body,
         attachments: message_model.attachments,
         metadata: message_model.metadata,
-        edited_at: message_model.edited_at,
+        sent_at: message_model.sent_at,
         created_at: message_model.created_at,
         deleted: message_model.deleted,
         forwarded_from: message_model.forwarded_from,
@@ -1280,6 +1626,7 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
         joinedAt: conversation_member_model.joined_at,
         userId: user_model.id,
         userName: user_model.name,
+        userPhone: user_model.phone,
         onlineStatus: user_model.online_status,
         lastSeen: user_model.last_seen,
         userProfilePic: user_model.profile_pic,
@@ -1307,11 +1654,15 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
     if (!chat) return null;
 
     // For DMs, get the other user's info
+
+    let final_chat_item: any;
+
     if (chat.type === "dm" && !chat.userId) {
       const [otherUser] = await db
         .select({
           userId: user_model.id,
           userName: user_model.name,
+          userPhone: user_model.phone,
           onlineStatus: user_model.online_status,
           lastSeen: user_model.last_seen,
           userProfilePic: user_model.profile_pic,
@@ -1326,10 +1677,11 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
         )
         .limit(1);
 
-      return {
+      final_chat_item = {
         ...chat,
         userId: otherUser?.userId || null,
         userName: otherUser?.userName || null,
+        userPhone: otherUser?.userPhone || null,
         onlineStatus: otherUser?.onlineStatus || "offline",
         lastSeen: otherUser?.lastSeen || null,
         userProfilePic: otherUser?.userProfilePic || null,
@@ -1343,6 +1695,7 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
         .select({
           userId: user_model.id,
           userName: user_model.name,
+          userPhone: user_model.phone,
           userProfilePic: user_model.profile_pic,
           role: conversation_member_model.role,
           joinedAt: conversation_member_model.joined_at,
@@ -1352,10 +1705,11 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
         .where(eq(conversation_member_model.conversation_id, conversation_id))
         .orderBy(asc(conversation_member_model.joined_at));
 
-      return {
+      final_chat_item = {
         ...chat,
         userId: null,
         userName: null,
+        userPhone: null,
         onlineStatus: "offline",
         lastSeen: null,
         userProfilePic: null,
@@ -1369,7 +1723,28 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
       };
     }
 
-    return chat;
+    if (chat.metadata !== null) {
+      const metadata = chat.metadata as any;
+
+      // if last_message exists in metadata, extract it if pinned message available append it as well
+      if (metadata.last_message != null) {
+        final_chat_item = {
+          ...final_chat_item,
+          lastMessageId: metadata.last_message.id,
+          lastMessageBody: metadata.last_message.body,
+          lastMessageType: metadata.last_message.type,
+        }
+      }
+
+      if (metadata.pinned_message != null) {
+        final_chat_item = {
+          ...final_chat_item,
+          pinnedMessageId: metadata.pinned_message.message_id,
+        }
+      }
+    }
+
+    return final_chat_item;
   } catch (error) {
     console.error('Error getting conversation details:', error);
     return null;
@@ -1382,6 +1757,7 @@ export {
   get_chat_list,
   get_group_info,
   create_group,
+  update_conversation,
   add_new_member,
   remove_member,
   promote_to_admin,
@@ -1397,4 +1773,5 @@ export {
   get_all_conversations_admin,
   get_conversation_members_admin,
   get_conversation_history_admin,
+  get_group_admin
 };

@@ -10,6 +10,7 @@ import {
 } from "@/utils/general.utils";
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
 import { eq, and, inArray, ne, sql, or, ilike } from "drizzle-orm";
+import { ConnectionStatusType } from "@/types/socket.types";
 
 type CreateUserParams = {
   name: string;
@@ -58,7 +59,7 @@ export const create_user = async ({
       code: 200,
       message: "User Created Successfully",
       data: {
-        user_id,
+        id: user_id,
         name,
         role,
         phone,
@@ -392,6 +393,29 @@ export const update_user_role = async (id: number, role: RoleType) => {
       code: 200,
       message: "User role updated successfully",
       data: { id, role },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      code: 500,
+      message: "Failed to update user role",
+      data: null,
+    };
+  }
+};
+
+export const update_user_connection_status = async (id: number, status: ConnectionStatusType) => {
+  try {
+    await db
+      .update(user_model)
+      .set({ connection_status: status })
+      .where(eq(user_model.id, id));
+
+    return {
+      success: true,
+      code: 200,
+      message: "User role updated successfully",
+      data: { id, status },
     };
   } catch (error) {
     return {

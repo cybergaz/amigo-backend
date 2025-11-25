@@ -95,9 +95,10 @@ export class FCMService {
         },
         android: {
           priority: 'high',
+          ttl: payload.type === 'call' ? 30000 : 2419200000, // 30 seconds for calls, 28 days for messages
           notification: {
             channelId: payload.type === 'call' ? 'calls' : 'messages',
-            priority: payload.type === 'call' ? 'high' : 'default',
+            priority: payload.type === 'call' ? 'max' : 'high',
             sound: 'default',
             vibrateTimingsMillis: [0, 250, 250, 250],
           },
@@ -297,7 +298,7 @@ export class FCMService {
           return '📎 Media';
         case 'reply':
           return '↩️ Reply';
-        case 'forward':
+        case 'forwarded':
           return '↪️ Forwarded message';
         default:
           return 'New message';
@@ -308,7 +309,7 @@ export class FCMService {
     switch (messageType) {
       case 'reply':
         return `↩️ ${messageBody.length > 90 ? messageBody.substring(0, 90) + '...' : messageBody}`;
-      case 'forward':
+      case 'forwarded':
         return '↪️ Forwarded message';
       default:
         // Truncate long messages

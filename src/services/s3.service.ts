@@ -60,6 +60,8 @@ export const FILE_TYPE_MAPPINGS = {
   "application/zip": S3_FOLDERS.DOCS,
   "application/x-rar-compressed": S3_FOLDERS.DOCS,
   "application/x-7z-compressed": S3_FOLDERS.DOCS,
+  "application/apk": S3_FOLDERS.DOCS,
+  "application/vnd.android.package-archive": S3_FOLDERS.DOCS,
 
 } as const;
 
@@ -219,15 +221,15 @@ export const get_file_size_limit = (mimeType: string): number => {
   switch (category) {
     case S3_FOLDERS.IMAGES:
     case S3_FOLDERS.PROFILE_IMAGES:
-      return 5 * 1024 * 1024; // 5MB for images
+      return 10 * 1024 * 1024; // 5MB for images
     case S3_FOLDERS.AUDIOS:
       return 50 * 1024 * 1024; // 50MB for audio
     case S3_FOLDERS.VIDEOS:
-      return 500 * 1024 * 1024; // 500MB for videos
+      return 100 * 1024 * 1024; // 500MB for videos
     case S3_FOLDERS.DOCS:
-      return 25 * 1024 * 1024; // 25MB for documents
+      return 110 * 1024 * 1024; // 25MB for documents
     default:
-      return 5 * 1024 * 1024; // Default 5MB
+      return 50 * 1024 * 1024; // Default 5MB
   }
 };
 

@@ -1,6 +1,7 @@
 import { pgTable, serial, text, timestamp, pgEnum, bigint, char, varchar, boolean, jsonb, } from "drizzle-orm/pg-core";
 import { InferInsertModel, InferSelectModel } from "drizzle-orm";
 import { ROLE_CONST } from "@/types/user.types";
+import { CONNECTION_STATUS_CONST } from "@/types/socket.types";
 
 const user_model = pgTable("users", {
   id: bigint({ mode: "number" }).primaryKey(),
@@ -15,6 +16,7 @@ const user_model = pgTable("users", {
   last_seen: timestamp({ withTimezone: true }).defaultNow(),
   call_access: boolean().default(false),
   online_status: boolean().default(false),
+  connection_status: varchar({ enum: CONNECTION_STATUS_CONST }),
   location: jsonb(), // { latitude: number, longitude: number }
   ip_address: varchar({ length: 50 }), // To accommodate IPv6 addresses
   permissions: jsonb(), // Array of permitted routes for sub-admins: ["dashboard", "manage-groups", "manage-chats", "admin-management"]

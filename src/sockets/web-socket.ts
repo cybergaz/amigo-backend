@@ -4,13 +4,13 @@ import db from '@/config/db';
 import { message_model, conversation_model, conversation_member_model } from '@/models/chat.model';
 import { eq, and, or, sql, inArray, ne } from 'drizzle-orm';
 import { ElysiaWS } from 'elysia/dist/ws';
-import { WebSocketData, TypedElysiaWS } from '@/types/elysia.types';
 import { user_model } from '@/models/user.model';
-import { forward_messages, pin_message, reply_to_message, star_messages, store_media } from '@/services/message-operations.services';
+import { forward_messages, pin_message, reply_to_message, star_messages, store_media } from '@/services/message.services';
 import { update_user_details } from '@/services/user.services';
 import { CallService } from '@/services/call.service';
 import { CallSignalingMessage } from '@/types/call.types';
 import FCMService from '@/services/fcm.service';
+import { WebSocketData } from '@/types/socket.types';
 
 // Connection management
 interface UserConnection {
@@ -345,12 +345,14 @@ const broadcast_to_conversation = async (conversation_id: number, message: WSMes
       } else if (message.type === 'message_forward') {
         senderId = messageData.user_id;
         messageBody = 'Forwarded message';
-        messageType = 'forward';
+        messageType = 'forwarded';
       } else {
         // Regular message or media
         senderId = messageData.sender_id || messageData.user_id;
         messageBody = messageData.body;
-        messageType = messageData.type || (message.type === 'media' ? 'media' : 'text');
+        // Use the message type from data, or default to 'text'
+        // Note: 'media' is no longer a valid type, should be one of: image, video, audio, document
+        messageType = messageData.type || 'text';
       }
 
       senderName = messageData.sender_name || 'Someone';
@@ -479,6 +481,22 @@ const broadcast_to_all = (message: WSMessage) => {
 
 // WebSocket server
 const web_socket = new Elysia()
+  .onError(({ error }) => {
+    switch ((error as any).code) {
+      case "NOT_FOUND":
+        console.error("[SOCKET] WebSocket endpoint not found");
+        return { message: "WebSocket endpoint not found" };
+      case "VALIDATION":
+        console.error("[SOCKET] WebSocket validation error");
+        return { message: "WebSocket validation error" };
+      case "INTERNAL_SERVER_ERROR":
+        console.error("[SOCKET] WebSocket internal server error");
+        return { message: "WebSocket internal server error" };
+      default:
+        console.error("[SOCKET] WebSocket unhandled error occurred");
+        return { message: "WebSocket error occurred" };
+    }
+  })
   .ws('/chat', {
 
     body: t.Object({
@@ -509,59 +527,59 @@ const web_socket = new Elysia()
         // }
 
         // Extract and validate JWT token
-        const url = new URL(ws.data.request.url);
-        const token = url.searchParams.get('token');
-
-        if (!token) {
-          ws.close(4001, "Missing authentication token");
-          return;
-        }
-
-        // Verify JWT token
-        const auth_result = authenticate_jwt(token);
-        if (!auth_result.success || !auth_result.data) {
-          ws.close(4001, "Invalid authentication token");
-          return;
-        }
-
-        const user_id = Number(auth_result.data.id);
-
-        // Store user_id in WebSocket data using type-safe helper
-        setUserId(ws, user_id);
-
-        const user_name = (await db
-          .select({ name: user_model.name })
-          .from(user_model)
-          .where(eq(user_model.id, user_id))
-          .limit(1))[0]?.name;
-
-        setUserName(ws, user_name);
+        // const url = new URL(ws.data.request.url);
+        // const token = url.searchParams.get('token');
+        //
+        // if (!token) {
+        //   ws.close(4001, "Missing authentication token");
+        //   return;
+        // }
+        //
+        // // Verify JWT token
+        // const auth_result = authenticate_jwt(token);
+        // if (!auth_result.success || !auth_result.data) {
+        //   ws.close(4001, "Invalid authentication token");
+        //   return;
+        // }
+        //
+        // const user_id = Number(auth_result.data.id);
+        //
+        // // Store user_id in WebSocket data using type-safe helper
+        // setUserId(ws, user_id);
+        //
+        // const user_name = (await db
+        //   .select({ name: user_model.name })
+        //   .from(user_model)
+        //   .where(eq(user_model.id, user_id))
+        //   .limit(1))[0]?.name;
+        //
+        // setUserName(ws, user_name);
 
         // -----------------------------------------------------------------------
         // you just have to fetch all conversation IDs for this user,
         // and store them in either connections.conversations or a new Map,
         // and then send the message to all the conversation IDs (idk how will you find sockets for them)
         // -----------------------------------------------------------------------
-        await add_connection(user_id, ws);
+        await add_connection(1234, ws);
 
         // Send welcome message
-        await send_to_user(user_id, {
+        await send_to_user(1234, {
           type: 'message',
           data: { message: 'Connected to chat server' },
           timestamp: new Date().toISOString()
         });
 
         // Notify all users about the new online user
-        broadcast_to_all(
-          {
-            type: 'user_online',
-            data: { user_id },
-            timestamp: new Date().toISOString()
-          }
-        )
+        // broadcast_to_all(
+        //   {
+        //     type: 'user_online',
+        //     data: { user_id },
+        //     timestamp: new Date().toISOString()
+        //   }
+        // )
 
         // update the online status of user in the DB
-        await update_user_details(user_id, { online_status: true, last_seen: new Date() });
+        // await update_user_details(user_id, { online_status: true, last_seen: new Date() });
 
         // console.log(`[WS] User ${user_id} authenticated and connected`);
       } catch (error) {
@@ -785,10 +803,10 @@ const web_socket = new Elysia()
                 timestamp: new Date().toISOString(),
               }, user_id);
 
-              await pin_message({
-                message_id: message.message_ids[0],
-                conversation_id: message.conversation_id
-              }, user_id)
+              // await pin_message({
+              //   message_id: message.message_ids[0],
+              //   conversation_id: message.conversation_id
+              // }, user_id)
             }
             break;
 
@@ -960,10 +978,10 @@ const web_socket = new Elysia()
                 timestamp: new Date().toISOString(),
               }, user_id);
 
-              await pin_message({
-                message_id: message.message_ids[0],
-                conversation_id: message.conversation_id
-              }, user_id)
+              // await pin_message({
+              //   message_id: message.message_ids[0],
+              //   conversation_id: message.conversation_id
+              // }, user_id)
             }
             break;
 

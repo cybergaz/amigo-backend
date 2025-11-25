@@ -1,8 +1,11 @@
 const CHAT_TYPE_CONSTS = ["dm", "group", "community_group"] as const;
 type ChatType = typeof CHAT_TYPE_CONSTS[number];
 
-const MESSAGE_TYPE_CONSTS = ["text", "system", "attachment", "reaction"] as const;
+const MESSAGE_TYPE_CONSTS = ["text", "image", "video", "audio", "document", "media", "reply", "forwarded", "system", "attachment", "reaction"] as const;
 type MessageType = typeof MESSAGE_TYPE_CONSTS[number];
+
+const MESSAGE_STATUS_CONSTS = ["sent", "delivered", "read"] as const;
+type MessageStatusType = typeof MESSAGE_STATUS_CONSTS[number];
 
 const CHAT_ROLE_CONST = ["member", "admin"] as const;
 type ChatRoleType = typeof CHAT_ROLE_CONST[number];
@@ -75,7 +78,8 @@ interface BulkMessageOperation {
 
 interface PinMessageRequest {
   message_id: number;
-  conversation_id: number;
+  conv_id: number;
+  user_id: number;
 }
 
 interface StarMessageRequest {
@@ -113,12 +117,13 @@ interface MediaMetadataRequest {
 }
 
 
-export { CHAT_TYPE_CONSTS, MESSAGE_TYPE_CONSTS, CHAT_ROLE_CONST, MESSAGE_OPERATION_CONSTS };
+export { CHAT_TYPE_CONSTS, MESSAGE_TYPE_CONSTS, MESSAGE_STATUS_CONSTS, CHAT_ROLE_CONST, MESSAGE_OPERATION_CONSTS };
 export type {
   ChatType,
   MessageType,
   ChatRoleType,
   MessageOperationType,
+  MessageStatusType,
   ConversationMetadata,
   MessageMetadata,
   BulkMessageOperation,

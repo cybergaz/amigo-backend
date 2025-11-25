@@ -3,6 +3,10 @@ import {
   conversation_model,
   conversation_member_model,
   message_model,
+  DBMessageType,
+  DBUpdateMessageStatusType,
+  message_status_model,
+  DBInsertMessageStatusType,
 } from "@/models/chat.model";
 import { user_model } from "@/models/user.model";
 import {
@@ -13,8 +17,10 @@ import {
   ReplyMessageRequest,
   ForwardMessageRequest,
   DeleteMessageRequest,
-  MediaMetadataRequest
+  MediaMetadataRequest,
+  MessageType
 } from "@/types/chat.types";
+import { ChatMessagePayload, MessagePinPayload } from "@/types/socket.types";
 import { create_unique_id } from "@/utils/general.utils";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
@@ -43,54 +49,91 @@ const get_user_info = async (user_id: number) => {
   return user;
 };
 
-// Pin/Unpin messages
-const pin_message = async (request: PinMessageRequest, user_id: number) => {
+const store_message = async (payload: ChatMessagePayload) => {
   try {
-    // Verify user membership
-    // const membership = await verify_user_membership(request.conversation_id, user_id);
-    // if (!membership) {
-    //   return {
-    //     success: false,
-    //     code: 403,
-    //     message: "You are not a member of this conversation",
-    //   };
-    // }
 
-    // Get user info
-    // const user = await get_user_info(user_id);
-    // if (!user) {
-    //   return {
-    //     success: false,
-    //     code: 404,
-    //     message: "User not found",
-    //   };
-    // }
+    // Handle reply metadata if applicable
+    if (payload.reply_to_message_id) {
+      // Fetch original message info
+      const [originalMessage] = await db
+        .select({
+          id: message_model.id,
+          body: message_model.body,
+          sender_id: message_model.sender_id,
+          created_at: message_model.created_at,
+        })
+        .from(message_model)
+        .where(
+          and(
+            eq(message_model.id, payload.reply_to_message_id),
+            eq(message_model.conversation_id, payload.conv_id),
+            eq(message_model.deleted, false)
+          )
+        );
 
-    // Verify the message exists and belongs to the conversation
-    // const [message] = await db
-    //   .select()
-    //   .from(message_model)
-    //   .where(
-    //     and(
-    //       eq(message_model.id, request.message_id),
-    //       eq(message_model.conversation_id, request.conversation_id),
-    //       eq(message_model.deleted, false)
-    //     )
-    //   ).limit(1);
-    //
-    // if (!message) {
-    //   return {
-    //     success: false,
-    //     code: 404,
-    //     message: "Message not found or not valid to pin",
-    //   };
-    // }
+      if (originalMessage) {
+        // Create reply metadata
+        const replyMetadata: MessageMetadata = {
+          reply_to: {
+            message_id: originalMessage.id,
+            sender_id: originalMessage.sender_id,
+            body: originalMessage.body?.substring(0, 100) || "", // Preview of original message
+            created_at: originalMessage.created_at?.toISOString() || ""
+          }
+        };
 
+        payload.metadata = {
+          ...(payload.metadata || {}),
+          ...replyMetadata
+        };
+      }
+    }
+
+    const [new_message] = await db
+      .insert(message_model)
+      .values({
+        conversation_id: payload.conv_id,
+        sender_id: payload.sender_id,
+        type: payload.msg_type,
+        body: payload.body,
+        attachments: payload.attachments,
+        metadata: payload.metadata,
+        sent_at: new Date(payload.sent_at),
+      }).returning()
+
+    if (!new_message) {
+      return {
+        success: false,
+        code: 500,
+        message: "Failed to store message",
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Message stored successfully",
+      data: new_message,
+    };
+  }
+  catch (error) {
+    console.error("storing message", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Failed to store message",
+    };
+  }
+}
+
+// Pin messages
+const pin_message = async (payload: PinMessageRequest) => {
+  try {
     // Get current conversation metadata
     const [conversation] = await db
       .select({ metadata: conversation_model.metadata })
       .from(conversation_model)
-      .where(eq(conversation_model.id, request.conversation_id))
+      .where(eq(conversation_model.id, payload.conv_id))
       .limit(1);
 
     if (!conversation) {
@@ -104,56 +147,123 @@ const pin_message = async (request: PinMessageRequest, user_id: number) => {
     const currentMetadata = (conversation.metadata as ConversationMetadata) || {};
 
     // Check if this message is already pinned
-    const isCurrentlyPinned = currentMetadata.pinned_message?.message_id === request.message_id;
+    const isCurrentlyPinned = currentMetadata.pinned_message?.message_id === payload.message_id;
 
     let newMetadata: ConversationMetadata;
-    let actionMessage: string;
 
     if (isCurrentlyPinned) {
       // Unpin the message by removing pinned_message from metadata
       const { pinned_message, ...restMetadata } = currentMetadata;
-      newMetadata = restMetadata;
-      actionMessage = "Message unpinned successfully";
+
+      newMetadata = {
+        ...restMetadata,
+        pinned_message: {
+          message_id: payload.message_id,
+          user_id: payload.user_id,
+          pinned_at: new Date().toISOString()
+        }
+      }
     } else {
       // Pin the new message (this will replace any existing pinned message)
+
       newMetadata = {
         ...currentMetadata,
         pinned_message: {
-          message_id: request.message_id,
-          user_id,
+          message_id: payload.message_id,
+          user_id: payload.user_id,
           pinned_at: new Date().toISOString()
         }
       };
-      actionMessage = "Message pinned successfully";
     }
 
     // Update conversation metadata
     await db
       .update(conversation_model)
       .set({ metadata: newMetadata })
-      .where(eq(conversation_model.id, request.conversation_id));
+      .where(eq(conversation_model.id, payload.conv_id));
 
     return {
       success: true,
       code: 200,
-      message: actionMessage,
+      message: "Message pinned successfully",
       data: {
-        conversation_id: request.conversation_id,
-        message_id: request.message_id,
+        conversation_id: payload.conv_id,
+        message_id: payload.message_id,
         pinned: !isCurrentlyPinned,
         pinned_by: !isCurrentlyPinned ? {
-          user_id,
+          user_id: payload.user_id,
           pinned_at: new Date().toISOString()
         } : null
       },
     };
-
-  } catch (error) {
+  }
+  catch (error) {
     console.error("pin_messages error", error);
     return {
       success: false,
       code: 500,
       message: "ERROR: pin_messages",
+    };
+  }
+};
+
+const unpin_message = async (payload: PinMessageRequest) => {
+  try {
+    // Get current conversation metadata
+    const [conversation] = await db
+      .select({ metadata: conversation_model.metadata })
+      .from(conversation_model)
+      .where(eq(conversation_model.id, payload.conv_id))
+      .limit(1);
+
+    if (!conversation) {
+      return {
+        success: false,
+        code: 404,
+        message: "Conversation not found",
+      };
+    }
+
+    const currentMetadata = (conversation.metadata as ConversationMetadata) || {};
+
+    // Check if this message is already pinned
+    const isCurrentlyPinned = currentMetadata.pinned_message?.message_id === payload.message_id;
+
+    let newMetadata: ConversationMetadata = currentMetadata;
+
+    if (isCurrentlyPinned) {
+      // Unpin the message by removing pinned_message from metadata
+      const { pinned_message, ...restMetadata } = currentMetadata;
+      newMetadata = restMetadata;
+    }
+
+    // Update conversation metadata
+    await db
+      .update(conversation_model)
+      .set({ metadata: newMetadata })
+      .where(eq(conversation_model.id, payload.conv_id));
+
+    return {
+      success: true,
+      code: 200,
+      message: "Message unpinned successfully",
+      data: {
+        conversation_id: payload.conv_id,
+        message_id: payload.message_id,
+        pinned: !isCurrentlyPinned,
+        pinned_by: !isCurrentlyPinned ? {
+          user_id: payload.user_id,
+          pinned_at: new Date().toISOString()
+        } : null
+      },
+    };
+  }
+  catch (error) {
+    console.error("unpin_messages error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: unpin_messages",
     };
   }
 };
@@ -344,38 +454,10 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: number) =
 // Forward messages
 const forward_messages = async (request: ForwardMessageRequest, user_id: number) => {
   try {
-    // Verify user membership in both conversations
-    // const sourceMembership = await verify_user_membership(request.source_conversation_id, user_id);
-    // const targetMembership = await verify_user_membership(request.target_conversation_id, user_id);
-    //
-    // if (!sourceMembership || !targetMembership) {
-    //   return {
-    //     success: false,
-    //     code: 403,
-    //     message: "You are not a member of one or both conversations",
-    //   };
-    // }
-
-    // Get user info
-    // const user = await get_user_info(user_id);
-    // if (!user) {
-    //   return {
-    //     success: false,
-    //     code: 404,
-    //     message: "User not found",
-    //   };
-    // }
 
     // Get messages to forward
     const original_messages = await db
-      .select({
-        id: message_model.id,
-        body: message_model.body,
-        attachments: message_model.attachments,
-        type: message_model.type,
-        sender_id: message_model.sender_id,
-        created_at: message_model.created_at
-      })
+      .select()
       .from(message_model)
       .where(
         and(
@@ -394,40 +476,47 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
       };
     }
 
-    // Create forwarded messages
-    const forwardedMessages = [];
-    for (const message of original_messages) {
-      const forwardMetadata: MessageMetadata = {
-        forwarded_from: {
-          original_message_id: message.id,
-          original_conversation_id: request.source_conversation_id,
-          original_sender_id: message.sender_id,
-          forwarded_by: user_id,
-          forwarded_at: new Date().toISOString()
-        }
-      };
+    const forwardedMessages: Map<number, (DBMessageType & { conv_type: string })[]> = new Map();
 
-      const [forwardedMessage] = await db
-        .insert(message_model)
-        .values({
-          forwarded_from: request.source_conversation_id,
-          forwarded_to: request.target_conversation_ids,
+    for (const target_conv_id of request.target_conversation_ids) {
+
+      const all_msgs: (DBMessageType & { conv_type: string })[] = [];
+
+      const [conv] = await db
+        .select({ conv_type: conversation_model.type })
+        .from(conversation_model)
+        .where(eq(conversation_model.id, target_conv_id))
+
+
+      for (const message of original_messages) {
+        const [inserted_msg] = await db.insert(message_model).values({
+          conversation_id: target_conv_id,
           sender_id: user_id,
           type: message.type,
           body: message.body,
           attachments: message.attachments,
-          metadata: forwardMetadata,
+          metadata: {
+            ...message.metadata as MessageMetadata,
+            forwarded_from: {
+              original_message_id: message.id,
+              original_conversation_id: request.source_conversation_id,
+              original_sender_id: message.sender_id,
+              forwarded_by: user_id,
+              forwarded_at: new Date().toISOString()
+            }
+          },
+          forwarded_from: request.source_conversation_id,
+          sent_at: new Date(),
+        }).returning()
+
+        all_msgs.push({
+          ...inserted_msg,
+          conv_type: conv.conv_type
         })
-        .returning();
+      }
 
-      forwardedMessages.push(forwardedMessage);
+      forwardedMessages.set(target_conv_id, all_msgs)
     }
-
-    // Update target conversation's last_message_at
-    await db
-      .update(conversation_model)
-      .set({ last_message_at: new Date() })
-      .where(inArray(conversation_model.id, request.target_conversation_ids));
 
     return {
       success: true,
@@ -671,14 +760,26 @@ const get_starred_messages = async (user_id: number, conversation_id?: number) =
 const store_media = async (request: MediaMetadataRequest, user_id: number) => {
   try {
 
-    const { conversation_id, ...rest_of_the_request } = request;
+    const { conversation_id, category, ...rest_of_the_request } = request;
+
+    // Map category to message type
+    let messageType: string = 'media'; // default
+    if (category === 'images') {
+      messageType = 'image';
+    } else if (category === 'videos') {
+      messageType = 'video';
+    } else if (category === 'audios') {
+      messageType = 'audio';
+    } else if (category === 'docs') {
+      messageType = 'document';
+    }
 
     const [media] = await db
       .insert(message_model)
       .values({
         conversation_id: request.conversation_id,
         sender_id: user_id,
-        type: "attachment",
+        type: messageType as MessageType,
         attachments: rest_of_the_request || null,
       })
       .returning();
@@ -706,13 +807,274 @@ const store_media = async (request: MediaMetadataRequest, user_id: number) => {
   }
 }
 
+const insert_message_status = async (msg_status: Pick<DBInsertMessageStatusType, "user_id" | "message_id" | "conv_id" | "delivered_at" | "read_at">) => {
+  try {
+
+    // Upsert message status
+    const [inserted_status] = await db
+      .insert(message_status_model)
+      .values({
+        user_id: msg_status.user_id,
+        message_id: msg_status.message_id,
+        conv_id: msg_status.conv_id,
+        delivered_at: msg_status.delivered_at,
+        read_at: msg_status.read_at,
+        updated_at: new Date()
+      }).returning()
+
+    if (!inserted_status) {
+      return {
+        success: false,
+        code: 500,
+        message: "Failed to store message status",
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Message status stored successfully",
+      data: inserted_status,
+    };
+
+  } catch (error) {
+    console.error("ERROR: store_message_status", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: store_message_status",
+    };
+  }
+}
+
+const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
+  try {
+
+    if (!msg_status.message_id || !msg_status.user_id) {
+      return {
+        success: false,
+        code: 400,
+        message: "message_id and user_id are required",
+      };
+    }
+
+    let updated_status;
+    if (msg_status.delivered_at && !msg_status.read_at) {
+
+      updated_status = (await db
+        .update(message_status_model)
+        .set({
+          delivered_at: msg_status.delivered_at,
+          updated_at: new Date()
+        }).where(
+          and(
+            eq(message_status_model.message_id, msg_status.message_id),
+            eq(message_status_model.user_id, msg_status.user_id)
+          )
+        ).returning())[0]
+    }
+    else if (!msg_status.delivered_at && msg_status.read_at) {
+      updated_status = (await db
+        .update(message_status_model)
+        .set({
+          read_at: msg_status.delivered_at,
+          updated_at: new Date()
+        }).where(
+          and(
+            eq(message_status_model.message_id, msg_status.message_id),
+            eq(message_status_model.user_id, msg_status.user_id)
+          )
+        ).returning())[0]
+    }
+    else {
+      // Upsert message status
+      updated_status = (await db
+        .update(message_status_model)
+        .set({
+          delivered_at: msg_status.delivered_at,
+          read_at: msg_status.read_at,
+          updated_at: new Date()
+        }).where(
+          and(
+            eq(message_status_model.message_id, msg_status.message_id),
+            eq(message_status_model.user_id, msg_status.user_id)
+          )
+        ).returning())[0]
+    }
+
+    if (updated_status === undefined || updated_status === null) {
+      return {
+        success: false,
+        code: 500,
+        message: "Failed to update message status",
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Message status updated successfully",
+      data: updated_status,
+    };
+
+  } catch (error) {
+    console.error("ERROR: update_message_status", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: update_message_status",
+    };
+  }
+}
+
+/**
+ * Batch insert message statuses for multiple messages and users
+ * This is MUCH more efficient than calling insert_message_status in a loop
+ * 
+ * Example: For 20 messages forwarded to 30 conversations with 40 users each:
+ * - Old way: 20 * 30 * 40 = 24,000 DB calls
+ * - New way: 30 DB calls (one per conversation) or even 1 call if we batch everything
+ * 
+ * @param statuses Array of message status records to insert
+ * @returns Success/failure response
+ */
+const batch_insert_message_status = async (
+  statuses: Array<Pick<DBInsertMessageStatusType, "user_id" | "message_id" | "conv_id" | "delivered_at" | "read_at">>
+) => {
+  try {
+    if (statuses.length === 0) {
+      return {
+        success: true,
+        code: 200,
+        message: "No statuses to insert",
+        data: [],
+      };
+    }
+
+    // Prepare all records with timestamps
+    const records = statuses.map(status => ({
+      user_id: status.user_id,
+      message_id: status.message_id,
+      conv_id: status.conv_id,
+      delivered_at: status.delivered_at || null,
+      read_at: status.read_at || null,
+      updated_at: new Date()
+    }));
+
+    // Batch insert all records in a single query
+    // This is exponentially faster than individual inserts
+    const inserted_statuses = await db
+      .insert(message_status_model)
+      .values(records)
+      .returning();
+
+    return {
+      success: true,
+      code: 200,
+      message: `Batch inserted ${inserted_statuses.length} message statuses`,
+      data: inserted_statuses,
+    };
+
+  } catch (error) {
+    console.error("ERROR: batch_insert_message_status", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: batch_insert_message_status",
+    };
+  }
+}
+
+/**
+ * Batch update message statuses for multiple messages for a single user
+ * Useful for marking multiple messages as read/delivered when user opens a conversation
+ * 
+ * Example: User opens conversation with 50 unread messages
+ * - Old way: 50 individual update queries
+ * - New way: 1 batch update using SQL WHERE IN clause
+ * 
+ * @param user_id The user whose message statuses are being updated
+ * @param conv_id The conversation ID (optional, for more specific updates)
+ * @param message_ids Array of message IDs to update
+ * @param status_update Object containing delivered_at and/or read_at timestamps
+ * @returns Success/failure response
+ */
+const batch_update_message_status = async (
+  user_id: number,
+  message_ids: number[],
+  status_update: { delivered_at?: Date; read_at?: Date },
+  conv_id?: number
+) => {
+  try {
+    if (message_ids.length === 0) {
+      return {
+        success: true,
+        code: 200,
+        message: "No message statuses to update",
+        data: [],
+      };
+    }
+
+    // Build the update object dynamically
+    const updateData: { delivered_at?: Date; read_at?: Date; updated_at: Date } = {
+      updated_at: new Date()
+    };
+
+    if (status_update.delivered_at) {
+      updateData.delivered_at = status_update.delivered_at;
+    }
+    if (status_update.read_at) {
+      updateData.read_at = status_update.read_at;
+    }
+
+    // Build WHERE conditions
+    const whereConditions = [
+      eq(message_status_model.user_id, user_id),
+      inArray(message_status_model.message_id, message_ids)
+    ];
+
+    // Optionally filter by conversation ID for more specific updates
+    if (conv_id !== undefined) {
+      whereConditions.push(eq(message_status_model.conv_id, conv_id));
+    }
+
+    // Update all message statuses in a single query
+    const updated_statuses = await db
+      .update(message_status_model)
+      .set(updateData)
+      .where(and(...whereConditions))
+      .returning();
+
+    return {
+      success: true,
+      code: 200,
+      message: `Batch updated ${updated_statuses.length} message statuses`,
+      data: updated_statuses,
+    };
+
+  } catch (error) {
+    console.error("ERROR: batch_update_message_status", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: batch_update_message_status",
+    };
+  }
+}
+
 export {
+  store_message,
   pin_message,
+  unpin_message,
   star_messages,
   reply_to_message,
   forward_messages,
   delete_messages,
   get_pinned_messages,
   get_starred_messages,
-  store_media
+  store_media,
+  insert_message_status,
+  update_message_status,
+  batch_insert_message_status,
+  batch_update_message_status
 };

@@ -1,20 +1,11 @@
 import { Cookie } from "elysia";
 import { RoleType } from "./user.types";
+import { WebSocketData } from "./socket.types";
 
 interface ElysiaMiddlewareType {
   cookie: Record<string, Cookie<string | undefined | unknown>>;
   headers: Record<string, string | undefined>;
   allowed?: RoleType[];
-}
-
-// WebSocket data interface for type safety
-interface WebSocketData {
-  user_id?: number;
-  user_name?: string;
-  request: Request;
-  query: {
-    token?: string;
-  };
 }
 
 // Extended WebSocket type with proper typing
@@ -25,5 +16,5 @@ interface TypedElysiaWS {
   readyState: number;
 }
 
-export { ElysiaMiddlewareType, WebSocketData, TypedElysiaWS };
+export { ElysiaMiddlewareType, TypedElysiaWS };
 

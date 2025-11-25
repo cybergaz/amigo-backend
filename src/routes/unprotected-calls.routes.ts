@@ -4,8 +4,22 @@ import { app_middleware } from "@/middleware";
 import db from "@/config/db";
 import { call_model } from "@/models/call.model";
 import { eq } from "drizzle-orm";
-import FCMService from '@/services/fcm.service';
-import { connections, conversation_connections, broadcast_to_all } from "@/sockets/web-socket";
+// import { connections, conversation_connections, broadcast_to_all } from "@/sockets/web-socket";
+
+
+function mapToObject(map: Map<any, any>) {
+  const obj: Record<string, any> = {};
+  for (const [key, value] of map.entries()) {
+    if (value instanceof Set) {
+      obj[key] = Array.from(value);
+    } else if (value instanceof Map) {
+      obj[key] = mapToObject(value);
+    } else {
+      obj[key] = value;
+    }
+  }
+  return obj;
+}
 
 const unprotected_call_routes = new Elysia({ prefix: "/call" })
 
@@ -37,22 +51,26 @@ const unprotected_call_routes = new Elysia({ prefix: "/call" })
 
   .get("/socket/status", async ({ set, params }) => {
     console.log("testing socket status endpoint");
+    console.log("conversation_connections ->", conversation_connections)
     broadcast_to_all({
       type: "socket_health_check",
       data: {
-        time: Date.now()
+        time: new Date().toLocaleString(),
+        message: "Socket is healthy"
       }
     });
     set.status = 200;
+    console.log("2nd conversation_connections ->", conversation_connections)
     return {
       success: true,
       data: {
-        connections: connections,
-        conversation_connections: conversation_connections
+        connections: mapToObject(connections),
+        conversation_connections: mapToObject(conversation_connections)
       },
       message: "Socket status retrieved successfully"
     };
   })
+
 
 
 export default unprotected_call_routes;

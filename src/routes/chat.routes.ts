@@ -18,14 +18,14 @@ import {
   dm_delete_status
 } from "@/services/chat.services";
 import {
-  pin_message,
+  // toggle_pin_message,
   star_messages,
   reply_to_message,
   forward_messages,
   delete_messages,
   get_pinned_messages,
   get_starred_messages
-} from "@/services/message-operations.services";
+} from "@/services/message.services";
 
 const chat_routes = new Elysia({ prefix: "/chat" })
   .state({ id: 0, role: "" })
@@ -200,17 +200,21 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     })
   })
 
-  // Message operations routes
-  .post("/messages/pin", async ({ set, store, body }) => {
-    const pin_result = await pin_message(body, store.id);
-    set.status = pin_result.code;
-    return pin_result;
-  }, {
-    body: t.Object({
-      message_id: t.Number(),
-      conversation_id: t.Number()
-    })
-  })
+  // // Message operations routes
+  // .post("/messages/pin", async ({ set, store, body }) => {
+  //   const pin_result = await toggle_pin_message({
+  //   conv_id: body.conversation_id,
+  //   message_id: body.message_id,
+  //
+  // });
+  //   set.status = pin_result.code;
+  //   return pin_result;
+  // }, {
+  //   body: t.Object({
+  //     message_id: t.Number(),
+  //     conversation_id: t.Number()
+  //   })
+  // })
 
   .post("/messages/star", async ({ set, store, body }) => {
     const star_result = await star_messages(body, store.id);
