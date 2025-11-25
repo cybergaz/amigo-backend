@@ -18,6 +18,8 @@ import { redis } from "@/config/redis";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { DeleteMessagePayload, NewConversationPayload, MembersType } from "@/types/socket.types";
 import { socket_connections } from "@/sockets/socket.server";
+import { get_user_details } from "./user.services";
+import { get_conversation_members } from "@/sockets/socket.cache";
 
 const create_chat = async (sender_id: number, receiver_id: number) => {
   try {
@@ -255,9 +257,6 @@ const get_chat_list = async (user_id: number, type: string) => {
         if (chat.type === "group" || chat.type === "community_group") {
           const userMemberInfo = (await db
             .select({
-              userId: user_model.id,
-              userName: user_model.name,
-              userPhone: user_model.phone,
               role: conversation_member_model.role,
               joinedAt: conversation_member_model.joined_at,
               unreadCount: conversation_member_model.unread_count
@@ -539,6 +538,7 @@ const create_group = async (
 
       // Invalidate conversation lru cache in other services
       await redis.publish("conv:invalidate", chat.id.toString());
+
     } catch (error) {
       console.error('Error sending conversation_added notification for group:', error);
       // Don't fail the request if notification fails
@@ -559,23 +559,27 @@ const create_group = async (
   }
 };
 
-const get_group_admin = async (user_id: number) => {
+const get_group_admin_info = async (conv_id: number) => {
   try {
-    const [admin] = await db
-      .select({
-        role: conversation_member_model.role,
-        conversation_id: conversation_member_model.conversation_id,
-      })
-      .from(conversation_member_model)
-      .where(
-        and(
-          eq(conversation_member_model.user_id, user_id),
-          eq(conversation_member_model.role, "admin")
-        )
-      )
+
+    const [conversation] = await db
+      .select({ creater_id: conversation_model.creater_id })
+      .from(conversation_model)
+      .where(eq(conversation_model.id, conv_id))
       .limit(1);
 
-    if (!admin) {
+
+    if (!conversation) {
+      return {
+        success: false,
+        code: 404,
+        message: "Conversation not found",
+      }
+    }
+
+    const admin = await get_user_details(conversation.creater_id);
+
+    if (!admin.success) {
       return {
         success: false,
         code: 404,
@@ -586,9 +590,8 @@ const get_group_admin = async (user_id: number) => {
     return {
       success: true,
       code: 200,
-      data: admin,
+      data: admin.data,
     }
-
 
   }
   catch (error) {
@@ -688,22 +691,70 @@ const add_new_member = async (
     }
 
     // Send websocket message to newly added member
-    try {
-      for (const newMemberId of eligibleIds) {
-        const conversationData = await getConversationDetailsForUser(conversation_id, newMemberId);
-        // if (conversationData) {
-        //   await send_to_user(newMemberId, {
-        //     type: 'conversation_added',
-        //     conversation_id: conversation_id,
-        //     data: conversationData,
-        //     timestamp: new Date().toISOString()
-        //   });
-        // }
-      }
-    } catch (error) {
-      console.error('Error sending conversation_added notification for new members:', error);
-      // Don't fail the request if notification fails
+    // try {
+    //   for (const newMemberId of eligibleIds) {
+    //     const conversationData = await getConversationDetailsForUser(conversation_id, newMemberId);
+    //     // if (conversationData) {
+    //     //   await send_to_user(newMemberId, {
+    //     //     type: 'conversation_added',
+    //     //     conversation_id: conversation_id,
+    //     //     data: conversationData,
+    //     //     timestamp: new Date().toISOString()
+    //     //   });
+    //     // }
+    //   }
+    // } catch (error) {
+    //   console.error('Error sending conversation_added notification for new members:', error);
+    //   // Don't fail the request if notification fails
+    // }
+
+    const [conv_details] = await db
+      .select()
+      .from(conversation_model)
+      .where(eq(conversation_model.id, conversation_id))
+      .limit(1);
+
+    const creater_info = await get_user_details(conv_details.creater_id);
+    const members_res = await get_group_members(conversation_id);
+    const members = members_res.success ? members_res.data : [];
+
+    if (!creater_info.success || !creater_info.data) {
+      throw new Error("Admin info not found");
     }
+
+    // for (const memberId of uniqueMemberIds) {
+    //   const conversationData = await getConversationDetailsForUser(chat.id, memberId);
+    // }
+
+    const new_conversation_payload: NewConversationPayload = {
+      conv_id: conversation_id,
+      conv_type: "group",
+      creater_id: creater_info.data.id,
+      title: conv_details.title || "",
+      creater_name: creater_info.data.name,
+      creater_phone: creater_info.data.phone || "",
+      creater_pfp: creater_info.data.profile_pic || undefined,
+      members: members,
+      joined_at: new Date(),
+    }
+    // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    await broadcast_message({
+      to: "users",
+      user_ids: user_ids,
+      message: {
+        type: "conversation:new",
+        payload: new_conversation_payload,
+        ws_timestamp: new Date()
+      },
+    })
+    // if (conversationData) {
+    //   await send_to_user(memberId, {
+    //     type: 'conversation_added',
+    //     conversation_id: chat.id,
+    //     data: conversationData,
+    //     timestamp: new Date().toISOString()
+    //   });
+    // }
 
     // update redis entries
     const redis_key = `conv:${conversation_id}:members`;
@@ -1773,5 +1824,6 @@ export {
   get_all_conversations_admin,
   get_conversation_members_admin,
   get_conversation_history_admin,
-  get_group_admin
+  getConversationDetailsForUser,
+  get_group_admin_info,
 };
