@@ -614,9 +614,9 @@ const web_socket_server = new Elysia()
       }
     }
   })
-  .listen(5003);
+  .listen(process.env.SOCKET_PORT || 5002);
 
-console.log(`🔌 New WebSocket is running at port ${5003}`);
+console.log(`🔌 New WebSocket is running at port ${process.env.SOCKET_PORT || 5002}`);
 
 // const health_check_payload: MiscPayload = {
 //   message: "Connection established successfully",

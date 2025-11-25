@@ -1341,9 +1341,9 @@ const web_socket = new Elysia()
     }
 
   })
-  .listen(process.env.SOCKET_PORT || 5002);
+// .listen(5005);
 
-console.log(`🔌 WebSocket is running at port ${process.env.SOCKET_PORT || 5002}`);
+console.log(`🔌 WebSocket is running at port 5005`);
 
 // Connection monitoring and cleanup
 const startConnectionMonitor = () => {
