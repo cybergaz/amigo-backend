@@ -77,7 +77,6 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/generate-login-otp/:phone", async ({ set, params }) => {
-    console.log("params => ", params)
     const existing_user_res = await find_user_by_phone(params.phone);
     if (!existing_user_res?.success) {
       set.status = existing_user_res?.code;
