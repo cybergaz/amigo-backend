@@ -3,7 +3,7 @@ import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
 import { WSMessageSchema } from "@/types/socket.elysia-schema";
 import { JoinLeavePayload, MiscPayload, ConnectionStatusPayload, UserConnection, ChatMessagePayload, TypingPayload, ChatMessageAckPayload, MessageForwardPayload, MessagePinPayload } from "@/types/socket.types";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import Elysia, { t } from "elysia";
 import { broadcast_message, get_connected_users, get_ws_data, handle_join_conversation, set_ws_data } from "./socket.handlers";
 import { update_user_connection_status, update_user_details } from "@/services/user.services";
@@ -11,7 +11,8 @@ import { pin_message, unpin_message, store_message, forward_messages, batch_inse
 import { update_conversation } from "@/services/chat.services";
 import { ChatType } from "@/types/chat.types";
 import { get_conversation_members } from "./socket.cache";
-import { message_status_model } from "@/models/chat.model";
+import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
+import FCMService from "@/services/fcm.service";
 
 const socket_connections = new Map<number, UserConnection>(); // user_id -> UserConnection
 
@@ -82,8 +83,8 @@ const web_socket_server = new Elysia()
         const url = new URL(ws.data.request.url);
         const token = url.searchParams.get('token');
 
-        console.log("request came for connection")
-        console.log("token -> ", token)
+        // console.log("request came for connection")
+        // console.log("token -> ", token)
 
         if (!token) {
           ws.send({
@@ -239,6 +240,7 @@ const web_socket_server = new Elysia()
                 await handle_join_conversation({
                   conv_id: payload.conv_id,
                   user_id: payload.user_id,
+
                   // is_active_in_conv: socket_connections.get(payload.user_id)?.active_conv_id === payload.conv_id
                 })
               }
@@ -274,6 +276,7 @@ const web_socket_server = new Elysia()
               const new_message_payload: ChatMessagePayload = {
                 ...payload,
                 canonical_id: stored_message?.data?.id,
+                sender_name: payload.sender_name || String(user_name) || undefined,
               }
 
               // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -294,7 +297,7 @@ const web_socket_server = new Elysia()
               //   ws_timestamp: new Date()
               // });
               // console.log("gg -> ", gg)
-              // console.log("sent_status -> ", sent_status)
+              // console.log("sent_status -> ", sent_result)
 
               // const is_sender_online = socket_connections.has(payload.sender_id);
               // const is_sender_in_conv = socket_connections.get(payload.sender_id)?.active_conv_id === payload.conv_id;
@@ -328,15 +331,15 @@ const web_socket_server = new Elysia()
                 for (const member_id of conv_members) {
                   if (member_id !== payload.sender_id) {
 
-                    const is_member_online = socket_connections.has(member_id);
-                    const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === member_id;
+                    // const is_member_online = socket_connections.has(member_id);
+                    // const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === member_id;
 
                     message_statuses.push({
                       user_id: member_id,
                       message_id: stored_message.data.id,
                       conv_id: payload.conv_id,
-                      delivered_at: is_member_online ? new Date() : null,
-                      read_at: is_member_in_conv ? new Date() : null,
+                      delivered_at: sent_result.online.includes(member_id) ? new Date() : null,
+                      read_at: sent_result.active_in_conv.includes(member_id) ? new Date() : null,
                     });
                   }
                 }
@@ -344,6 +347,51 @@ const web_socket_server = new Elysia()
                 // Batch insert message statuses for all recipients
                 if (message_statuses.length > 0) {
                   await batch_insert_message_status(message_statuses);
+                }
+
+                // Special handling for DMs: update message status in messages table
+                if (conv_members.size === 2) {
+                  const copy_conv_member = [...conv_members];
+
+                  const reciepient_id = Array.from(copy_conv_member)[0] == payload.sender_id
+                    ? Array.from(copy_conv_member)[1]   // for DMs only
+                    : Array.from(copy_conv_member)[0]
+                  if (reciepient_id) {
+                    // update message status in messages table (for DMs)
+                    await db.update(message_model).set({
+                      status: sent_result.active_in_conv.includes(reciepient_id)
+                        ? "read"
+                        : sent_result.online.includes(reciepient_id)
+                          ? "delivered"
+                          : "sent"
+                    }).where(
+                      and(
+                        eq(message_model.id, stored_message.data.id),
+                        eq(message_model.conversation_id, payload.conv_id)
+                      )
+                    )
+                  }
+                }
+
+                const offline_and_inactive_users = new Set([...sent_result.offline, ...sent_result.online]);
+                for (const user_id of offline_and_inactive_users) {
+                  // insert into missed_messages table
+                  await db.update(conversation_member_model)
+                    .set({
+                      unread_count: sql`${conversation_member_model.unread_count} + 1`,
+                      last_delivered_message_id: sent_result.online.includes(user_id) || sent_result.active_in_conv.includes(user_id)
+                        ? stored_message.data.id
+                        : sql`${conversation_member_model.last_delivered_message_id}`,
+                      last_read_message_id: sent_result.active_in_conv.includes(user_id)
+                        ? stored_message.data.id
+                        : sql`${conversation_member_model.last_read_message_id}`,
+                    })
+                    .where(
+                      and(
+                        eq(conversation_member_model.conversation_id, payload.conv_id),
+                        eq(conversation_member_model.user_id, user_id)
+                      )
+                    )
                 }
               }
 
@@ -353,6 +401,14 @@ const web_socket_server = new Elysia()
                 metadata: { last_message: stored_message?.data },
                 last_message_at: new Date()
               })
+
+
+              // send fcm notification to offline users
+              await FCMService.sendBulkMessageNotifications(
+                sent_result.offline,
+                new_message_payload
+              );
+
             }
             else {
               console.error('[WS] message:new payload missing');

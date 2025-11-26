@@ -4,7 +4,7 @@ import { get_conversation_members, get_user_conversations } from "./socket.cache
 import { socket_connections } from "./socket.server";
 import db from "@/config/db";
 import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, ne } from "drizzle-orm";
 
 const set_ws_data = (ws: ElysiaWS, data: WebSocketData) => {
   Object.assign(ws.data, data)
@@ -172,6 +172,16 @@ const handle_join_conversation = async ({
         )
       )
 
+    // special handling for DMs: updating message table for sent status 
+    await db
+      .update(message_model)
+      .set({ status: "read" })
+      .where(
+        and(
+          eq(message_model.conversation_id, conv_id),
+          ne(message_model.sender_id, user_id),
+        )
+      );
 
   }
   catch (error) {

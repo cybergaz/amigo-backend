@@ -3,6 +3,8 @@ import { eq, and } from 'drizzle-orm';
 import db from '@/config/db';
 import { user_model } from '@/models/user.model';
 import { conversation_member_model } from '@/models/chat.model';
+import { ChatMessagePayload } from '@/types/socket.types';
+import { MessageType } from '@/types/chat.types';
 
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
@@ -21,7 +23,8 @@ if (!admin.apps.length) {
 interface NotificationPayload {
   title: string;
   body: string;
-  data?: Record<string, string>;
+  data?: Record<string, any>;
+  chat_message?: ChatMessagePayload;
   type: 'message' | 'call' | 'call_end';
 }
 
@@ -30,8 +33,8 @@ interface MessageNotificationData {
   messageId: string;
   senderId: string;
   senderName: string;
-  messageBody?: string;
-  messageType: string;
+  messageBody?: ChatMessagePayload;
+  messageType: MessageType;
 }
 
 interface CallNotificationData {
@@ -56,7 +59,7 @@ export class FCMService {
    * Send push notification to a specific user
    */
   async sendNotificationToUser(
-    userId: number,
+    user_id: number,
     payload: NotificationPayload
   ): Promise<boolean> {
     try {
@@ -68,16 +71,23 @@ export class FCMService {
           conversation_member_model,
           eq(user_model.id, conversation_member_model.user_id)
         )
-        .where(and(eq(user_model.id, userId), eq(conversation_member_model.deleted, false), payload.data?.conversationId ? eq(conversation_member_model.conversation_id, Number(payload.data?.conversationId)) : undefined))
+        .where(
+          and(
+            eq(user_model.id, user_id),
+            eq(conversation_member_model.deleted, false),
+            payload.data?.conversationId
+              ? eq(conversation_member_model.conversation_id, Number(payload.data?.conversationId))
+              : undefined
+          ))
         .limit(1);
 
       if (user.length === 0) {
-        console.log(`[FCM] ${userId} is not a member of the conversation ${payload.data?.conversationId}`);
+        console.log(`[FCM] ${user_id} is not a member of the conversation ${payload.data?.conversationId}`);
         return false;
       }
 
       if (!user[0].fcm_token) {
-        console.log(`[FCM] No FCM token found for user ${userId}`);
+        console.log(`[FCM] No FCM token found for user ${user_id}`);
         return false;
       }
 
@@ -92,6 +102,7 @@ export class FCMService {
         data: {
           type: payload.type,
           ...payload.data,
+          ...(payload.chat_message ? { chat_message: JSON.stringify(payload.chat_message) } : {}),
         },
         android: {
           priority: 'high',
@@ -99,8 +110,14 @@ export class FCMService {
           notification: {
             channelId: payload.type === 'call' ? 'calls' : 'messages',
             priority: payload.type === 'call' ? 'max' : 'high',
+            sticky: payload.type === 'call' ? true : false,
             sound: 'default',
             vibrateTimingsMillis: [0, 250, 250, 250],
+            // Group notifications for WhatsApp-like behavior
+            ...(payload.type === 'message' && payload.data?.conversationId ? {
+              tag: `conversation_${payload.data.conversationId}`, // Group by conversation
+              // group: 'messages_group', // All messages in same group
+            } : {}),
           },
         },
         apns: {
@@ -115,13 +132,13 @@ export class FCMService {
       };
 
       const response = await admin.messaging().send(message);
-      console.log(`[FCM] Successfully sent notification to user ${userId}: ${response}`);
+      console.log(`[FCM] Successfully sent notification to user ${user_id}: ${response}`);
       return true;
     } catch (error: any) {
       if (error.code === 'messaging/registration-token-not-registered') {
-        console.error(`[FCM] Error sending notification to user ${userId}: Invalid FCM Token`);
+        console.error(`[FCM] Error sending notification to user ${user_id}: Invalid FCM Token`);
       } else {
-        console.error(`[FCM] Error sending notification to user ${userId}: `, error);
+        console.error(`[FCM] Error sending notification to user ${user_id}: `, error);
       }
       return false;
     }
@@ -134,9 +151,10 @@ export class FCMService {
     userId: number,
     data: MessageNotificationData
   ): Promise<boolean> {
+
     const payload: NotificationPayload = {
       title: `${data.senderName}`,
-      body: this._formatMessageBody(data.messageBody, data.messageType),
+      body: this._formatMessageBody(data.messageBody),
       type: 'message',
       data: {
         conversationId: data.conversationId,
@@ -144,7 +162,10 @@ export class FCMService {
         senderId: data.senderId,
         senderName: data.senderName,
         messageType: data.messageType,
+        messagePayload: data.messageBody
       },
+      // Include chat_message for local DB storage
+      chat_message: data.messageBody,
     };
 
     return await this.sendNotificationToUser(userId, payload);
@@ -197,6 +218,7 @@ export class FCMService {
           notification: {
             channelId: 'calls',
             priority: 'high',
+            sticky: true,
             sound: 'default',
             vibrateTimingsMillis: [0, 250, 250, 250],
             visibility: "public"
@@ -281,19 +303,23 @@ export class FCMService {
   /**
    * Format message body based on message type
    */
-  private _formatMessageBody(messageBody?: string, messageType?: string): string {
-    if (!messageBody) {
-      switch (messageType) {
+  private _formatMessageBody(message?: ChatMessagePayload): string {
+
+    if (!message) {
+      return 'New message';
+    }
+
+    // If no body, return based on message type
+    if (!message.body) {
+      switch (message.msg_type) {
         case 'image':
           return '📷 Photo';
         case 'video':
           return '🎥 Video';
         case 'audio':
           return '🎵 Voice message';
-        case 'file':
+        case 'attachment':
           return '📎 File';
-        case 'location':
-          return '📍 Location';
         case 'media':
           return '📎 Media';
         case 'reply':
@@ -306,17 +332,17 @@ export class FCMService {
     }
 
     // Add prefix for special message types
-    switch (messageType) {
+    switch (message.msg_type) {
       case 'reply':
-        return `↩️ ${messageBody.length > 90 ? messageBody.substring(0, 90) + '...' : messageBody}`;
+        return `↩️ ${message.body.length > 90 ? message.body.substring(0, 90) + '...' : message.body}`;
       case 'forwarded':
         return '↪️ Forwarded message';
       default:
         // Truncate long messages
-        if (messageBody.length > 100) {
-          return messageBody.substring(0, 100) + '...';
+        if (message.body.length > 100) {
+          return message.body.substring(0, 100) + '...';
         }
-        return messageBody;
+        return message.body;
     }
   }
 
@@ -324,30 +350,23 @@ export class FCMService {
    * Send bulk notifications for group messages
    */
   async sendBulkMessageNotifications(
-    userIds: number[],
-    conversationId: string,
-    senderId: string,
-    senderName: string,
-    messageBody?: string,
-    messageType: string = 'text'
+    user_ids: number[],
+    msg_payload?: ChatMessagePayload,
   ): Promise<{ success: number; failed: number }> {
     const messageId = Date.now().toString(); // Use timestamp as message ID for notifications
 
-    const promises = userIds.map(async (userId) => {
+    const promises = user_ids.map(async (user_id) => {
 
       // Don't send notification to sender
-      if (userId.toString() === senderId) return;
+      if (user_id === msg_payload?.sender_id) return;
 
-      const data: MessageNotificationData = {
-        conversationId,
-        messageId,
-        senderId,
-        senderName,
-        messageBody,
-        messageType,
-      };
-
-      return await this.sendMessageNotification(userId, data);
+      // return await this.sendMessageNotification(user_id, msg_payload);
+      return await this.sendNotificationToUser(user_id, {
+        title: `${msg_payload?.sender_name || 'New Message'}`,
+        body: this._formatMessageBody(msg_payload),
+        type: 'message',
+        chat_message: msg_payload
+      });
     });
 
     const results = await Promise.allSettled(promises);

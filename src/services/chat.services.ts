@@ -20,6 +20,7 @@ import { DeleteMessagePayload, NewConversationPayload, MembersType } from "@/typ
 import { socket_connections } from "@/sockets/socket.server";
 import { get_user_details } from "./user.services";
 import { get_conversation_members } from "@/sockets/socket.cache";
+import { status } from "elysia";
 
 const create_chat = async (sender_id: number, receiver_id: number) => {
   try {
@@ -1112,7 +1113,7 @@ const dm_delete_status = async (conversation_id: number, user_id: number, status
 
 const soft_delete_message = async (message_ids: number[], user_id: number, is_admin_or_staff?: boolean) => {
   try {
-    console.log("soft_delete_message called with:", { message_ids, user_id, is_admin_or_staff });
+    // console.log("soft_delete_message called with:", { message_ids, user_id, is_admin_or_staff });
 
     // First, get the messages to retrieve conversation_id and check if they exist
     const messagesToDelete = await db
@@ -1352,6 +1353,7 @@ const get_conversation_history = async (
         metadata: message_model.metadata,
         sent_at: message_model.sent_at,
         created_at: message_model.created_at,
+        status: message_model.status,
         deleted: message_model.deleted,
         forwarded_from: message_model.forwarded_from,
         forwarded_count: message_model.forwarded_to,
