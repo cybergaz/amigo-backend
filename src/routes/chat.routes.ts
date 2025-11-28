@@ -8,6 +8,7 @@ import {
   remove_member,
   update_group_title,
   get_conversation_history,
+  get_message_statuses,
   get_group_info,
   promote_to_admin,
   demote_to_member,
@@ -155,7 +156,26 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     }),
     query: t.Object({
       page: t.Optional(t.Number({ minimum: 1, default: 1 })),
-      limit: t.Optional(t.Number({ minimum: 1, maximum: 100, default: 20 }))
+      limit: t.Optional(t.Number({ minimum: 1, maximum: 500, default: 20 }))
+    })
+  })
+
+  .get("/get-message-statuses/:conversation_id", async ({ set, store, params, query }) => {
+    const statuses_result = await get_message_statuses(
+      params.conversation_id,
+      store.id,
+      query.page,
+      query.limit
+    );
+    set.status = statuses_result.code;
+    return statuses_result;
+  }, {
+    params: t.Object({
+      conversation_id: t.Number()
+    }),
+    query: t.Object({
+      page: t.Optional(t.Number({ minimum: 1, default: 1 })),
+      limit: t.Optional(t.Number({ minimum: 1, maximum: 10000, default: 1000 }))
     })
   })
 

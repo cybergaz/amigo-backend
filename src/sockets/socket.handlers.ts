@@ -4,7 +4,7 @@ import { get_conversation_members, get_user_conversations } from "./socket.cache
 import { socket_connections } from "./socket.server";
 import db from "@/config/db";
 import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
-import { and, desc, eq, ne } from "drizzle-orm";
+import { and, desc, eq, isNull, ne, or } from "drizzle-orm";
 
 const set_ws_data = (ws: ElysiaWS, data: WebSocketData) => {
   Object.assign(ws.data, data)
@@ -120,16 +120,6 @@ const handle_join_conversation = async ({
   // is_active_in_conv: boolean
 }) => {
   try {
-    // Clear unread count when user becomes active in conversation
-    await db
-      .update(conversation_member_model)
-      .set({ unread_count: 0 })
-      .where(
-        and(
-          eq(conversation_member_model.conversation_id, conv_id),
-          eq(conversation_member_model.user_id, user_id)
-        )
-      );
 
     // Get the latest message in this conversation to update last_read_message_id
     const [latest_message] = await db
@@ -151,6 +141,8 @@ const handle_join_conversation = async ({
         .update(conversation_member_model)
         .set({
           last_read_message_id: latest_message.id,
+          // Clear unread count when user becomes active in conversation
+          unread_count: 0
         })
         .where(
           and(
@@ -169,6 +161,7 @@ const handle_join_conversation = async ({
         and(
           eq(message_status_model.conv_id, conv_id),
           eq(message_status_model.user_id, user_id),
+          isNull(message_status_model.read_at),
         )
       )
 
@@ -180,6 +173,7 @@ const handle_join_conversation = async ({
         and(
           eq(message_model.conversation_id, conv_id),
           ne(message_model.sender_id, user_id),
+          ne(message_model.status, "read"),
         )
       );
 

@@ -3,6 +3,7 @@ import {
   conversation_model,
   conversation_member_model,
   message_model,
+  message_status_model,
   DBUpdateConversationType,
 } from "@/models/chat.model";
 import { user_model } from "@/models/user.model";
@@ -1432,6 +1433,90 @@ const get_conversation_history = async (
   }
 };
 
+const get_message_statuses = async (
+  conversation_id: number,
+  user_id: number,
+  page: number = 1,
+  limit: number = 1000
+) => {
+  try {
+    // First, verify user is a member of this conversation
+    const [member] = await db
+      .select({
+        user_id: conversation_member_model.user_id,
+      })
+      .from(conversation_member_model)
+      .where(
+        and(
+          eq(conversation_member_model.conversation_id, conversation_id),
+          eq(conversation_member_model.user_id, user_id),
+          eq(conversation_member_model.deleted, false)
+        )
+      )
+      .limit(1);
+
+    if (!member) {
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
+
+    // Calculate offset for pagination
+    const offset = (page - 1) * limit;
+
+    // Get all message statuses for this conversation
+    // This includes statuses for all users in the conversation
+    const statuses = await db
+      .select()
+      .from(message_status_model)
+      .where(
+        and(
+          eq(message_status_model.conv_id, conversation_id)
+        )
+      )
+      .orderBy(desc(message_status_model.updated_at))
+      .limit(limit)
+      .offset(offset);
+
+    // Get total count for pagination info
+    const totalCountResult = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(message_status_model)
+      .where(eq(message_status_model.conv_id, conversation_id));
+
+    const totalCount = totalCountResult[0]?.count || 0;
+    const totalPages = Math.ceil(totalCount / limit);
+    const hasNextPage = page < totalPages;
+    const hasPreviousPage = page > 1;
+
+    return {
+      success: true,
+      code: 200,
+      data: {
+        statuses,
+        pagination: {
+          currentPage: page,
+          totalPages,
+          totalCount,
+          limit,
+          hasNextPage,
+          hasPreviousPage,
+        },
+      },
+    };
+
+  } catch (error) {
+    console.error("get_message_statuses error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : get_message_statuses",
+    };
+  }
+};
+
 // Admin-specific functions for managing all chats
 const get_all_conversations_admin = async (type?: string) => {
   try {
@@ -1823,6 +1908,7 @@ export {
   soft_delete_message,
   hard_delete_message,
   get_conversation_history,
+  get_message_statuses,
   get_all_conversations_admin,
   get_conversation_members_admin,
   get_conversation_history_admin,

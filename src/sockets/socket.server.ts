@@ -3,7 +3,7 @@ import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
 import { WSMessageSchema } from "@/types/socket.elysia-schema";
 import { JoinLeavePayload, MiscPayload, ConnectionStatusPayload, UserConnection, ChatMessagePayload, TypingPayload, ChatMessageAckPayload, MessageForwardPayload, MessagePinPayload } from "@/types/socket.types";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, sql, isNull } from "drizzle-orm";
 import Elysia, { t } from "elysia";
 import { broadcast_message, get_connected_users, get_ws_data, handle_join_conversation, set_ws_data } from "./socket.handlers";
 import { update_user_connection_status, update_user_details } from "@/services/user.services";
@@ -13,8 +13,19 @@ import { ChatType } from "@/types/chat.types";
 import { get_conversation_members } from "./socket.cache";
 import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
 import FCMService from "@/services/fcm.service";
+import { CallService } from "@/services/call.service";
 
 const socket_connections = new Map<number, UserConnection>(); // user_id -> UserConnection
+
+const send_to_user = async (user_id: number, message: any) => {
+  const connection = socket_connections.get(user_id);
+  if (connection && connection.ws.readyState === 1) {
+    connection.ws.send(JSON.stringify(message));
+    console.log(`[WS] Sent message to user ${user_id}:`, message);
+    return true
+  }
+  return false
+}
 
 // WebSocket server
 const web_socket_server = new Elysia()
@@ -47,7 +58,9 @@ const web_socket_server = new Elysia()
   })
 
   .ws('/chat', {
-    body: WSMessageSchema,
+    // temporarily skipping schema validation
+    // body: WSMessageSchema,
+    body: t.Any(),
     query: t.Object({ token: t.String() }),
 
     error: ({ error }) => {
@@ -151,7 +164,12 @@ const web_socket_server = new Elysia()
         await db
           .update(message_status_model)
           .set({ delivered_at: new Date() })
-          .where(eq(message_status_model.user_id, user_id))
+          .where(
+            and(
+              eq(message_status_model.user_id, user_id),
+              isNull(message_status_model.delivered_at)
+            )
+          );
 
       } catch (error) {
         console.error('[WS] Error in establishing connection:', error);
@@ -161,9 +179,9 @@ const web_socket_server = new Elysia()
     },
 
     message: async (ws, message) => {
-      const user_id = get_ws_data(ws, "user_id");
-      const user_name = get_ws_data(ws, "user_name");
-      const user_pfp = get_ws_data(ws, "user_pfp");
+      const user_id = Number(get_ws_data(ws, "user_id"));
+      const user_name = String(get_ws_data(ws, "user_name"));
+      const user_pfp = String(get_ws_data(ws, "user_pfp"));
 
       if (!user_id) {
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -402,13 +420,11 @@ const web_socket_server = new Elysia()
                 last_message_at: new Date()
               })
 
-
               // send fcm notification to offline users
               await FCMService.sendBulkMessageNotifications(
                 sent_result.offline,
                 new_message_payload
               );
-
             }
             else {
               console.error('[WS] message:new payload missing');
@@ -618,6 +634,224 @@ const web_socket_server = new Elysia()
               timestamp: new Date().toISOString()
             }, true);
             break;
+
+
+          // --------------------------------------------------------------------
+          // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+          // TEMPORARY CALL IMPLEMENTATION
+          // --------------------------------------------------------------------
+
+          // Call signaling handlers
+          case 'call:init':
+            if (message.to && message.payload) {
+              // console.log(`[WS] Processing call:init from ${user_id} to ${message.to}`);
+              // console.log(`[WS] Current connections: ${Array.from(connections.keys())}`);
+              // console.log(`[WS] Target user ${message.to} connected: ${connections.has(message.to)}`);
+
+              const result = await CallService.initiate_call(Number(user_id), message.to, message.payload);
+
+              if (result.success) {
+                const callId = result.data?.callId;
+                // console.log(`[WS] Call initiation successful, callId: ${callId}`);
+
+                // Send acknowledgment to caller
+                const ackSent = await send_to_user(user_id, {
+                  type: 'call:init',
+                  callId,
+                  from: user_id,
+                  to: message.to,
+                  data: { success: true, callId },
+                  timestamp: new Date().toISOString()
+                });
+                // console.log(`[WS] Ack sent to caller ${user_id}: ${ackSent}`);
+
+                // Send incoming call notification to callee
+                const ringSent = await send_to_user(message.to, {
+                  type: 'call:ringing',
+                  callId,
+                  from: user_id,
+                  to: message.to,
+                  payload: message.payload,
+                  timestamp: new Date().toISOString()
+                });
+
+                // Send push notification if user is offline
+                if (!ringSent) {
+                  try {
+                    // Get caller details for notification
+                    const caller = await db
+                      .select({ name: user_model.name, profile_pic: user_model.profile_pic })
+                      .from(user_model)
+                      .where(eq(user_model.id, user_id))
+                      .limit(1);
+
+                    const callerName = caller[0]?.name || 'Unknown';
+                    const callerProfilePic = caller[0]?.profile_pic!;
+
+                    await FCMService.sendCallNotification(message.to, {
+                      callId: callId!.toString(),
+                      callerId: user_id.toString(),
+                      callerName,
+                      callerProfilePic,
+                      callType: message.payload?.callType || 'audio',
+                    });
+                  } catch (error) {
+                    console.error(`[WS] Error sending call push notification:`, error);
+                  }
+                }
+                // console.log(`[WS] Ring sent to callee ${message.to}: ${ringSent}`);
+                //
+                // console.log(`[WS] Call init complete: ${callId} from ${user_id} to ${message.to}`);
+              } else {
+                // console.log(`[WS] Call initiation failed: ${result.error} (${result.code})`);
+                // Send error to caller
+                await send_to_user(user_id, {
+                  type: 'error',
+                  data: { message: result.error, code: result.code },
+                  timestamp: new Date().toISOString()
+                });
+              }
+            } else {
+              console.log(`[WS] Invalid call:init message - missing to or payload`);
+            }
+            break;
+
+          case 'call:offer':
+          case 'call:answer':
+          case 'call:ice':
+            // Forward WebRTC signaling between caller and callee
+            console.log(`[WS] Received ${message.type} from ${user_id} to ${message.to} for call ${message.callId}`);
+            if (message.callId && message.to && message.payload) {
+              await send_to_user(message.to, {
+                type: message.type,
+                callId: message.callId,
+                from: user_id,
+                to: message.to,
+                payload: message.payload,
+                timestamp: new Date().toISOString()
+              });
+
+              // console.log(`[WS] Forwarded ${message.type} for call ${message.callId}`);
+            }
+            break;
+
+          case 'call:accept':
+            if (message.callId) {
+              const result = await CallService.accept_call(message.callId, user_id);
+
+
+              if (result.success) {
+                console.log("call accepted success", message)
+                // Notify both parties
+                const active_call = CallService.get_user_active_call(user_id);
+                if (active_call) {
+                  // Notify caller
+                  await send_to_user(active_call.caller_id, {
+                    type: 'call:accept',
+                    callId: message.callId,
+                    from: user_id,
+                    to: active_call.caller_id,
+                    timestamp: new Date().toISOString()
+                  });
+
+                  // Acknowledge to callee
+                  await send_to_user(user_id, {
+                    type: 'call:accept',
+                    callId: message.callId,
+                    from: user_id,
+                    to: active_call.caller_id,
+                    data: { success: true },
+                    timestamp: new Date().toISOString()
+                  });
+                }
+              } else {
+                await send_to_user(user_id, {
+                  type: 'error',
+                  data: { message: result.error },
+                  timestamp: new Date().toISOString()
+                });
+              }
+            }
+            break;
+
+          case 'call:decline':
+            if (message.callId) {
+              const active_call = CallService.get_user_active_call(user_id);
+              const result = await CallService.decline_call(message.callId, user_id, message.payload?.reason);
+
+              if (result.success) {
+                if (active_call) {
+                  // Notify caller
+                  const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
+                  await send_to_user(active_call.caller_id, {
+                    type: 'call:decline',
+                    callId: message.callId,
+                    from: user_id,
+                    to: other_user,
+                    payload: message.payload,
+                    timestamp: new Date().toISOString()
+                  });
+                  await send_to_user(user_id, {
+                    type: 'call:decline',
+                    callId: message.callId,
+                    data: { success: true, reason: message.payload?.reason },
+                    timestamp: new Date().toISOString()
+                  });
+
+                  await FCMService.sendNotificationToUser(other_user, {
+                    title: "Call Ended",
+                    body: `User declined your call`,
+                    type: 'call_end',
+                  })
+                }
+              }
+            }
+            break;
+
+          case 'call:end':
+            if (message.callId) {
+              // Get active call first before ending it
+              const active_call = CallService.get_user_active_call(user_id);
+
+              const result = await CallService.end_call(message.callId, user_id, message.payload?.reason);
+
+              if (result.success) {
+                // Find the other party and notify them
+                if (active_call) {
+                  const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
+
+                  // console.log(`[WS] Call ended: ${message.callId}, notifying user ${other_user}`);
+
+                  await send_to_user(other_user, {
+                    type: 'call:end',
+                    callId: message.callId,
+                    from: user_id,
+                    to: other_user,
+                    payload: {
+                      reason: message.payload?.reason,
+                      duration: result.data?.duration_seconds
+                    },
+                    timestamp: new Date().toISOString()
+                  });
+
+                  // Acknowledge to sender
+                  await send_to_user(user_id, {
+                    type: 'call:end',
+                    callId: message.callId,
+                    data: { success: true, duration: result.data?.duration_seconds },
+                    timestamp: new Date().toISOString()
+                  });
+                } else {
+                  console.warn(`[WS] No active call found for user ${user_id} when ending call ${message.callId}`);
+                }
+              } else {
+                console.error(`[WS] Failed to end call ${message.callId}: ${result.error}`);
+              }
+            }
+            break;
+
+
+
         }
 
 
