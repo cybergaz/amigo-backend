@@ -27,6 +27,7 @@ type WSMessage = {
   | DeleteMessagePayload
   | MessagePinPayload
   | MessageForwardPayload
+  | CallPayload
   | MiscPayload
   // | WSPayload
   ws_timestamp?: Date
@@ -135,6 +136,19 @@ type MembersType = {
   joined_at: Date
 }
 
+type CallPayload = {
+  call_id?: number
+  caller_id: number
+  caller_name?: string
+  caller_pfp?: string
+  callee_id: number
+  callee_name?: string
+  callee_pfp?: string
+  data?: any
+  error?: any
+  timestamp?: Date
+}
+
 type MiscPayload = {
   message: string
   data?: any
@@ -154,6 +168,7 @@ const WS_MESSAGE_TYPE_CONST = [
   'message:forward',
   'message:delete',
   'call:init',
+  'call:init:ack',
   'call:offer',
   'call:answer',
   'call:ice',
@@ -162,9 +177,11 @@ const WS_MESSAGE_TYPE_CONST = [
   'call:end',
   'call:ringing',
   'call:missed',
+  'call:error',
   'socket:health_check',
   'socket:error',
-  'ping'
+  'ping',
+  'pong'
 ] as const;
 
 type WSMessageType = typeof WS_MESSAGE_TYPE_CONST[number];
@@ -186,5 +203,6 @@ export type {
   MembersType,
   MessagePinPayload,
   MessageForwardPayload,
+  CallPayload,
   ConnectionStatusType,
 };

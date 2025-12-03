@@ -21,7 +21,7 @@ const user_calls = new Map<number, number>(); // user_id -> call_id
 export class CallService {
 
   // Initialize a new call
-  static async initiate_call(caller_id: number, callee_id: number, payload: CallInitPayload) {
+  static async initiate_call(caller_id: number, callee_id: number) {
     try {
       // Check if either user is already in a call
       if (user_calls.has(caller_id) || user_calls.has(callee_id)) {
@@ -109,12 +109,20 @@ export class CallService {
     try {
       const active_call = active_calls.get(call_id);
       if (!active_call) {
-        return { success: false, error: 'Call not found' };
+        return {
+          success: false,
+          code: 404,
+          error: 'Call not found'
+        };
       }
 
       // Only callee can accept
       if (active_call.callee_id !== user_id) {
-        return { success: false, error: 'Unauthorized to accept this call' };
+        return {
+          success: false,
+          code: 401,
+          error: 'Unauthorized to accept this call'
+        };
       }
 
       // Clear timeout
@@ -136,10 +144,18 @@ export class CallService {
 
       // console.log(`[CALL] Call accepted: ${call_id}`);
 
-      return { success: true, code: 200 };
+      return {
+        success: true,
+        code: 200,
+        message: 'Call accepted'
+      };
     } catch (error) {
       console.error('[CALL] Error accepting call:', error);
-      return { success: false, code: 500, error: 'Failed to accept call' };
+      return {
+        success: false,
+        code: 500,
+        error: 'Failed to accept call'
+      };
     }
   }
 

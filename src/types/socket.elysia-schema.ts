@@ -90,6 +90,24 @@ const MiscPayloadSchema = t.Object({
   error: t.Optional(t.Any()),
 });
 
+// CallPayload schema
+const CallPayloadSchema = t.Object({
+  call_id: t.Optional(t.Number()),
+  caller_id: t.Number(),
+  caller_name: t.Optional(t.String()),
+  caller_pfp: t.Optional(t.String()),
+  callee_id: t.Number(),
+  callee_name: t.Optional(t.String()),
+  callee_pfp: t.Optional(t.String()),
+  data: t.Optional(t.Any()),
+  error: t.Optional(t.Any()),
+  timestamp: t.Optional(
+    t.Transform(t.String())
+      .Decode((value) => new Date(value))
+      .Encode((value) => (value instanceof Date ? value.toISOString() : value))
+  ),
+});
+
 // MessagePinPayload schema
 const MessagePinPayloadSchema = t.Object({
   conv_id: t.Number(),
@@ -135,6 +153,7 @@ const WSPayloadSchema = t.Union([
   TypingPayloadSchema,
   DeleteMessagePayloadSchema,
   MiscPayloadSchema,
+  CallPayloadSchema,
   NewConversationPayloadSchema,
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
@@ -157,6 +176,7 @@ export {
   MembersTypeSchema,
   NewConversationPayloadSchema,
   MiscPayloadSchema,
+  CallPayloadSchema,
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
   WSPayloadSchema,
