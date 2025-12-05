@@ -43,7 +43,6 @@ const compare_password = async (password: string, hashed_password: string) => {
 
 function parse_phone(input: string, default_country_code?: string) {
   const phone = parsePhoneNumberFromString(input);
-  console.log("phone -> ", phone)
 
   if (!phone) return {
     country: null,
