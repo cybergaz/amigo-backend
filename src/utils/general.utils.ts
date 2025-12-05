@@ -10,8 +10,7 @@ const create_unique_id = () => {
 };
 
 const create_otp = () => {
-  const nanoid = customAlphabet("0123456789", 6);
-  return Number(nanoid());
+  return Math.floor(100000 + Math.random() * 900000).toString();
 };
 
 const hash_password = async (password: string): Promise<string> => {
@@ -44,14 +43,17 @@ const compare_password = async (password: string, hashed_password: string) => {
 
 function parse_phone(input: string, default_country_code?: string) {
   const phone = parsePhoneNumberFromString(input);
+  console.log("phone -> ", phone)
 
   if (!phone) return {
+    country: null,
     code: "",
     phone: input,
     concatinated: `+${default_country_code}${input.replace(" ", "")}`,
   };
 
   return {
+    country: phone.country || null,
     code: phone.countryCallingCode, // e.g. "91"
     phone: phone.nationalNumber,     // e.g. "7777777777"
     concatinated: `+${phone.countryCallingCode || ""}${phone.nationalNumber}`.replace(" ", "") // e.g. "+917777777777"

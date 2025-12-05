@@ -643,7 +643,7 @@ const web_socket_server = new Elysia()
 
               if (result.success) {
                 const call_id = result.data?.callId;
-                
+
                 // Get caller details for the payload
                 let callerName: string | undefined;
                 let callerPfp: string | undefined;
@@ -653,13 +653,13 @@ const web_socket_server = new Elysia()
                     .from(user_model)
                     .where(eq(user_model.id, payload.caller_id || Number(user_id)))
                     .limit(1);
-                  
+
                   callerName = caller[0]?.name;
                   callerPfp = caller[0]?.profile_pic || undefined;
                 } catch (error) {
                   console.error(`[WS] Error fetching caller details:`, error);
                 }
-                
+
                 // Send acknowledgment to caller
                 const call_init_payload: CallPayload = {
                   call_id: result.data?.callId,
@@ -667,7 +667,7 @@ const web_socket_server = new Elysia()
                   callee_id: payload.callee_id,
                   timestamp: new Date(),
                 }
-                
+
                 // Payload for callee with caller details
                 const call_ringing_payload: CallPayload = {
                   call_id: result.data?.callId,
