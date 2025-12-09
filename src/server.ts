@@ -61,6 +61,8 @@ console.log(
   `🦊 Elysia is running at port ${app.server?.port} (PID: ${process.pid})`
 );
 
+// console.log(parse_phone("+32463001607"));
+
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully');

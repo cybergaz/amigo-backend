@@ -10,7 +10,7 @@ const create_unique_id = () => {
 };
 
 const create_otp = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
+  return Math.floor(100000 + Math.random() * 900000);
 };
 
 const hash_password = async (password: string): Promise<string> => {

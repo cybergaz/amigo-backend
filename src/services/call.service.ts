@@ -159,7 +159,7 @@ export class CallService {
     }
   }
 
-  // Decline a call
+  // Decline a call (can be declined by callee or cancelled by caller)
   static async decline_call(call_id: number, user_id: number, reason?: string) {
     try {
       const active_call = active_calls.get(call_id);
@@ -167,10 +167,13 @@ export class CallService {
         return { success: false, error: 'Call not found' };
       }
 
-      // Only callee can decline
-      if (active_call.callee_id !== user_id) {
+      // Either caller or callee can decline/cancel the call
+      if (active_call.callee_id !== user_id && active_call.caller_id !== user_id) {
         return { success: false, error: 'Unauthorized to decline this call' };
       }
+
+      // Determine status based on who is declining
+      const status = active_call.caller_id === user_id ? 'cancelled' : 'declined';
 
       // Clear timeout
       if (active_call.timeout_timer) {
@@ -181,18 +184,18 @@ export class CallService {
       await db
         .update(call_model)
         .set({
-          status: 'declined',
+          status: status,
           ended_at: new Date(),
-          reason
+          reason: reason || (active_call.caller_id === user_id ? 'caller_cancelled' : 'callee_declined')
         })
         .where(eq(call_model.id, call_id));
 
       // Remove from active calls
       this.cleanup_call(call_id);
 
-      // console.log(`[CALL] Call declined: ${call_id}`);
+      console.log(`[CALL] Call ${status}: ${call_id} by user ${user_id}`);
 
-      return { success: true };
+      return { success: true, data: { status } };
     } catch (error) {
       console.error('[CALL] Error declining call:', error);
       return { success: false, error: 'Failed to decline call' };

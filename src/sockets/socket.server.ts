@@ -192,6 +192,11 @@ const web_socket_server = new Elysia()
       }
 
       try {
+
+        if (message.type.startsWith("call")) {
+          console.log(message)
+        }
+
         // Handle incoming messages 
         switch (message.type) {
 
@@ -753,7 +758,7 @@ const web_socket_server = new Elysia()
                 return
               }
               // Forward WebRTC signaling between caller and callee
-              console.log('[WS] Received ', message)
+              // console.log('[WS] Received ', message)
 
               const call_offer_payload: CallPayload = {
                 call_id: payload.call_id,
@@ -866,6 +871,7 @@ const web_socket_server = new Elysia()
                 return
               }
 
+              // Get active call BEFORE declining (it will be removed after)
               const active_call = CallService.get_user_active_call(user_id);
               const result = await CallService.decline_call(payload.call_id, user_id, payload.data?.reason);
 
@@ -875,30 +881,57 @@ const web_socket_server = new Elysia()
                 callee_id: payload.callee_id,
                 timestamp: new Date(),
               }
+
               if (result.success) {
-                if (active_call) {
-                  const other_user = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
-                  // Notify caller
-                  // Acknowledge to callee
-                  // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-                  await broadcast_message({
-                    to: "users",
-                    user_ids: [payload.caller_id, payload.callee_id],
-                    message: {
-                      type: "call:decline",
-                      payload: {
-                        ...call_decline_payload,
-                        data: { success: true, reason: payload.data?.reason },
+                // Determine caller and callee from active_call or payload
+                const caller_id = active_call?.caller_id || payload.caller_id;
+                const callee_id = active_call?.callee_id || payload.callee_id;
+                const other_user = caller_id === user_id ? callee_id : caller_id;
+                const is_caller_declining = user_id === caller_id;
+
+                // Notify both parties about the decline/cancel
+                // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+                await broadcast_message({
+                  to: "users",
+                  user_ids: [caller_id, callee_id],
+                  message: {
+                    type: "call:decline",
+                    payload: {
+                      ...call_decline_payload,
+                      caller_id,
+                      callee_id,
+                      data: {
+                        success: true,
+                        reason: payload.data?.reason,
+                        declined_by: user_id,
+                        status: result.data?.status
                       },
                     },
-                  })
+                  },
+                })
 
-                  await FCMService.sendNotificationToUser(other_user, {
-                    title: "Call Ended",
-                    body: `User declined your call`,
-                    type: 'call_end',
-                  })
-                }
+                // Send push notification to the other party
+                await FCMService.sendNotificationToUser(other_user, {
+                  title: "Call Ended",
+                  body: is_caller_declining ? `Caller cancelled the call` : `Call was declined`,
+                  type: 'call_end',
+                })
+              } else {
+                // Send error back to the user
+                await broadcast_message({
+                  to: "users",
+                  user_ids: [user_id],
+                  message: {
+                    type: "call:error",
+                    payload: {
+                      ...call_decline_payload,
+                      error: {
+                        code: 'DECLINE_FAILED',
+                        message: result.error,
+                      },
+                    },
+                  },
+                })
               }
             }
             break;
