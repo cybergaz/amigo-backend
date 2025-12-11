@@ -23,10 +23,37 @@ function mapToObject(map: Map<any, any>) {
 
 const unprotected_call_routes = new Elysia({ prefix: "/call" })
 
-  .post("/decline/:call_id", async ({ params }) => {
-    const [call_info] = await db.select().from(call_model).where(eq(call_model.id, Number(params.call_id))).limit(1);
-    await CallService.decline_call(Number(params.call_id), call_info.callee_id);
+  .post("/decline/:call_id", async ({ set, params }) => {
+    try {
+      const callId = Number(params.call_id);
+      
+      // Get call info from database
+      const [call_info] = await db.select().from(call_model).where(eq(call_model.id, callId)).limit(1);
+      
+      if (!call_info) {
+        set.status = 404;
+        return {
+          success: false,
+          message: "Call not found"
+        };
+      }
 
+      // Decline the call
+      await CallService.decline_call(callId, call_info.callee_id);
+
+      set.status = 200;
+      return {
+        success: true,
+        message: "Call declined successfully"
+      };
+    } catch (error) {
+      console.error('[UNPROTECTED CALL ROUTES] Error declining call:', error);
+      set.status = 500;
+      return {
+        success: false,
+        message: "Internal server error"
+      };
+    }
   })
 
   .get("/status/:call_id", async ({ set, params }) => {

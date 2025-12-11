@@ -9,7 +9,7 @@ import media_routes from "./routes/media.routes";
 import community_routes from "./routes/community.routes";
 import call_routes from "./routes/call.routes";
 import admin_routes from "./routes/admin.routes";
-// import unprotected_call_routes from "./routes/unprotected-calls.routes";
+import unprotected_call_routes from "./routes/unprotected-calls.routes";
 import web_socket_server from "./sockets/socket.server";
 import { parse_phone } from "./utils/general.utils";
 
@@ -52,7 +52,7 @@ const app = new Elysia({ prefix: "/api" })
   .use(community_routes)
   .use(call_routes)
   .use(admin_routes)
-  // .use(unprotected_call_routes)
+  .use(unprotected_call_routes)
   // .use(web_socket)
   .use(web_socket_server)
   .listen(SERVER_PORT);
