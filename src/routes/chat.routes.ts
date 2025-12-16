@@ -86,7 +86,12 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   })
 
   .post("/add-members", async ({ set, store, body }) => {
-    const member_result = await add_new_member(body.conversation_id, body.user_ids, body.role);
+    const member_result = await add_new_member(
+      body.conversation_id,
+      body.user_ids,
+      body.role,
+      store.id,
+    );
     set.status = member_result.code;
     return member_result;
   }, {
@@ -98,7 +103,11 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   })
 
   .delete("/remove-member", async ({ set, store, body }) => {
-    const member_result = await remove_member(body.conversation_id, body.user_id);
+    const member_result = await remove_member(
+      body.conversation_id,
+      body.user_id,
+      store.id,
+    );
     set.status = member_result.code;
     return member_result;
   }, {
@@ -109,7 +118,11 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   })
 
   .post("/promote-to-admin", async ({ set, store, body }) => {
-    const promotion_result = await promote_to_admin(body.conversation_id, body.user_id);
+    const promotion_result = await promote_to_admin(
+      body.conversation_id,
+      body.user_id,
+      store.id,
+    );
     set.status = promotion_result.code;
     return promotion_result;
   }, {
@@ -120,7 +133,11 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   })
 
   .post("/demote-to-member", async ({ set, store, body }) => {
-    const promotion_result = await demote_to_member(body.conversation_id, body.user_id);
+    const promotion_result = await demote_to_member(
+      body.conversation_id,
+      body.user_id,
+      store.id,
+    );
     set.status = promotion_result.code;
     return promotion_result;
   }, {

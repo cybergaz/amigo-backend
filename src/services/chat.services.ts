@@ -17,11 +17,68 @@ import { create_dm_key, create_unique_id } from "@/utils/general.utils";
 import { and, arrayContains, asc, desc, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
 import { redis } from "@/config/redis";
 import { broadcast_message } from "@/sockets/socket.handlers";
-import { DeleteMessagePayload, NewConversationPayload, MembersType } from "@/types/socket.types";
+import { ConversationActionPayload, DeleteMessagePayload, NewConversationPayload, MembersType } from "@/types/socket.types";
 import { socket_connections } from "@/sockets/socket.server";
 import { get_user_details } from "./user.services";
 import { get_conversation_members } from "@/sockets/socket.cache";
 import { status } from "elysia";
+
+const build_conversation_action_message = (
+  action: ConversationActionPayload["action"],
+  members: MembersType[],
+) => {
+  const names = members.map((m) => m.user_name).filter(Boolean);
+  const target = names.length ? names.join(", ") : "Member";
+
+  switch (action) {
+    case "member_added":
+      return `${target} added`;
+    case "member_removed":
+      return `${target} removed`;
+    case "member_promoted":
+      return `${target} promoted to admin`;
+    case "member_demoted":
+      return `${target} demoted to member`;
+    default:
+      return target;
+  }
+};
+
+const broadcast_conversation_action = async (data: {
+  conv_id: number;
+  conv_type: ChatType;
+  action: ConversationActionPayload["action"];
+  members: MembersType[];
+  actor_id?: number;
+  actor_name?: string;
+  actor_pfp?: string;
+}) => {
+  if (!data.members.length) return;
+
+  const action_at = new Date();
+  const payload: ConversationActionPayload = {
+    event_id: create_unique_id(),
+    conv_id: data.conv_id,
+    conv_type: data.conv_type,
+    action: data.action,
+    members: data.members,
+    actor_id: data.actor_id,
+    actor_name: data.actor_name,
+    actor_pfp: data.actor_pfp,
+    message: build_conversation_action_message(data.action, data.members),
+    action_at,
+  };
+
+  await broadcast_message({
+    to: "conversation",
+    conv_id: data.conv_id,
+    message: {
+      type: "conversation:action",
+      payload,
+      ws_timestamp: action_at,
+    },
+  });
+};
 
 const create_chat = async (sender_id: number, receiver_id: number) => {
   try {
@@ -640,7 +697,8 @@ const get_group_members = async (conversation_id: number) => {
 const add_new_member = async (
   conversation_id: number,
   user_ids: number[],
-  role: ChatRoleType = "member"
+  role: ChatRoleType = "member",
+  actor_id?: number,
 ) => {
   try {
     // 1. Filter valid users
@@ -716,6 +774,16 @@ const add_new_member = async (
       .where(eq(conversation_model.id, conversation_id))
       .limit(1);
 
+    if (!conv_details) {
+      return {
+        success: false,
+        code: 404,
+        message: "Conversation not found",
+      };
+    }
+
+    const actor_details = actor_id ? await get_user_details(actor_id) : null;
+
     const creater_info = await get_user_details(conv_details.creater_id);
     const members_res = await get_group_members(conversation_id);
     const members = members_res.success ? members_res.data : [];
@@ -749,6 +817,42 @@ const add_new_member = async (
         ws_timestamp: new Date()
       },
     })
+    if (eligibleIds.length > 0) {
+      const users_meta = await db
+        .select({
+          id: user_model.id,
+          name: user_model.name,
+          profile_pic: user_model.profile_pic,
+        })
+        .from(user_model)
+        .where(inArray(user_model.id, eligibleIds));
+
+      const members_for_action: MembersType[] = eligibleIds.map((id) => {
+        const meta = users_meta.find((m) => m.id === id);
+        const memberRow = inserted.find((row) => row.user_id === id);
+        const joinedAt = memberRow?.joined_at
+          ? new Date(memberRow.joined_at)
+          : new Date();
+
+        return {
+          user_id: id,
+          user_name: meta?.name || "Member",
+          user_pfp: meta?.profile_pic || undefined,
+          role: (memberRow?.role as ChatRoleType) || role,
+          joined_at: joinedAt,
+        };
+      });
+
+      await broadcast_conversation_action({
+        conv_id: conversation_id,
+        conv_type: (conv_details.type as ChatType) || "group",
+        action: "member_added",
+        members: members_for_action,
+        actor_id,
+        actor_name: actor_details?.data?.name,
+        actor_pfp: actor_details?.data?.profile_pic || undefined,
+      });
+    }
     // if (conversationData) {
     //   await send_to_user(memberId, {
     //     type: 'conversation_added',
@@ -787,9 +891,38 @@ const add_new_member = async (
 
 const remove_member = async (
   conversation_id: number,
-  user_id: number
+  user_id: number,
+  actor_id?: number,
 ) => {
   try {
+    const [conversation] = await db
+      .select({ type: conversation_model.type })
+      .from(conversation_model)
+      .where(eq(conversation_model.id, conversation_id))
+      .limit(1);
+
+    const member_info = await db
+      .select({
+        user_id: conversation_member_model.user_id,
+        role: conversation_member_model.role,
+        joined_at: conversation_member_model.joined_at,
+        user_name: user_model.name,
+        user_pfp: user_model.profile_pic,
+      })
+      .from(conversation_member_model)
+      .innerJoin(
+        user_model,
+        eq(user_model.id, conversation_member_model.user_id)
+      )
+      .where(
+        and(
+          eq(conversation_member_model.conversation_id, conversation_id),
+          eq(conversation_member_model.user_id, user_id)
+        )
+      );
+
+    const actor_details = actor_id ? await get_user_details(actor_id) : null;
+
     const result = await db
       .delete(conversation_member_model)
       .where(
@@ -816,6 +949,26 @@ const remove_member = async (
     // Invalidate conversation lru cache in other services
     await redis.publish("conv:invalidate", conversation_id.toString());
 
+    if (member_info.length) {
+      const members_for_action: MembersType[] = member_info.map((m) => ({
+        user_id: m.user_id,
+        user_name: m.user_name || "Member",
+        user_pfp: m.user_pfp || undefined,
+        role: m.role as ChatRoleType,
+        joined_at: m.joined_at ? new Date(m.joined_at) : new Date(),
+      }));
+
+      await broadcast_conversation_action({
+        conv_id: conversation_id,
+        conv_type: (conversation?.type as ChatType) || "group",
+        action: "member_removed",
+        members: members_for_action,
+        actor_id,
+        actor_name: actor_details?.data?.name,
+        actor_pfp: actor_details?.data?.profile_pic || undefined,
+      });
+    }
+
     return {
       success: true,
       code: 200,
@@ -836,8 +989,18 @@ const remove_member = async (
 const promote_to_admin = async (
   conversation_id: number,
   user_id: number,
+  actor_id?: number,
 ) => {
   try {
+    const [conversation] = await db
+      .select({ type: conversation_model.type })
+      .from(conversation_model)
+      .where(eq(conversation_model.id, conversation_id))
+      .limit(1);
+
+    const actor_details = actor_id ? await get_user_details(actor_id) : null;
+    const target_user_details = await get_user_details(user_id);
+
     const [member] = await db
       .update(conversation_member_model)
       .set({ role: "admin" })
@@ -857,6 +1020,26 @@ const promote_to_admin = async (
       };
     }
 
+    const members_for_action: MembersType[] = [
+      {
+        user_id: user_id,
+        user_name: target_user_details.data?.name || "Member",
+        user_pfp: target_user_details.data?.profile_pic || undefined,
+        role: "admin",
+        joined_at: member.joined_at ? new Date(member.joined_at) : new Date(),
+      },
+    ];
+
+    await broadcast_conversation_action({
+      conv_id: conversation_id,
+      conv_type: (conversation?.type as ChatType) || "group",
+      action: "member_promoted",
+      members: members_for_action,
+      actor_id,
+      actor_name: actor_details?.data?.name,
+      actor_pfp: actor_details?.data?.profile_pic || undefined,
+    });
+
     return {
       success: true,
       code: 200,
@@ -875,8 +1058,18 @@ const promote_to_admin = async (
 const demote_to_member = async (
   conversation_id: number,
   user_id: number,
+  actor_id?: number,
 ) => {
   try {
+    const [conversation] = await db
+      .select({ type: conversation_model.type })
+      .from(conversation_model)
+      .where(eq(conversation_model.id, conversation_id))
+      .limit(1);
+
+    const actor_details = actor_id ? await get_user_details(actor_id) : null;
+    const target_user_details = await get_user_details(user_id);
+
     const [member] = await db
       .update(conversation_member_model)
       .set({ role: "member" })
@@ -895,6 +1088,26 @@ const demote_to_member = async (
         message: "Member not found in the conversation",
       };
     }
+
+    const members_for_action: MembersType[] = [
+      {
+        user_id: user_id,
+        user_name: target_user_details.data?.name || "Member",
+        user_pfp: target_user_details.data?.profile_pic || undefined,
+        role: "member",
+        joined_at: member.joined_at ? new Date(member.joined_at) : new Date(),
+      },
+    ];
+
+    await broadcast_conversation_action({
+      conv_id: conversation_id,
+      conv_type: (conversation?.type as ChatType) || "group",
+      action: "member_demoted",
+      members: members_for_action,
+      actor_id,
+      actor_name: actor_details?.data?.name,
+      actor_pfp: actor_details?.data?.profile_pic || undefined,
+    });
 
     return {
       success: true,

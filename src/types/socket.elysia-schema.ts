@@ -144,6 +144,25 @@ const MessageForwardPayloadSchema = t.Object({
   target_conv_ids: t.Array(t.Number()),
 });
 
+// ConversationActionPayload schema
+const ConversationActionPayloadSchema = t.Object({
+  event_id: t.Number(),
+  conv_id: t.Number(),
+  conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
+  action: t.Enum({
+    member_added: "member_added",
+    member_removed: "member_removed",
+    member_promoted: "member_promoted",
+    member_demoted: "member_demoted",
+  }),
+  members: t.Array(MembersTypeSchema),
+  actor_id: t.Optional(t.Number()),
+  actor_name: t.Optional(t.String()),
+  actor_pfp: t.Optional(t.String()),
+  message: t.String(),
+  action_at: t.Date(),
+});
+
 // Union schema for payload
 const WSPayloadSchema = t.Union([
   ConnectionStatusPayloadSchema,
@@ -157,6 +176,7 @@ const WSPayloadSchema = t.Union([
   NewConversationPayloadSchema,
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
+  ConversationActionPayloadSchema,
 ]);
 
 // WSMessage schema
@@ -179,6 +199,7 @@ export {
   CallPayloadSchema,
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
+  ConversationActionPayloadSchema,
   WSPayloadSchema,
   WSMessageSchema,
 };

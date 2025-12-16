@@ -29,6 +29,7 @@ type WSMessage = {
   | MessageForwardPayload
   | CallPayload
   | MiscPayload
+  | ConversationActionPayload
   // | WSPayload
   ws_timestamp?: Date
 }
@@ -150,10 +151,29 @@ type CallPayload = {
 }
 
 type MiscPayload = {
-  message: string
+  message?: string
   data?: any
   code?: number
   error?: any
+}
+
+type ConversationActionType =
+  | 'member_added'
+  | 'member_removed'
+  | 'member_promoted'
+  | 'member_demoted';
+
+type ConversationActionPayload = {
+  event_id: number
+  conv_id: number
+  conv_type: ChatType
+  action: ConversationActionType
+  members: MembersType[]
+  actor_id?: number
+  actor_name?: string
+  actor_pfp?: string
+  message: string
+  action_at: Date
 }
 
 const WS_MESSAGE_TYPE_CONST = [
@@ -162,6 +182,7 @@ const WS_MESSAGE_TYPE_CONST = [
   'conversation:leave',
   'conversation:new',
   'conversation:typing',
+  'conversation:action',
   'message:new',
   'message:ack',
   'message:pin',
@@ -205,4 +226,5 @@ export type {
   MessageForwardPayload,
   CallPayload,
   ConnectionStatusType,
+  ConversationActionPayload,
 };
