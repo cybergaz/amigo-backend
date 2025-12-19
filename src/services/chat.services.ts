@@ -894,7 +894,7 @@ const remove_member = async (
   user_id: number,
   actor_id?: number,
 ) => {
-  try {
+ try {
     const [conversation] = await db
       .select({ type: conversation_model.type })
       .from(conversation_model)
@@ -943,7 +943,7 @@ const remove_member = async (
     }
 
     // Update redis set
-    const redis_key = `chat:${conversation_id}:members`;
+    const redis_key = `conv:${conversation_id}:members`;
     await redis.srem(redis_key, user_id.toString());
 
     // Invalidate conversation lru cache in other services

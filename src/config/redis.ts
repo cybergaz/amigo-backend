@@ -23,6 +23,19 @@ const redis_ping = async () => {
   }
 }
 
+async function cleanRedis() {
+  try {
+    const result = await redis.flushall();
+    console.log("Redis cleared:", result); // Should output "OK"
+  } catch (error) {
+    console.error("Error clearing Redis:", error);
+  } finally {
+    process.exit();
+  }
+}
+
+
+
 redis_ping()
 
-export { redis, redis_ping, get_new_redis_client }
+export { redis, redis_ping, get_new_redis_client, cleanRedis }
