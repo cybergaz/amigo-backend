@@ -911,10 +911,22 @@ const web_socket_server = new Elysia()
                 })
 
                 // Send push notification to the other party
+                // Get caller name for notification
+                const [caller_user] = await db
+                  .select({ name: user_model.name })
+                  .from(user_model)
+                  .where(eq(user_model.id, caller_id))
+                  .limit(1);
+                
                 await FCMService.sendNotificationToUser(other_user, {
                   title: "Call Ended",
                   body: is_caller_declining ? `Caller cancelled the call` : `Call was declined`,
                   type: 'call_end',
+                  data: {
+                    callId: payload.call_id.toString(),
+                    callerId: caller_id.toString(),
+                    callerName: caller_user?.name || 'Unknown',
+                  },
                 })
               } else {
                 // Send error back to the user
@@ -989,6 +1001,25 @@ const web_socket_server = new Elysia()
                           duration: result.data?.duration_seconds
                         },
                       },
+                    },
+                  })
+
+                  // Send FCM notification to the other party (important when app is terminated)
+                  // Get caller name for notification
+                  const [caller_user] = await db
+                    .select({ name: user_model.name })
+                    .from(user_model)
+                    .where(eq(user_model.id, active_call.caller_id))
+                    .limit(1);
+                  
+                  await FCMService.sendNotificationToUser(other_user, {
+                    title: "Call Ended",
+                    body: `Call ended`,
+                    type: 'call_end',
+                    data: {
+                      callId: payload.call_id.toString(),
+                      callerId: active_call.caller_id.toString(),
+                      callerName: caller_user?.name || 'Unknown',
                     },
                   })
 
