@@ -6,6 +6,8 @@ import {
   generate_refresh_jwt,
 } from "@/utils/general.utils";
 import { eq } from "drizzle-orm";
+import { socket_connections } from "@/sockets/socket.server";
+import { MiscPayload } from "@/types/socket.types";
 
 const handle_login = async ({
   phone,
@@ -61,6 +63,9 @@ const handle_login = async ({
 
     const access_token = generate_jwt(user.id, user.role || false, "7d");
     const refresh_token = generate_refresh_jwt(user.id, user.role, "90d");
+
+    // Force logout all other devices before updating the refresh token
+    await force_logout_other_devices(user.id);
 
     await db
       .update(user_model)
@@ -180,4 +185,89 @@ const handle_refresh_token_mobile = async (token: string) => {
   }
 };
 
-export { handle_login, handle_refresh_token, handle_refresh_token_mobile };
+/**
+ * Validate if a refresh token is still valid (matches what's in the database)
+ * This is a lightweight check to verify if the token was invalidated by a new login
+ */
+const validate_refresh_token = async (token: string) => {
+  try {
+    const [user] = await db
+      .select({ id: user_model.id })
+      .from(user_model)
+      .where(eq(user_model.refresh_token, token))
+      .limit(1);
+
+    if (!user) {
+      return {
+        success: false,
+        code: 404,
+        message: "Invalid refresh token",
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Refresh token is valid",
+    };
+  } catch (error: any) {
+    console.error("Token validation error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Internal server error during token validation",
+    };
+  }
+};
+
+/**
+ * Force logout all other devices when a user logs in on a new device
+ * This sends a WebSocket message to all active connections for the user
+ * and closes those connections
+ */
+const force_logout_other_devices = async (user_id: number): Promise<void> => {
+  try {
+    const connection = socket_connections.get(user_id);
+    
+    if (connection && connection.ws.readyState === 1) {
+      // Send force logout message to the existing connection
+      const force_logout_message = {
+        type: 'auth:force_logout' as const,
+        payload: {
+          message: 'You have been logged out because you logged in on another device',
+          code: 401,
+        } as MiscPayload,
+        ws_timestamp: new Date(),
+      };
+
+      try {
+        connection.ws.send(force_logout_message, true);
+        console.log(`[AUTH] Sent force logout message to user ${user_id}`);
+        
+        // Close the WebSocket connection after a short delay to allow message delivery
+        setTimeout(() => {
+          if (connection.ws.readyState === 1) {
+            connection.ws.close(4003, "Logged out due to new login on another device");
+            socket_connections.delete(user_id);
+            console.log(`[AUTH] Closed WebSocket connection for user ${user_id}`);
+          }
+        }, 100);
+      } catch (error) {
+        console.error(`[AUTH] Error sending force logout to user ${user_id}:`, error);
+        // Still try to close the connection
+        try {
+          if (connection.ws.readyState === 1) {
+            connection.ws.close(4003, "Logged out due to new login on another device");
+          }
+          socket_connections.delete(user_id);
+        } catch (closeError) {
+          console.error(`[AUTH] Error closing connection for user ${user_id}:`, closeError);
+        }
+      }
+    }
+  } catch (error) {
+    console.error(`[AUTH] Error in force_logout_other_devices for user ${user_id}:`, error);
+  }
+};
+
+export { handle_login, handle_refresh_token, handle_refresh_token_mobile, force_logout_other_devices, validate_refresh_token };

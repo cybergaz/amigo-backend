@@ -201,6 +201,7 @@ const WS_MESSAGE_TYPE_CONST = [
   'call:error',
   'socket:health_check',
   'socket:error',
+  'auth:force_logout',
   'ping',
   'pong'
 ] as const;

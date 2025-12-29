@@ -27,6 +27,8 @@ export const authenticate_jwt = (token: string) => {
 
 export const app_middleware = ({ cookie, headers, allowed }: ElysiaMiddlewareType) => {
   let access_token = String(cookie.access_token) || String(headers["authorization"]?.replace("Bearer ", "") ?? "");
+  // console.log("cookie refresh:", cookie.refresh_token.value);
+  // console.log("cookie access:", cookie.access_token.value);
 
   if (!access_token) {
     return {
