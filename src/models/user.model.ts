@@ -1,6 +1,6 @@
-import { pgTable, serial, text, timestamp, pgEnum, bigint, char, varchar, boolean, jsonb, } from "drizzle-orm/pg-core";
+import { pgTable, serial, text, timestamp, pgEnum, bigint, char, varchar, boolean, jsonb, bigserial, } from "drizzle-orm/pg-core";
 import { InferInsertModel, InferSelectModel } from "drizzle-orm";
-import { ROLE_CONST } from "@/types/user.types";
+import { ROLE_CONST, REQUEST_STATUS_CONST } from "@/types/user.types";
 import { CONNECTION_STATUS_CONST } from "@/types/socket.types";
 
 const user_model = pgTable("users", {
@@ -24,9 +24,23 @@ const user_model = pgTable("users", {
   app_version: char({ length: 10 }), // To track the app version the user is on
 });
 
+const signup_request_model = pgTable("signup_requests", {
+  id: bigserial({ mode: "number" }).primaryKey(),
+  first_name: varchar({ length: 50 }).notNull(),
+  last_name: varchar({ length: 50 }).notNull(),
+  phone: varchar({ length: 20 }).unique().notNull(),
+  status: varchar({ enum: REQUEST_STATUS_CONST }).default("pending").notNull(),
+  rejected_reason: text(),
+  created_at: timestamp({ withTimezone: true }).defaultNow(),
+});
+
+type SignupRequestType = InferSelectModel<typeof signup_request_model>;
+type InsertSignupRequestType = InferInsertModel<typeof signup_request_model>;
+type UpdateSignupRequestType = Partial<InsertSignupRequestType>;
+
 type UserType = InferSelectModel<typeof user_model>;
 type InsertUserType = InferInsertModel<typeof user_model>;
 type UpdateUserType = Partial<InsertUserType>;
 
-export { user_model };
-export type { UserType, InsertUserType, UpdateUserType };
+export { user_model, signup_request_model };
+export type { UserType, InsertUserType, UpdateUserType, SignupRequestType, InsertSignupRequestType, UpdateSignupRequestType };

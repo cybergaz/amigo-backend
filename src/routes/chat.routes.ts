@@ -15,6 +15,7 @@ import {
   hard_delete_chat,
   soft_delete_chat,
   soft_delete_message,
+  delete_message_for_me,
   revive_chat,
   dm_delete_status
 } from "@/services/chat.services";
@@ -227,13 +228,32 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   })
 
   .delete("/soft-delete-message", async ({ set, store, body }) => {
-    const delete_result = await soft_delete_message(body.message_ids, store.id, body.is_admin_or_staff || false);
+    const delete_result = await soft_delete_message(
+      body.message_ids, 
+      store.id, 
+      body.is_admin_or_staff ?? false
+    );
     set.status = delete_result.code;
     return delete_result;
   }, {
     body: t.Object({
       message_ids: t.Array(t.Number()),
       is_admin_or_staff: t.Optional(t.Boolean())
+    })
+  })
+
+  .delete("/delete-message-for-me", async ({ set, store, body }) => {
+    const delete_result = await delete_message_for_me(
+      body.message_ids,
+      store.id,
+      body.conversation_id
+    );
+    set.status = delete_result.code;
+    return delete_result;
+  }, {
+    body: t.Object({
+      message_ids: t.Array(t.Number()),
+      conversation_id: t.Number()
     })
   })
 

@@ -1,13 +1,15 @@
-import { user_model } from "@/models/user.model";
+import { signup_request_model, UpdateSignupRequestType, user_model } from "@/models/user.model";
 import db from "@/config/db";
 import {
   compare_password,
   generate_jwt,
   generate_refresh_jwt,
 } from "@/utils/general.utils";
-import { eq } from "drizzle-orm";
+import { eq, desc } from "drizzle-orm";
 import { socket_connections } from "@/sockets/socket.server";
 import { MiscPayload } from "@/types/socket.types";
+import { RequestStatusType } from "@/types/user.types";
+import { create_user } from "./user.services";
 
 const handle_login = async ({
   phone,
@@ -228,7 +230,7 @@ const validate_refresh_token = async (token: string) => {
 const force_logout_other_devices = async (user_id: number): Promise<void> => {
   try {
     const connection = socket_connections.get(user_id);
-    
+
     if (connection && connection.ws.readyState === 1) {
       // Send force logout message to the existing connection
       const force_logout_message = {
@@ -243,7 +245,7 @@ const force_logout_other_devices = async (user_id: number): Promise<void> => {
       try {
         connection.ws.send(force_logout_message, true);
         console.log(`[AUTH] Sent force logout message to user ${user_id}`);
-        
+
         // Close the WebSocket connection after a short delay to allow message delivery
         setTimeout(() => {
           if (connection.ws.readyState === 1) {
@@ -270,4 +272,131 @@ const force_logout_other_devices = async (user_id: number): Promise<void> => {
   }
 };
 
-export { handle_login, handle_refresh_token, handle_refresh_token_mobile, force_logout_other_devices, validate_refresh_token };
+const create_signup_request = async ({ first_name, last_name, phone }: { first_name: string; last_name: string; phone: string }) => {
+  try {
+    const signup_request = await db.insert(signup_request_model).values({ first_name, last_name, phone }).returning();
+    if (!signup_request) {
+      return { success: false, code: 404, message: "Signup request not created" };
+    }
+    return {
+      success: true,
+      code: 200,
+      message: "Signup request created successfully",
+      data: signup_request,
+    };
+  } catch (error) {
+    console.error("Signup request error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Internal server error during signup request"
+    };
+  }
+};
+
+const get_signup_request_status = async (phone: string) => {
+  try {
+    const signup_request = await db
+      .select()
+      .from(signup_request_model)
+      .where(eq(signup_request_model.phone, phone))
+      .limit(1);
+
+    if (!signup_request || signup_request.length === 0) {
+      return {
+        success: false,
+        code: 404,
+        message: "Signup request not found for this phone number"
+      };
+    }
+    return {
+      success: true,
+      code: 200,
+      message: "Signup request status fetched successfully",
+      data: signup_request[0]
+    };
+  } catch (error) {
+    console.error("Signup request status error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Internal server error during signup request status"
+    };
+  }
+};
+
+const get_all_signup_requests = async () => {
+  try {
+    const signup_requests = await db
+      .select()
+      .from(signup_request_model)
+      .orderBy(desc(signup_request_model.created_at));
+
+    return {
+      success: true,
+      code: 200,
+      message: "Signup requests fetched successfully",
+      data: signup_requests
+    };
+  } catch (error) {
+    console.error("Get all signup requests error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Internal server error during fetching signup requests"
+    };
+  }
+};
+
+const update_signup_request_status = async (payload: UpdateSignupRequestType) => {
+  try {
+
+    const signup_request = await db
+      .update(signup_request_model)
+      .set(payload)
+      .where(eq(signup_request_model.phone, payload.phone!))
+      .returning();
+
+      
+
+    if (!signup_request) {
+      return { success: false, code: 404, message: "Signup request not updated" };
+    }
+
+    // Only create user if status is accepted
+    if (payload.status === "accepted") {
+      const create_user_res = await create_user({
+        name: signup_request[0].first_name + " " + signup_request[0].last_name,
+        password: null,
+        role: "user",
+        phone: signup_request[0].phone,
+      });
+      
+      if (!create_user_res?.success) {
+        return { success: false, code: create_user_res.code, message: create_user_res.message };
+      }
+    }
+    
+    return {
+      success: true,
+      code: 200,
+      message: "Signup request status updated successfully",
+      data: signup_request[0]
+    };
+  } catch (error) {
+    console.error("Signup request status update error:", error);
+    return { success: false, code: 500, message: "Internal server error during signup request status update" };
+  }
+};
+
+export {
+  handle_login,
+  handle_refresh_token,
+  handle_refresh_token_mobile,
+  force_logout_other_devices,
+  validate_refresh_token,
+  create_signup_request,
+  get_signup_request_status,
+  get_all_signup_requests,
+  update_signup_request_status
+};

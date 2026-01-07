@@ -29,8 +29,8 @@ const generate_otp = async (phone: string) => {
     // -----------------------------------------------------------
     // Generate OTP using Nanoid
     // -----------------------------------------------------------
-    // const otp = create_otp();
-    const otp = 123456
+    const otp = create_otp();
+    // const otp = 123456
 
     // -----------------------------------------------------------
     // Send OTP via JaipurSMS API

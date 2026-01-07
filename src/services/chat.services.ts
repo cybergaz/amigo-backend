@@ -14,7 +14,7 @@ import {
   ConversationMetadata,
 } from "@/types/chat.types";
 import { create_dm_key, create_unique_id } from "@/utils/general.utils";
-import { and, arrayContains, asc, desc, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
+import { and, arrayContains, asc, desc, eq, gt, inArray, isNotNull, ne, not, or, sql } from "drizzle-orm";
 import { redis } from "@/config/redis";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { ConversationActionPayload, DeleteMessagePayload, NewConversationPayload, MembersType } from "@/types/socket.types";
@@ -1462,6 +1462,118 @@ const soft_delete_message = async (message_ids: number[], user_id: number, is_ad
   }
 };
 
+const delete_message_for_me = async (
+  message_ids: number[],
+  user_id: number,
+  conversation_id: number
+) => {
+  try {
+    // Verify user is a member of the conversation
+    const membership = await db
+      .select()
+      .from(conversation_member_model)
+      .where(
+        and(
+          eq(conversation_member_model.conversation_id, conversation_id),
+          eq(conversation_member_model.user_id, user_id),
+          eq(conversation_member_model.deleted, false)
+        )
+      )
+      .limit(1);
+
+    if (membership.length === 0) {
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
+
+    // Verify messages exist and belong to this conversation
+    const messages = await db
+      .select({
+        id: message_model.id,
+        conversation_id: message_model.conversation_id,
+      })
+      .from(message_model)
+      .where(
+        and(
+          inArray(message_model.id, message_ids),
+          eq(message_model.conversation_id, conversation_id)
+        )
+      );
+
+    if (messages.length === 0) {
+      return {
+        success: false,
+        code: 404,
+        message: "Messages not found",
+      };
+    }
+
+    // Update or insert message_status with deleted_at timestamp
+    // First, try to update existing records
+    const updatedStatuses = await db
+      .update(message_status_model)
+      .set({
+        deleted_at: new Date(),
+        updated_at: new Date(),
+      })
+      .where(
+        and(
+          inArray(message_status_model.message_id, message_ids),
+          eq(message_status_model.user_id, user_id),
+          eq(message_status_model.conv_id, conversation_id)
+        )
+      )
+      .returning();
+
+    // For messages without existing status records, insert new ones
+    const existingMessageIds = updatedStatuses.map(s => s.message_id);
+    const messagesToInsert = messages.filter(
+      m => !existingMessageIds.includes(m.id)
+    );
+
+    if (messagesToInsert.length > 0) {
+      await db
+        .insert(message_status_model)
+        .values(
+          messagesToInsert.map(msg => ({
+            message_id: msg.id,
+            user_id: user_id,
+            conv_id: conversation_id,
+            deleted_at: new Date(),
+          }))
+        )
+        .onConflictDoUpdate({
+          target: [
+            message_status_model.message_id,
+            message_status_model.user_id
+          ],
+          set: {
+            deleted_at: new Date(),
+            updated_at: new Date(),
+          }
+        });
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Messages deleted for you",
+      data: { deleted_count: messages.length }
+    };
+
+  } catch (error) {
+    console.error("delete_message_for_me error", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: delete_message_for_me",
+    };
+  }
+};
+
 const hard_delete_message = async (message_id: number) => {
   try {
     // Check if user is super admin (this should be verified at route level)
@@ -1555,7 +1667,21 @@ const get_conversation_history = async (
     // Calculate offset for pagination
     const offset = (page - 1) * limit;
 
-    // Get messages with sender information
+    // Get message IDs deleted by this user (delete for me)
+    const userDeletedMessages = await db
+      .select({ message_id: message_status_model.message_id })
+      .from(message_status_model)
+      .where(
+        and(
+          eq(message_status_model.user_id, user_id),
+          eq(message_status_model.conv_id, conversation_id),
+          isNotNull(message_status_model.deleted_at)
+        )
+      );
+
+    const deletedMessageIds = userDeletedMessages.map(d => d.message_id);
+
+    // Get messages with sender information, excluding messages deleted for this user
     const messages = await db
       .select({
         id: message_model.id,
@@ -1587,15 +1713,12 @@ const get_conversation_history = async (
             eq(message_model.conversation_id, conversation_id),
             arrayContains(message_model.forwarded_to, [conversation_id]),
           ),
-          or(
-            // and(
-            //   eq(message_model.sender_id, user_id),
-            //   eq(message_model.deleted, false)
-            // ),
-            // ne(message_model.sender_id, user_id),
-            eq(message_model.deleted, false),
-            // user_details.user_role === "admin" || user_details.user_role === "staff" ? undefined : eq(message_model.deleted, false)
-          ),
+          // Exclude messages deleted for everyone
+          eq(message_model.deleted, false),
+          // Exclude messages deleted for this specific user (delete for me)
+          deletedMessageIds.length > 0 
+            ? not(inArray(message_model.id, deletedMessageIds))
+            : undefined,
           user_details.joining_date ? gt(message_model.created_at, user_details.joining_date) : undefined
         )
       )
@@ -1603,14 +1726,17 @@ const get_conversation_history = async (
       .limit(limit)
       .offset(offset);
 
-    // Get total count for pagination info
+    // Get total count for pagination info (excluding messages deleted for this user)
     const totalCountResult = await db
       .select({ count: sql<number>`count(*)` })
       .from(message_model)
       .where(
         and(
           eq(message_model.conversation_id, conversation_id),
-          eq(message_model.deleted, false)
+          eq(message_model.deleted, false),
+          deletedMessageIds.length > 0 
+            ? not(inArray(message_model.id, deletedMessageIds))
+            : undefined
         )
       );
 
@@ -2291,6 +2417,7 @@ export {
   revive_chat,
   dm_delete_status,
   soft_delete_message,
+  delete_message_for_me,
   hard_delete_message,
   get_conversation_history,
   get_message_statuses,

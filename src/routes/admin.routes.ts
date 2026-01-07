@@ -7,9 +7,10 @@ import db from "@/config/db";
 import { user_model } from "@/models/user.model";
 import { conversation_model } from "@/models/chat.model";
 import { create_unique_id } from "@/utils/general.utils";
-import { RoleType } from "@/types/user.types";
+import { REQUEST_STATUS_CONST, RoleType } from "@/types/user.types";
 import { eq, sql } from "drizzle-orm";
 import { community_model } from "@/models/community.model";
+import { update_signup_request_status, get_all_signup_requests } from "@/services/auth.service";
 
 const admin_routes = new Elysia({ prefix: "/admin" })
   // unauthorized route to create a super admin if none exists
@@ -783,6 +784,26 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     body: t.Object({
       conversation_id: t.Number(),
       member_id: t.Number()
+    })
+  })
+
+  .get("/auth-management/signup-requests", async ({ set }) => {
+    const signup_requests_result = await get_all_signup_requests();
+    set.status = signup_requests_result.code;
+    return signup_requests_result;
+  })
+
+  .post("/auth-management/approve-signup-request", async ({ set, body }) => {
+    const approve_signup_request_result = await update_signup_request_status(body);
+    set.status = approve_signup_request_result.code;
+    return approve_signup_request_result;
+  }, {
+    body: t.Object({
+      phone: t.String(),
+      first_name: t.String(),
+      last_name: t.String(),
+      status: t.Optional(t.Enum(Object.fromEntries(REQUEST_STATUS_CONST.map(x => [x, x])))),
+      rejected_reason: t.Optional(t.String()),
     })
   })
 

@@ -54,6 +54,7 @@ const message_status_model = pgTable("message_status", {
   conv_id: bigint({ mode: "number" }).references(() => conversation_model.id, { onDelete: "cascade" }).notNull(),
   delivered_at: timestamp({ withTimezone: true }),  // when message delivered to this user
   read_at: timestamp({ withTimezone: true }),       // when user read it
+  deleted_at: timestamp({ withTimezone: true }),    // when user deleted this message (delete for me)
   updated_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
 },
   (table) => [uniqueIndex("unique_user_message").on(table.message_id, table.user_id),]

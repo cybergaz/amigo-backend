@@ -1,7 +1,7 @@
 import db from "@/config/db";
 import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
-import { handle_login, handle_refresh_token, handle_refresh_token_mobile, validate_refresh_token } from "@/services/auth.service";
+import { create_signup_request, get_signup_request_status, handle_login, handle_refresh_token, handle_refresh_token_mobile, validate_refresh_token } from "@/services/auth.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
@@ -133,7 +133,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       cookie["access_token"].set({
         value: create_user_res.data.access_token,
         ...cookieConfig,
-        maxAge: 60 * 15
+        maxAge: 60 * 60 * 24,
       });
       console.log(
         `[SERVER]   Set Tokens to Cookies (${isMobileApp(userAgent) ? 'Mobile' : 'Web'}) : ${new Date().toLocaleString()}`
@@ -143,6 +143,38 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     return create_user_res;
   },
     { body: VerifySignupSchema }
+  )
+
+  .post("/request-signup", async ({ body, set }) => {
+    const { first_name, last_name, phone } = body;
+
+    const signup_request_res = await create_signup_request({ first_name, last_name, phone });
+    if (!signup_request_res?.success) {
+      set.status = signup_request_res?.code;
+      return signup_request_res;
+    }
+    set.status = signup_request_res.code;
+    return signup_request_res;
+  },
+    { body: t.Object({
+      first_name: t.String(),
+      last_name: t.String(),
+      phone: t.String(),
+    }),
+    }
+  )
+
+  .get('/signup-request-status/:phone', async ({ set, params }) => {
+
+    const signup_request_status_res = await get_signup_request_status(params.phone);
+    set.status = signup_request_status_res.code;
+    return signup_request_status_res;
+  },
+    {
+      params: t.Object({
+        phone: t.String(),
+      }),
+    }
   )
 
   .post("/verify-login-otp", async ({ body, set, cookie, headers }) => {
