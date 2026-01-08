@@ -30,6 +30,7 @@ const generate_otp = async (phone: string) => {
     // Generate OTP using Nanoid
     // -----------------------------------------------------------
     const otp = create_otp();
+    console.log(`otp for ${parsed_phone.phone}-> `, otp)
     // const otp = 123456
 
     // -----------------------------------------------------------
