@@ -156,11 +156,12 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     set.status = signup_request_res.code;
     return signup_request_res;
   },
-    { body: t.Object({
-      first_name: t.String(),
-      last_name: t.String(),
-      phone: t.String(),
-    }),
+    {
+      body: t.Object({
+        first_name: t.String(),
+        last_name: t.String(),
+        phone: t.String(),
+      }),
     }
   )
 
@@ -207,7 +208,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       cookie["access_token"].set({
         value: login_res.data.access_token,
         ...cookieConfig,
-        maxAge: 60 * 15,
+        maxAge: 60 * 60 * 24,
       });
       console.log(`[SERVER]   Set Tokens to Cookies (${isMobileApp(userAgent) ? 'Mobile' : 'Web'}) : ${new Date().toLocaleString()}`);
     }
@@ -394,7 +395,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         value: refresh_res.data.refresh_token,
         httpOnly: true,
         secure: true,
-        sameSite: "none",
+        sameSite: "none" as const,
         maxAge: 60 * 60 * 24 * 30,
         path: "/",
         ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
@@ -403,8 +404,8 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         value: refresh_res.data.access_token,
         httpOnly: true,
         secure: true,
-        sameSite: "none",
-        maxAge: 60 * 15,
+        sameSite: "none" as const,
+        maxAge: 60 * 60 * 24,
         path: "/",
         ...(COOKIE_DOMAIN && { domain: COOKIE_DOMAIN }),
       });

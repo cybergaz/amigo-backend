@@ -70,7 +70,7 @@ const generate_otp = async (phone: string) => {
     });
 
     const response_data = await response.json();
-    console.log("response_data", response_data);
+    // console.log("response_data", response_data);
 
     // Handle API response
     if (!response_data.success) {

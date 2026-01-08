@@ -193,9 +193,9 @@ const web_socket_server = new Elysia()
 
       try {
 
-        if (message.type.startsWith("call")) {
-          console.log(message)
-        }
+        // if (message.type.startsWith("call")) {
+        //   console.log(message)
+        // }
 
         // Handle incoming messages 
         switch (message.type) {
@@ -284,6 +284,7 @@ const web_socket_server = new Elysia()
             if (message.payload) {
               const payload = message.payload as ChatMessagePayload;
 
+              // store the new message in DB
               const stored_message = await store_message(payload)
               if (!stored_message?.success) break;
 
@@ -917,7 +918,7 @@ const web_socket_server = new Elysia()
                   .from(user_model)
                   .where(eq(user_model.id, caller_id))
                   .limit(1);
-                
+
                 await FCMService.sendNotificationToUser(other_user, {
                   title: "Call Ended",
                   body: is_caller_declining ? `Caller cancelled the call` : `Call was declined`,
@@ -1011,7 +1012,7 @@ const web_socket_server = new Elysia()
                     .from(user_model)
                     .where(eq(user_model.id, active_call.caller_id))
                     .limit(1);
-                  
+
                   await FCMService.sendNotificationToUser(other_user, {
                     title: "Call Ended",
                     body: `Call ended`,

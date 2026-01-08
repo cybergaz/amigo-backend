@@ -173,7 +173,7 @@ export class CallService {
       }
 
       // Determine status based on who is declining
-      const status = active_call.caller_id === user_id ? 'cancelled' : 'declined';
+      const status = active_call.caller_id === user_id ? 'ended' : 'declined';
 
       // Clear timeout
       if (active_call.timeout_timer) {

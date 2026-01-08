@@ -19,8 +19,8 @@ export const authenticate_jwt = (token: string) => {
   } catch (err) {
     return {
       success: false,
-      code: 401,
-      message: "Inalid Token",
+      code: 498,
+      message: "Invalid Token",
     };
   }
 };
@@ -33,7 +33,7 @@ export const app_middleware = ({ cookie, headers, allowed }: ElysiaMiddlewareTyp
   if (!access_token) {
     return {
       success: false,
-      code: 401,
+      code: 499,
       message: "No Access Token in Cookies",
     };
   }

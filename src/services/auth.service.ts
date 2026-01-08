@@ -160,8 +160,8 @@ const handle_refresh_token_mobile = async (token: string) => {
       };
     }
 
-    const access_token = generate_jwt(user.id, user.role || false, "7d");
-    const refresh_token = generate_refresh_jwt(user.id, user.role, "90d");
+    const access_token = generate_jwt(user.id, user.role || false, "1d");
+    const refresh_token = generate_refresh_jwt(user.id, user.role, "30d");
 
     await db
       .update(user_model)
@@ -237,7 +237,7 @@ const force_logout_other_devices = async (user_id: number): Promise<void> => {
         type: 'auth:force_logout' as const,
         payload: {
           message: 'You have been logged out because you logged in on another device',
-          code: 401,
+          code: 499,
         } as MiscPayload,
         ws_timestamp: new Date(),
       };
@@ -357,7 +357,7 @@ const update_signup_request_status = async (payload: UpdateSignupRequestType) =>
       .where(eq(signup_request_model.phone, payload.phone!))
       .returning();
 
-      
+
 
     if (!signup_request) {
       return { success: false, code: 404, message: "Signup request not updated" };
@@ -371,12 +371,12 @@ const update_signup_request_status = async (payload: UpdateSignupRequestType) =>
         role: "user",
         phone: signup_request[0].phone,
       });
-      
+
       if (!create_user_res?.success) {
         return { success: false, code: create_user_res.code, message: create_user_res.message };
       }
     }
-    
+
     return {
       success: true,
       code: 200,
