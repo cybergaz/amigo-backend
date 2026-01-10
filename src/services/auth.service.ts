@@ -280,15 +280,22 @@ const create_signup_request = async ({ first_name, last_name, phone }: { first_n
         first_name,
         last_name,
         phone,
-        // ---------------------------------------------------------
-        // temporarily auto-accepting all signup requests
-        // ---------------------------------------------------------
-        status: "accepted"
       })
       .returning();
     if (!signup_request) {
       return { success: false, code: 404, message: "Signup request not created" };
     }
+
+    // ---------------------------------------------------------
+    // temporarily auto-accepting all signup requests
+    // ---------------------------------------------------------
+    await update_signup_request_status({
+      phone,
+      first_name,
+      last_name,
+      status: "accepted",
+    })
+
     return {
       success: true,
       code: 200,
