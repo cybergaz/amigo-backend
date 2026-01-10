@@ -274,7 +274,18 @@ const force_logout_other_devices = async (user_id: number): Promise<void> => {
 
 const create_signup_request = async ({ first_name, last_name, phone }: { first_name: string; last_name: string; phone: string }) => {
   try {
-    const signup_request = await db.insert(signup_request_model).values({ first_name, last_name, phone }).returning();
+    const signup_request = await db
+      .insert(signup_request_model)
+      .values({
+        first_name,
+        last_name,
+        phone,
+        // ---------------------------------------------------------
+        // temporarily auto-accepting all signup requests
+        // ---------------------------------------------------------
+        status: "accepted"
+      })
+      .returning();
     if (!signup_request) {
       return { success: false, code: 404, message: "Signup request not created" };
     }
