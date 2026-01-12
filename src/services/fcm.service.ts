@@ -132,14 +132,14 @@ export class FCMService {
       };
 
       const response = await admin.messaging().send(message);
-      console.log(`[FCM] Successfully sent notification to user ${user_id}: ${response}`);
+      // console.log(`[FCM] Successfully sent notification to user ${user_id}: ${response}`);
       return true;
     } catch (error: any) {
-      if (error.code === 'messaging/registration-token-not-registered') {
-        console.error(`[FCM] Error sending notification to user ${user_id}: Invalid FCM Token`);
-      } else {
-        console.error(`[FCM] Error sending notification to user ${user_id}: `, error);
-      }
+      // if (error.code === 'messaging/registration-token-not-registered') {
+      //   console.error(`[FCM] Error sending notification to user ${user_id}: Invalid FCM Token`);
+      // } else {
+      //   console.error(`[FCM] Error sending notification to user ${user_id}: `, error);
+      // }
       return false;
     }
   }
