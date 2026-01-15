@@ -131,7 +131,7 @@ export class FCMService {
         },
       };
 
-      const response = await admin.messaging().send(message);
+      await admin.messaging().send(message);
       // console.log(`[FCM] Successfully sent notification to user ${user_id}: ${response}`);
       return true;
     } catch (error: any) {

@@ -1,4 +1,6 @@
 import db from "@/config/db";
+import { redis } from "@/config/redis";
+import { conversation_member_model } from "@/models/chat.model";
 import { UpdateUserType, user_model } from "@/models/user.model";
 import { RoleType } from "@/types/user.types";
 import {
@@ -896,6 +898,31 @@ export const delete_user_permanently = async (user_id: number) => {
         console.error("Error deleting profile image from S3:", error);
         // Continue with user deletion even if S3 deletion fails
       }
+    }
+
+    // Remove user from redis conversation member sets to avoid stale cache
+    try {
+      const conversations = await db
+        .select({ conversation_id: conversation_member_model.conversation_id })
+        .from(conversation_member_model)
+        .where(
+          and(
+            eq(conversation_member_model.user_id, user_id),
+            eq(conversation_member_model.deleted, false),
+          ),
+        );
+
+      const convIds = Array.from(
+        new Set(conversations.map((row) => row.conversation_id)),
+      );
+
+      for (const convId of convIds) {
+        const redisKey = `conv:${convId}:members`;
+        await redis.srem(redisKey, user_id.toString());
+        await redis.publish("conv:invalidate", convId.toString());
+      }
+    } catch (error) {
+      console.error("Error removing user from redis conversations:", error);
     }
 
     // Delete the user permanently from database
