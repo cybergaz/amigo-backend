@@ -26,7 +26,8 @@ import {
   forward_messages,
   delete_messages,
   get_pinned_messages,
-  get_starred_messages
+  get_starred_messages,
+  mark_message_delivered
 } from "@/services/message.services";
 
 const chat_routes = new Elysia({ prefix: "/chat" })
@@ -338,6 +339,21 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   }, {
     query: t.Object({
       conversation_id: t.Optional(t.Number())
+    })
+  })
+
+  .post("/messages/delivered", async ({ set, store, body }) => {
+    const delivery_result = await mark_message_delivered(
+      body.message_id,
+      body.conversation_id,
+      store.id
+    );
+    set.status = delivery_result.code;
+    return delivery_result;
+  }, {
+    body: t.Object({
+      message_id: t.Number(),
+      conversation_id: t.Number()
     })
   })
 

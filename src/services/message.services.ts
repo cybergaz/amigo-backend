@@ -9,6 +9,7 @@ import {
   DBInsertMessageStatusType,
 } from "@/models/chat.model";
 import { user_model } from "@/models/user.model";
+import { broadcast_message } from "@/sockets/socket.handlers";
 import {
   ConversationMetadata,
   MessageMetadata,
@@ -20,7 +21,7 @@ import {
   MediaMetadataRequest,
   MessageType
 } from "@/types/chat.types";
-import { ChatMessagePayload, MessagePinPayload } from "@/types/socket.types";
+import { ChatMessageAckPayload, ChatMessagePayload, MessagePinPayload } from "@/types/socket.types";
 import { create_unique_id } from "@/utils/general.utils";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 
@@ -1062,6 +1063,113 @@ const batch_update_message_status = async (
   }
 }
 
+/**
+ * Mark a message as delivered via API (typically from FCM when app was killed)
+ * This updates the database and broadcasts a WebSocket message to the sender
+ * 
+ * @param message_id The ID of the message that was delivered
+ * @param conversation_id The conversation ID
+ * @param recipient_id The user ID who received the message
+ * @returns Success/failure response
+ */
+const mark_message_delivered = async (
+  message_id: number,
+  conversation_id: number,
+  recipient_id: number
+) => {
+  try {
+    // Get message details to find sender
+    const [message] = await db
+      .select({
+        id: message_model.id,
+        sender_id: message_model.sender_id,
+        conversation_id: message_model.conversation_id,
+        status: message_model.status,
+      })
+      .from(message_model)
+      .where(
+        and(
+          eq(message_model.id, message_id),
+          eq(message_model.conversation_id, conversation_id),
+          eq(message_model.deleted, false)
+        )
+      )
+      .limit(1);
+
+    if (!message) {
+      return {
+        success: false,
+        code: 404,
+        message: "Message not found",
+      };
+    }
+
+    const sender_id = message.sender_id;
+
+    // Update message status in message_status table
+    await update_message_status({
+      message_id: message_id,
+      user_id: recipient_id,
+      delivered_at: new Date(),
+    });
+
+    // Update message status in messages table (for DMs)
+    await db.update(message_model).set({
+      status: "delivered"
+    }).where(
+      and(
+        eq(message_model.id, message_id),
+        eq(message_model.conversation_id, conversation_id),
+        eq(message_model.status, "sent") // Only update if still "sent"
+      )
+    );
+
+    const ack_payload: ChatMessageAckPayload = {
+      optimistic_id: 0, // Not needed for delivery receipts
+      canonical_id: message_id,
+      conv_id: conversation_id,
+      sender_id: sender_id,
+      delivered_at: new Date(),
+      delivered_to: [recipient_id],
+      read_by: [],
+      offline_users: [],
+    };
+
+    // Send ack to the original message sender
+    await broadcast_message({
+      to: "users",
+      user_ids: [sender_id],
+      message: {
+        type: "message:ack",
+        payload: ack_payload,
+        ws_timestamp: new Date()
+      },
+    });
+
+    console.log(`[API] Delivery receipt processed: message ${message_id} delivered to user ${recipient_id}`);
+
+    return {
+      success: true,
+      code: 200,
+      message: "Message marked as delivered successfully",
+      data: {
+        message_id,
+        conversation_id,
+        recipient_id,
+        delivered_at: new Date(),
+      },
+    };
+
+  } catch (error) {
+    console.error("ERROR: mark_message_delivered", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR: mark_message_delivered",
+    };
+  }
+}
+
 export {
   store_message,
   pin_message,
@@ -1076,5 +1184,6 @@ export {
   insert_message_status,
   update_message_status,
   batch_insert_message_status,
-  batch_update_message_status
+  batch_update_message_status,
+  mark_message_delivered
 };
