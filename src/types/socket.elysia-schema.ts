@@ -163,6 +163,15 @@ const ConversationActionPayloadSchema = t.Object({
   action_at: t.Date(),
 });
 
+// MessageDeliveredPayload schema - for delivery receipts from FCM messages
+const MessageDeliveredPayloadSchema = t.Object({
+  message_id: t.Number(),
+  conv_id: t.Number(),
+  sender_id: t.Number(),
+  recipient_id: t.Number(),
+  delivered_at: t.Date(),
+});
+
 // Ping message schema (for heartbeat)
 const PingMessageSchema = t.Object({
   type: t.Literal('ping'),
@@ -189,6 +198,7 @@ const WSPayloadSchema = t.Union([
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
   ConversationActionPayloadSchema,
+  MessageDeliveredPayloadSchema,
 ]);
 
 // Regular WSMessage schema (for messages with payload)
@@ -221,6 +231,7 @@ export {
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
   ConversationActionPayloadSchema,
+  MessageDeliveredPayloadSchema,
   PingMessageSchema,
   PongMessageSchema,
   WSPayloadSchema,

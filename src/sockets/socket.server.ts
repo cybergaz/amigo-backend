@@ -2,12 +2,12 @@ import db from "@/config/db";
 import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
 import { WSMessageSchema } from "@/types/socket.elysia-schema";
-import { JoinLeavePayload, MiscPayload, ConnectionStatusPayload, UserConnection, ChatMessagePayload, TypingPayload, ChatMessageAckPayload, MessageForwardPayload, MessagePinPayload, CallPayload, SSEConnection, PollingConnection, PendingMessage, SyncMessagesPayload, SyncMessageItem } from "@/types/socket.types";
+import { JoinLeavePayload, MiscPayload, ConnectionStatusPayload, UserConnection, ChatMessagePayload, TypingPayload, ChatMessageAckPayload, MessageForwardPayload, MessagePinPayload, CallPayload, SSEConnection, PollingConnection, PendingMessage, SyncMessagesPayload, SyncMessageItem, MessageDeliveredPayload } from "@/types/socket.types";
 import { and, eq, sql, isNull, desc, inArray } from "drizzle-orm";
 import Elysia, { t } from "elysia";
 import { broadcast_message, get_connected_users, get_ws_data, handle_join_conversation, set_ws_data } from "./socket.handlers";
 import { update_user_connection_status, update_user_details } from "@/services/user.services";
-import { pin_message, unpin_message, store_message, forward_messages, batch_insert_message_status } from "@/services/message.services";
+import { pin_message, unpin_message, store_message, forward_messages, batch_insert_message_status, update_message_status } from "@/services/message.services";
 import { update_conversation } from "@/services/chat.services";
 import { ChatType } from "@/types/chat.types";
 import { get_conversation_members } from "./socket.cache";
@@ -978,6 +978,63 @@ const web_socket_server = new Elysia()
             }
             break;
 
+          // --------------------------------------------------------------------
+          // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+          // --------------------------------------------------------------------
+
+          case 'message:delivered':
+            // Delivery receipt from recipient (typically from FCM message when app was killed)
+            if (message.payload) {
+              const payload = message.payload as MessageDeliveredPayload;
+              
+              console.log(`[WS] Received delivery receipt for message ${payload.message_id} from user ${payload.recipient_id}`);
+
+              // Update message status in the database
+              await update_message_status({
+                message_id: payload.message_id,
+                user_id: payload.recipient_id,
+                delivered_at: new Date(payload.delivered_at),
+              });
+
+              // Update the message status in the messages table (for DMs)
+              await db.update(message_model).set({
+                status: "delivered"
+              }).where(
+                and(
+                  eq(message_model.id, payload.message_id),
+                  eq(message_model.conversation_id, payload.conv_id),
+                  eq(message_model.status, "sent") // Only update if still "sent"
+                )
+              );
+
+              // Broadcast acknowledgment to the original sender so they can update UI
+              const ack_payload: ChatMessageAckPayload = {
+                optimistic_id: 0, // Not needed for delivery receipts
+                canonical_id: payload.message_id,
+                conv_id: payload.conv_id,
+                sender_id: payload.sender_id,
+                delivered_at: new Date(payload.delivered_at),
+                delivered_to: [payload.recipient_id],
+                read_by: [],
+                offline_users: [],
+              };
+
+              // Send ack to the original message sender
+              await broadcast_message({
+                to: "users",
+                user_ids: [payload.sender_id],
+                message: {
+                  type: "message:ack",
+                  payload: ack_payload,
+                  ws_timestamp: new Date()
+                },
+              });
+
+              console.log(`[WS] Delivery receipt processed: message ${payload.message_id} delivered to user ${payload.recipient_id}`);
+            } else {
+              console.error('[WS] message:delivered payload missing');
+            }
+            break;
 
           case 'socket:health_check':
             if (message.payload) {

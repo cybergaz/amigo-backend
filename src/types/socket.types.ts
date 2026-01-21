@@ -77,7 +77,8 @@ type RegularWSMessage = {
   | CallPayload
   | MiscPayload
   | ConversationActionPayload
-  | SyncMessagesPayload;
+  | SyncMessagesPayload
+  | MessageDeliveredPayload;
   ws_timestamp?: Date;
 }
 
@@ -248,6 +249,15 @@ type SyncMessagesPayload = {
   total_count: number
 }
 
+// Delivery receipt payload - sent by recipient when message is delivered via FCM
+type MessageDeliveredPayload = {
+  message_id: number
+  conv_id: number
+  sender_id: number
+  recipient_id: number
+  delivered_at: Date
+}
+
 const WS_MESSAGE_TYPE_CONST = [
   'connection:status',
   'conversation:join',
@@ -261,6 +271,7 @@ const WS_MESSAGE_TYPE_CONST = [
   'message:forward',
   'message:delete',
   'message:sync',  // Sync missed messages on reconnection
+  'message:delivered',  // Delivery receipt from FCM messages
   'call:init',
   'call:init:ack',
   'call:offer',
@@ -310,4 +321,5 @@ export type {
   ConversationActionPayload,
   SyncMessageItem,
   SyncMessagesPayload,
+  MessageDeliveredPayload,
 };
