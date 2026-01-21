@@ -76,7 +76,8 @@ type RegularWSMessage = {
   | MessageForwardPayload
   | CallPayload
   | MiscPayload
-  | ConversationActionPayload;
+  | ConversationActionPayload
+  | SyncMessagesPayload;
   ws_timestamp?: Date;
 }
 
@@ -225,6 +226,28 @@ type ConversationActionPayload = {
   action_at: Date
 }
 
+// Sync payload for missed messages on reconnection
+type SyncMessageItem = {
+  id: number
+  conv_id: number
+  conv_type: ChatType
+  sender_id: number
+  sender_name?: string
+  sender_pfp?: string
+  msg_type: MessageType
+  body?: string
+  attachments?: any
+  metadata?: any
+  sent_at: Date
+  created_at: Date
+}
+
+type SyncMessagesPayload = {
+  messages: SyncMessageItem[]
+  sync_timestamp: Date
+  total_count: number
+}
+
 const WS_MESSAGE_TYPE_CONST = [
   'connection:status',
   'conversation:join',
@@ -237,6 +260,7 @@ const WS_MESSAGE_TYPE_CONST = [
   'message:pin',
   'message:forward',
   'message:delete',
+  'message:sync',  // Sync missed messages on reconnection
   'call:init',
   'call:init:ack',
   'call:offer',
@@ -284,4 +308,6 @@ export type {
   CallPayload,
   ConnectionStatusType,
   ConversationActionPayload,
+  SyncMessageItem,
+  SyncMessagesPayload,
 };

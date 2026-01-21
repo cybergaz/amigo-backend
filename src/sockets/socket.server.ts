@@ -2,8 +2,8 @@ import db from "@/config/db";
 import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
 import { WSMessageSchema } from "@/types/socket.elysia-schema";
-import { JoinLeavePayload, MiscPayload, ConnectionStatusPayload, UserConnection, ChatMessagePayload, TypingPayload, ChatMessageAckPayload, MessageForwardPayload, MessagePinPayload, CallPayload, SSEConnection, PollingConnection, PendingMessage } from "@/types/socket.types";
-import { and, eq, sql, isNull } from "drizzle-orm";
+import { JoinLeavePayload, MiscPayload, ConnectionStatusPayload, UserConnection, ChatMessagePayload, TypingPayload, ChatMessageAckPayload, MessageForwardPayload, MessagePinPayload, CallPayload, SSEConnection, PollingConnection, PendingMessage, SyncMessagesPayload, SyncMessageItem } from "@/types/socket.types";
+import { and, eq, sql, isNull, desc, inArray } from "drizzle-orm";
 import Elysia, { t } from "elysia";
 import { broadcast_message, get_connected_users, get_ws_data, handle_join_conversation, set_ws_data } from "./socket.handlers";
 import { update_user_connection_status, update_user_details } from "@/services/user.services";
@@ -11,7 +11,7 @@ import { pin_message, unpin_message, store_message, forward_messages, batch_inse
 import { update_conversation } from "@/services/chat.services";
 import { ChatType } from "@/types/chat.types";
 import { get_conversation_members } from "./socket.cache";
-import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
+import { conversation_model, conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
 import FCMService from "@/services/fcm.service";
 import { CallService } from "@/services/call.service";
 import { CallInitPayload } from "@/types/call.types";
@@ -250,6 +250,143 @@ function stopStatsLogging() {
   }
 }
 
+// =============================================================================
+// Message Sync on Reconnection
+// =============================================================================
+
+/**
+ * Fetch and send all undelivered messages to a user on reconnection.
+ * This ensures users don't miss messages during temporary disconnections.
+ */
+async function syncMissedMessages(user_id: number, ws: any) {
+  try {
+    // Get all conversations the user is a member of
+    const userConversations = await db
+      .select({
+        conv_id: conversation_member_model.conversation_id,
+        conv_type: conversation_model.type,
+      })
+      .from(conversation_member_model)
+      .innerJoin(
+        conversation_model,
+        eq(conversation_model.id, conversation_member_model.conversation_id)
+      )
+      .where(
+        and(
+          eq(conversation_member_model.user_id, user_id),
+          eq(conversation_member_model.deleted, false)
+        )
+      );
+
+    if (userConversations.length === 0) {
+      console.log(`[SYNC] No conversations found for user ${user_id}`);
+      return;
+    }
+
+    const conversationIds = userConversations.map(c => c.conv_id);
+    const convTypeMap = new Map(userConversations.map(c => [c.conv_id, c.conv_type]));
+
+    // Find all messages in user's conversations that haven't been delivered to this user
+    // These are messages where message_status.delivered_at is NULL for this user
+    const undeliveredStatuses = await db
+      .select({
+        message_id: message_status_model.message_id,
+        conv_id: message_status_model.conv_id,
+      })
+      .from(message_status_model)
+      .where(
+        and(
+          eq(message_status_model.user_id, user_id),
+          inArray(message_status_model.conv_id, conversationIds),
+          isNull(message_status_model.delivered_at)
+        )
+      )
+      .limit(500); // Limit to prevent overwhelming the client
+
+    if (undeliveredStatuses.length === 0) {
+      console.log(`[SYNC] No missed messages for user ${user_id}`);
+      return;
+    }
+
+    const messageIds = undeliveredStatuses.map(s => s.message_id);
+
+    // Fetch the actual message data
+    const missedMessages = await db
+      .select({
+        id: message_model.id,
+        conversation_id: message_model.conversation_id,
+        sender_id: message_model.sender_id,
+        type: message_model.type,
+        body: message_model.body,
+        attachments: message_model.attachments,
+        metadata: message_model.metadata,
+        sent_at: message_model.sent_at,
+        created_at: message_model.created_at,
+        sender_name: user_model.name,
+        sender_pfp: user_model.profile_pic,
+      })
+      .from(message_model)
+      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+      .where(
+        and(
+          inArray(message_model.id, messageIds),
+          eq(message_model.deleted, false)
+        )
+      )
+      .orderBy(desc(message_model.sent_at));
+
+    if (missedMessages.length === 0) {
+      console.log(`[SYNC] No valid missed messages for user ${user_id}`);
+      return;
+    }
+
+    // Transform to SyncMessageItem format
+    const syncMessages: SyncMessageItem[] = missedMessages.map(msg => ({
+      id: msg.id,
+      conv_id: msg.conversation_id!,
+      conv_type: (convTypeMap.get(msg.conversation_id!) || 'dm') as any,
+      sender_id: msg.sender_id,
+      sender_name: msg.sender_name || undefined,
+      sender_pfp: msg.sender_pfp || undefined,
+      msg_type: msg.type as any,
+      body: msg.body || undefined,
+      attachments: msg.attachments,
+      metadata: msg.metadata,
+      sent_at: msg.sent_at || new Date(),
+      created_at: msg.created_at,
+    }));
+
+    // Send sync message to user
+    const syncPayload: SyncMessagesPayload = {
+      messages: syncMessages.reverse(), // Send oldest first
+      sync_timestamp: new Date(),
+      total_count: syncMessages.length,
+    };
+
+    ws.send({
+      type: 'message:sync',
+      payload: syncPayload,
+      ws_timestamp: new Date(),
+    }, true);
+
+    // Mark these messages as delivered
+    await db
+      .update(message_status_model)
+      .set({ delivered_at: new Date() })
+      .where(
+        and(
+          eq(message_status_model.user_id, user_id),
+          inArray(message_status_model.message_id, messageIds)
+        )
+      );
+
+    console.log(`[SYNC] Synced ${syncMessages.length} missed messages to user ${user_id}`);
+
+  } catch (error) {
+    console.error(`[SYNC] Error syncing missed messages for user ${user_id}:`, error);
+  }
+}
+
 // WebSocket server
 const web_socket_server = new Elysia()
   .onError(({ error, path }) => {
@@ -393,16 +530,9 @@ const web_socket_server = new Elysia()
         // update the online status of user in the DB
         await update_user_details(user_id, { online_status: true, connection_status: "foreground", last_seen: new Date() });
 
-        // mark as delivered all undelivered messages for this user
-        await db
-          .update(message_status_model)
-          .set({ delivered_at: new Date() })
-          .where(
-            and(
-              eq(message_status_model.user_id, user_id),
-              isNull(message_status_model.delivered_at)
-            )
-          );
+        // Sync missed messages to the user (this also marks them as delivered)
+        // This is critical for users who temporarily lost connection
+        await syncMissedMessages(user_id, ws);
 
       } catch (error) {
         const request = ws.data.request;
