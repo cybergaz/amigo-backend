@@ -50,8 +50,21 @@ interface PollingConnection {
   client_ip?: string;
 }
 
-type WSMessage = {
-  type: WSMessageType
+// Ping message for heartbeat
+type PingMessage = {
+  type: 'ping';
+  timestamp: string;
+}
+
+// Pong message for heartbeat response
+type PongMessage = {
+  type: 'pong';
+  timestamp: string;
+}
+
+// Regular WebSocket message with payload
+type RegularWSMessage = {
+  type: Exclude<WSMessageType, 'ping' | 'pong'>;
   payload?: ConnectionStatusPayload
   | JoinLeavePayload
   | NewConversationPayload
@@ -63,10 +76,12 @@ type WSMessage = {
   | MessageForwardPayload
   | CallPayload
   | MiscPayload
-  | ConversationActionPayload
-  // | WSPayload
-  ws_timestamp?: Date
+  | ConversationActionPayload;
+  ws_timestamp?: Date;
 }
+
+// Union type for all WebSocket messages
+type WSMessage = PingMessage | PongMessage | RegularWSMessage;
 
 // type WSPayload = {
 //   sender_id: number
@@ -250,6 +265,9 @@ export type {
   SSEConnection,
   PollingConnection,
   PendingMessage,
+  PingMessage,
+  PongMessage,
+  RegularWSMessage,
   WSMessage,
   WSMessageType,
   ConnectionStatusPayload,

@@ -163,6 +163,18 @@ const ConversationActionPayloadSchema = t.Object({
   action_at: t.Date(),
 });
 
+// Ping message schema (for heartbeat)
+const PingMessageSchema = t.Object({
+  type: t.Literal('ping'),
+  timestamp: t.String(),
+});
+
+// Pong message schema (for heartbeat response)
+const PongMessageSchema = t.Object({
+  type: t.Literal('pong'),
+  timestamp: t.String(),
+});
+
 // Union schema for payload
 const WSPayloadSchema = t.Union([
   ConnectionStatusPayloadSchema,
@@ -179,12 +191,21 @@ const WSPayloadSchema = t.Union([
   ConversationActionPayloadSchema,
 ]);
 
-// WSMessage schema
-const WSMessageSchema = t.Object({
-  type: t.Enum(Object.fromEntries(WS_MESSAGE_TYPE_CONST.map(x => [x, x]))),
+// Regular WSMessage schema (for messages with payload)
+const RegularWSMessageSchema = t.Object({
+  type: t.Enum(Object.fromEntries(
+    WS_MESSAGE_TYPE_CONST.filter(x => x !== 'ping' && x !== 'pong').map(x => [x, x])
+  )),
   payload: t.Optional(WSPayloadSchema),
   ws_timestamp: t.Optional(t.String()),
 });
+
+// Combined WSMessage schema - Union of regular messages, ping, and pong
+const WSMessageSchema = t.Union([
+  PingMessageSchema,
+  PongMessageSchema,
+  RegularWSMessageSchema,
+]);
 
 export {
   ConnectionStatusPayloadSchema,
@@ -200,6 +221,8 @@ export {
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
   ConversationActionPayloadSchema,
+  PingMessageSchema,
+  PongMessageSchema,
   WSPayloadSchema,
   WSMessageSchema,
 };
