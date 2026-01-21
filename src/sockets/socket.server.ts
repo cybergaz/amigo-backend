@@ -2,7 +2,7 @@ import db from "@/config/db";
 import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
 import { WSMessageSchema } from "@/types/socket.elysia-schema";
-import { JoinLeavePayload, MiscPayload, ConnectionStatusPayload, UserConnection, ChatMessagePayload, TypingPayload, ChatMessageAckPayload, MessageForwardPayload, MessagePinPayload, CallPayload } from "@/types/socket.types";
+import { JoinLeavePayload, MiscPayload, ConnectionStatusPayload, UserConnection, ChatMessagePayload, TypingPayload, ChatMessageAckPayload, MessageForwardPayload, MessagePinPayload, CallPayload, SSEConnection, PollingConnection, PendingMessage } from "@/types/socket.types";
 import { and, eq, sql, isNull } from "drizzle-orm";
 import Elysia, { t } from "elysia";
 import { broadcast_message, get_connected_users, get_ws_data, handle_join_conversation, set_ws_data } from "./socket.handlers";
@@ -16,7 +16,239 @@ import FCMService from "@/services/fcm.service";
 import { CallService } from "@/services/call.service";
 import { CallInitPayload } from "@/types/call.types";
 
-const socket_connections = new Map<number, UserConnection>(); // user_id -> UserConnection
+// Connection maps for different transport types
+const socket_connections = new Map<number, UserConnection>(); // user_id -> UserConnection (WebSocket)
+const sse_connections = new Map<number, SSEConnection>(); // user_id -> SSE connection
+const polling_connections = new Map<number, PollingConnection>(); // user_id -> Polling connection
+
+// Heartbeat configuration
+const HEARTBEAT_INTERVAL_MS = 30000; // Send ping every 30 seconds
+const MAX_MISSED_PINGS = 3; // Close connection after 3 missed pings
+const PING_TIMEOUT_MS = 10000; // Wait 10 seconds for pong response
+
+// Heartbeat interval for all WebSocket connections
+let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Start the heartbeat mechanism that sends periodic pings to all connected WebSocket clients.
+ * This helps detect stale connections and keeps connections alive through NAT/firewalls.
+ */
+function startHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+  }
+
+  heartbeatInterval = setInterval(() => {
+    const now = new Date();
+    const staleConnections: number[] = [];
+
+    socket_connections.forEach((connection, user_id) => {
+      // Check if connection missed too many pings
+      if (connection.missed_pings >= MAX_MISSED_PINGS) {
+        console.log(`[WS-HEARTBEAT] User ${user_id} missed ${connection.missed_pings} pings, closing connection`);
+        staleConnections.push(user_id);
+        return;
+      }
+
+      // Check if WebSocket is still open
+      if (connection.ws.readyState !== 1) { // 1 = OPEN
+        console.log(`[WS-HEARTBEAT] User ${user_id} WebSocket not open (state: ${connection.ws.readyState}), removing`);
+        staleConnections.push(user_id);
+        return;
+      }
+
+      // Send ping to client
+      try {
+        connection.ws.send({
+          type: 'ping',
+          timestamp: now.toISOString()
+        }, true);
+        connection.last_ping_sent = now;
+        connection.missed_pings++;
+        // console.log(`[WS-HEARTBEAT] Sent ping to user ${user_id}, missed_pings: ${connection.missed_pings}`);
+      } catch (error) {
+        console.error(`[WS-HEARTBEAT] Error sending ping to user ${user_id}:`, error);
+        staleConnections.push(user_id);
+      }
+    });
+
+    // Clean up stale connections
+    staleConnections.forEach(async (user_id) => {
+      const connection = socket_connections.get(user_id);
+      if (connection) {
+        try {
+          connection.ws.close(4000, "Connection timeout - no pong response");
+        } catch (e) {
+          // Ignore close errors
+        }
+        socket_connections.delete(user_id);
+
+        // Update user status in DB
+        await update_user_details(user_id, { online_status: false, last_seen: new Date() });
+
+        // Notify connected users about this user being offline
+        const connected_users = await get_connected_users(user_id);
+        const message_payload: ConnectionStatusPayload = {
+          sender_id: user_id,
+          status: 'disconnected',
+        };
+        await broadcast_message({
+          to: "users",
+          user_ids: Array.from(connected_users),
+          message: {
+            type: "connection:status",
+            payload: message_payload,
+            ws_timestamp: new Date()
+          },
+          exclude_user_ids: [user_id]
+        });
+
+        console.log(`[WS-HEARTBEAT] Cleaned up stale connection for user ${user_id}. Total connections: ${socket_connections.size}`);
+      }
+    });
+  }, HEARTBEAT_INTERVAL_MS);
+
+  console.log(`[WS-HEARTBEAT] Started heartbeat interval (${HEARTBEAT_INTERVAL_MS}ms)`);
+}
+
+/**
+ * Stop the heartbeat mechanism
+ */
+function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+    console.log('[WS-HEARTBEAT] Stopped heartbeat interval');
+  }
+}
+
+/**
+ * Handle pong response from client - reset missed ping counter
+ */
+function handlePongResponse(user_id: number) {
+  const connection = socket_connections.get(user_id);
+  if (connection) {
+    connection.last_pong_received = new Date();
+    connection.missed_pings = 0;
+    // console.log(`[WS-HEARTBEAT] Received pong from user ${user_id}`);
+  }
+}
+
+// =============================================================================
+// Connection Statistics & Enhanced Logging
+// =============================================================================
+
+interface ConnectionStats {
+  total_ws_connections: number;
+  total_sse_connections: number;
+  total_polling_connections: number;
+  connections_by_transport: Record<string, number>;
+  oldest_connection_age_seconds: number;
+  average_missed_pings: number;
+}
+
+/**
+ * Get current connection statistics for monitoring
+ */
+function getConnectionStats(): ConnectionStats {
+  const now = Date.now();
+  let oldestConnectionAge = 0;
+  let totalMissedPings = 0;
+
+  socket_connections.forEach((conn) => {
+    const age = (now - conn.connected_at.getTime()) / 1000;
+    if (age > oldestConnectionAge) {
+      oldestConnectionAge = age;
+    }
+    totalMissedPings += conn.missed_pings;
+  });
+
+  return {
+    total_ws_connections: socket_connections.size,
+    total_sse_connections: sse_connections.size,
+    total_polling_connections: polling_connections.size,
+    connections_by_transport: {
+      websocket: socket_connections.size,
+      sse: sse_connections.size,
+      polling: polling_connections.size,
+    },
+    oldest_connection_age_seconds: Math.round(oldestConnectionAge),
+    average_missed_pings: socket_connections.size > 0 
+      ? totalMissedPings / socket_connections.size 
+      : 0,
+  };
+}
+
+/**
+ * Log detailed connection error with context
+ */
+function logConnectionError(
+  context: string,
+  user_id: number | undefined,
+  client_ip: string | undefined,
+  error: any,
+  additional_info?: Record<string, any>
+) {
+  const errorLog = {
+    timestamp: new Date().toISOString(),
+    context,
+    user_id,
+    client_ip,
+    error: error?.message || String(error),
+    error_stack: error?.stack,
+    connection_stats: getConnectionStats(),
+    ...additional_info,
+  };
+  
+  console.error(`[CONNECTION-ERROR] ${JSON.stringify(errorLog)}`);
+}
+
+/**
+ * Log successful connection with diagnostics
+ */
+function logConnectionSuccess(
+  transport: 'ws' | 'sse' | 'polling',
+  user_id: number,
+  client_ip: string,
+  additional_info?: Record<string, any>
+) {
+  const successLog = {
+    timestamp: new Date().toISOString(),
+    transport,
+    user_id,
+    client_ip,
+    connection_stats: getConnectionStats(),
+    ...additional_info,
+  };
+  
+  console.log(`[CONNECTION-SUCCESS] ${JSON.stringify(successLog)}`);
+}
+
+// Periodic stats logging (every 5 minutes)
+let statsInterval: ReturnType<typeof setInterval> | null = null;
+
+function startStatsLogging() {
+  if (statsInterval) {
+    clearInterval(statsInterval);
+  }
+
+  statsInterval = setInterval(() => {
+    const stats = getConnectionStats();
+    console.log(`[CONNECTION-STATS] ${JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...stats,
+    })}`);
+  }, 5 * 60 * 1000); // Every 5 minutes
+
+  console.log('[CONNECTION-STATS] Started periodic stats logging');
+}
+
+function stopStatsLogging() {
+  if (statsInterval) {
+    clearInterval(statsInterval);
+    statsInterval = null;
+  }
+}
 
 // WebSocket server
 const web_socket_server = new Elysia()
@@ -120,10 +352,20 @@ const web_socket_server = new Elysia()
         // insert user_name into WebSocket data using type-safe helper
         set_ws_data(ws, { user_name });
 
-        // Add to active socket connections
+        // Extract client IP for logging/diagnostics
+        const request = ws.data.request;
+        const client_ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() 
+          || request.headers.get('x-real-ip') 
+          || 'unknown';
+
+        // Add to active socket connections with new tracking fields
         socket_connections.set(user_id, {
           ws,
-          connection_status: "foreground"
+          connection_status: "foreground",
+          transport_type: "ws",
+          missed_pings: 0,
+          connected_at: new Date(),
+          client_ip
         });
 
         // notify all connected users about this user being online
@@ -146,7 +388,7 @@ const web_socket_server = new Elysia()
           exclude_user_ids: [user_id]
         });
 
-        console.log(`[WS] User ${user_id} connected. Total connections: ${socket_connections.size}`);
+        logConnectionSuccess('ws', user_id, client_ip, { user_name });
 
         // update the online status of user in the DB
         await update_user_details(user_id, { online_status: true, connection_status: "foreground", last_seen: new Date() });
@@ -163,7 +405,11 @@ const web_socket_server = new Elysia()
           );
 
       } catch (error) {
-        console.error('[WS] Error in establishing connection:', error);
+        const request = ws.data.request;
+        const client_ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() 
+          || request.headers.get('x-real-ip') 
+          || 'unknown';
+        logConnectionError('ws_open', undefined, client_ip, error);
         ws.close(4000, "Connection error");
       }
 
@@ -624,12 +870,17 @@ const web_socket_server = new Elysia()
             break;
 
           case 'ping':
-            console.log(`[WS] Received ping from user ${user_id}`);
-            // Respond with pong
+            // Client sent ping, respond with pong
+            // console.log(`[WS] Received ping from user ${user_id}`);
             ws.send({
               type: 'pong',
               timestamp: new Date().toISOString()
             }, true);
+            break;
+
+          case 'pong':
+            // Client responded to our ping - reset missed ping counter
+            handlePongResponse(user_id);
             break;
 
 
@@ -1084,24 +1335,359 @@ const web_socket_server = new Elysia()
       }
     }
   })
+  // ============================================================================
+  // SSE (Server-Sent Events) Endpoint - Fallback transport for WebSocket
+  // ============================================================================
+  .get('/chat/sse', async ({ query, set, request }) => {
+    const token = query.token;
+    
+    if (!token) {
+      set.status = 401;
+      return { error: 'Authentication token is required' };
+    }
+
+    // Verify JWT token
+    const auth_result = authenticate_jwt(token);
+    if (!auth_result.success || !auth_result.data) {
+      set.status = 401;
+      return { error: 'Invalid authentication token' };
+    }
+
+    const user_id = auth_result.data.id;
+    const client_ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() 
+      || request.headers.get('x-real-ip') 
+      || 'unknown';
+
+    console.log(`[SSE] User ${user_id} connecting from ${client_ip}`);
+
+    // Create SSE stream
+    const stream = new ReadableStream({
+      start: async (controller) => {
+        // Store the SSE connection
+        sse_connections.set(user_id, {
+          controller,
+          user_id,
+          connected_at: new Date(),
+          last_keepalive: new Date(),
+          client_ip
+        });
+
+        // Send initial connection success event
+        const connectEvent = `data: ${JSON.stringify({ type: 'connection:status', payload: { sender_id: user_id, status: 'foreground' }, ws_timestamp: new Date() })}\n\n`;
+        controller.enqueue(new TextEncoder().encode(connectEvent));
+
+        // Update user status in DB
+        await update_user_details(user_id, { online_status: true, connection_status: "foreground", last_seen: new Date() });
+
+        // Notify connected users about this user being online
+        const connected_users = await get_connected_users(user_id);
+        const message_payload: ConnectionStatusPayload = {
+          sender_id: user_id,
+          status: 'foreground',
+        };
+        await broadcast_message({
+          to: "users",
+          user_ids: Array.from(connected_users),
+          message: {
+            type: "connection:status",
+            payload: message_payload,
+            ws_timestamp: new Date()
+          },
+          exclude_user_ids: [user_id]
+        });
+
+        logConnectionSuccess('sse', user_id, client_ip);
+
+        // Set up keepalive interval
+        const keepaliveInterval = setInterval(() => {
+          try {
+            const sse_conn = sse_connections.get(user_id);
+            if (sse_conn) {
+              controller.enqueue(new TextEncoder().encode(`: keepalive\n\n`));
+              sse_conn.last_keepalive = new Date();
+            }
+          } catch (e) {
+            // Controller is closed
+            clearInterval(keepaliveInterval);
+          }
+        }, 30000);
+
+        // Handle cleanup when stream is cancelled
+        request.signal.addEventListener('abort', async () => {
+          clearInterval(keepaliveInterval);
+          sse_connections.delete(user_id);
+          
+          // Update user status in DB
+          await update_user_details(user_id, { online_status: false, last_seen: new Date() });
+
+          // Notify connected users about this user being offline
+          const connected_users = await get_connected_users(user_id);
+          await broadcast_message({
+            to: "users",
+            user_ids: Array.from(connected_users),
+            message: {
+              type: "connection:status",
+              payload: { sender_id: user_id, status: 'disconnected' },
+              ws_timestamp: new Date()
+            },
+            exclude_user_ids: [user_id]
+          });
+
+          console.log(`[SSE] User ${user_id} disconnected. Total SSE connections: ${sse_connections.size}`);
+          controller.close();
+        });
+      }
+    });
+
+    set.headers['Content-Type'] = 'text/event-stream';
+    set.headers['Cache-Control'] = 'no-cache';
+    set.headers['Connection'] = 'keep-alive';
+    set.headers['X-Accel-Buffering'] = 'no'; // Disable nginx buffering
+
+    return stream;
+  }, {
+    query: t.Object({ token: t.String() })
+  })
+  // ============================================================================
+  // HTTP Long Polling Endpoints - Fallback transport for WebSocket/SSE
+  // ============================================================================
+  // GET endpoint to poll for new messages
+  .get('/chat/poll', async ({ query, set, request }) => {
+    const token = query.token;
+    const last_message_id = query.last_message_id;
+    
+    if (!token) {
+      set.status = 401;
+      return { error: 'Authentication token is required' };
+    }
+
+    // Verify JWT token
+    const auth_result = authenticate_jwt(token);
+    if (!auth_result.success || !auth_result.data) {
+      set.status = 401;
+      return { error: 'Invalid authentication token' };
+    }
+
+    const user_id = auth_result.data.id;
+    const client_ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() 
+      || request.headers.get('x-real-ip') 
+      || 'unknown';
+
+    // Get or create polling connection
+    let polling_conn = polling_connections.get(user_id);
+    if (!polling_conn) {
+      polling_conn = {
+        user_id,
+        pending_messages: [],
+        connected_at: new Date(),
+        client_ip
+      };
+      polling_connections.set(user_id, polling_conn);
+      
+      // Update user status in DB
+      await update_user_details(user_id, { online_status: true, connection_status: "foreground", last_seen: new Date() });
+
+      logConnectionSuccess('polling', user_id, client_ip);
+    }
+
+    polling_conn.last_poll = new Date();
+
+    // Filter messages after last_message_id if provided
+    let messages = polling_conn.pending_messages;
+    if (last_message_id) {
+      const idx = messages.findIndex(m => m.message_id === last_message_id);
+      if (idx !== -1) {
+        messages = messages.slice(idx + 1);
+      }
+    }
+
+    // If there are pending messages, return them immediately
+    if (messages.length > 0) {
+      // Clear returned messages from queue
+      polling_conn.pending_messages = polling_conn.pending_messages.filter(
+        m => !messages.some(msg => msg.message_id === m.message_id)
+      );
+      polling_conn.last_message_id = messages[messages.length - 1].message_id;
+      
+      return {
+        messages: messages.map(m => ({ ...m.message, message_id: m.message_id })),
+        last_message_id: polling_conn.last_message_id
+      };
+    }
+
+    // Long poll: wait up to 30 seconds for new messages
+    const POLL_TIMEOUT_MS = 30000;
+    const start_time = Date.now();
+    const abort_controller = new AbortController();
+
+    // Handle client disconnect
+    request.signal.addEventListener('abort', () => {
+      abort_controller.abort();
+    });
+
+    // Wait for messages with timeout
+    return new Promise((resolve) => {
+      const checkInterval = setInterval(() => {
+        const polling = polling_connections.get(user_id);
+        
+        // Check if client disconnected
+        if (abort_controller.signal.aborted) {
+          clearInterval(checkInterval);
+          resolve({ messages: [], last_message_id: polling?.last_message_id });
+          return;
+        }
+
+        // Check for new messages
+        if (polling && polling.pending_messages.length > 0) {
+          clearInterval(checkInterval);
+          const newMessages = [...polling.pending_messages];
+          polling.pending_messages = [];
+          polling.last_message_id = newMessages[newMessages.length - 1].message_id;
+          
+          resolve({
+            messages: newMessages.map(m => ({ ...m.message, message_id: m.message_id })),
+            last_message_id: polling.last_message_id
+          });
+          return;
+        }
+
+        // Check timeout
+        if (Date.now() - start_time >= POLL_TIMEOUT_MS) {
+          clearInterval(checkInterval);
+          resolve({ messages: [], last_message_id: polling?.last_message_id });
+          return;
+        }
+      }, 500); // Check every 500ms
+    });
+  }, {
+    query: t.Object({ 
+      token: t.String(),
+      last_message_id: t.Optional(t.String())
+    })
+  })
+  // POST endpoint to send messages via polling
+  .post('/chat/poll', async ({ body, query, set, request }) => {
+    const token = query.token;
+    
+    if (!token) {
+      set.status = 401;
+      return { error: 'Authentication token is required' };
+    }
+
+    // Verify JWT token
+    const auth_result = authenticate_jwt(token);
+    if (!auth_result.success || !auth_result.data) {
+      set.status = 401;
+      return { error: 'Invalid authentication token' };
+    }
+
+    const user_id = auth_result.data.id;
+
+    // Get user details for message handling
+    const user_name = (await db
+      .select({ name: user_model.name })
+      .from(user_model)
+      .where(eq(user_model.id, user_id))
+      .limit(1))[0]?.name;
+
+    // Process the message similar to WebSocket message handling
+    const message = body as any;
+    
+    // For now, support basic message types that don't require WebSocket-specific handling
+    switch (message.type) {
+      case 'ping':
+        return { type: 'pong', timestamp: new Date().toISOString() };
+
+      case 'message:new':
+        if (message.payload) {
+          const payload = message.payload as ChatMessagePayload;
+          
+          // Store the message in DB
+          const stored_message = await store_message(payload);
+          if (!stored_message?.success) {
+            set.status = 500;
+            return { error: 'Failed to store message' };
+          }
+
+          const new_message_payload: ChatMessagePayload = {
+            ...payload,
+            canonical_id: stored_message?.data?.id,
+            sender_name: payload.sender_name || user_name || undefined,
+          };
+
+          // Broadcast to conversation members
+          const sent_result = await broadcast_message({
+            to: "conversation",
+            conv_id: payload.conv_id,
+            message: {
+              type: "message:new",
+              payload: new_message_payload,
+              ws_timestamp: new Date()
+            },
+            exclude_user_ids: [payload.sender_id]
+          });
+
+          // Return acknowledgment
+          return {
+            type: "message:ack",
+            payload: {
+              optimistic_id: payload.optimistic_id,
+              canonical_id: stored_message?.data?.id,
+              conv_id: payload.conv_id,
+              sender_id: payload.sender_id,
+              delivered_at: new Date(),
+              delivered_to: sent_result.online,
+              offline_users: sent_result.offline,
+            }
+          };
+        }
+        break;
+
+      case 'conversation:typing':
+        if (message.payload) {
+          const payload = message.payload as TypingPayload;
+          await broadcast_message({
+            to: "conversation",
+            conv_id: payload.conv_id,
+            message: {
+              type: "conversation:typing",
+              payload: payload,
+              ws_timestamp: new Date()
+            },
+            exclude_user_ids: [payload.sender_id],
+          });
+          return { success: true };
+        }
+        break;
+
+      default:
+        return { error: `Unsupported message type for polling: ${message.type}` };
+    }
+
+    return { success: true };
+  }, {
+    query: t.Object({ token: t.String() }),
+    body: t.Any()
+  })
   .listen(process.env.SOCKET_PORT || 5002);
 
-console.log(`🔌 New WebSocket is running at port ${process.env.SOCKET_PORT || 5002}`);
+console.log(`🔌 WebSocket server is running at port ${process.env.SOCKET_PORT || 5002}`);
 
-// const health_check_payload: MiscPayload = {
-//   message: "Connection established successfully",
-//   code: 1
-// };
-// // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-// await broadcast_message({
-//   to: "users",
-//   user_ids: [user_id],
-//   message: {
-//     type: "socket:health_check",
-//     payload: health_check_payload,
-//     ws_timestamp: new Date()
-//   },
-// });
+// Start the heartbeat mechanism
+startHeartbeat();
+
+// Start periodic connection stats logging
+startStatsLogging();
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  stopHeartbeat();
+  stopStatsLogging();
+});
+process.on('SIGINT', () => {
+  stopHeartbeat();
+  stopStatsLogging();
+});
 
 export default web_socket_server;
-export { socket_connections };
+export { socket_connections, sse_connections, polling_connections, startHeartbeat, stopHeartbeat };

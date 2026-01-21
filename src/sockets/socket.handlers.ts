@@ -1,10 +1,17 @@
-import { WebSocketData, WSMessage } from "@/types/socket.types";
+import { WebSocketData, WSMessage, PendingMessage } from "@/types/socket.types";
 import { ElysiaWS } from "elysia/dist/ws";
 import { get_conversation_members, get_user_conversations } from "./socket.cache";
-import { socket_connections } from "./socket.server";
+import { socket_connections, sse_connections, polling_connections } from "./socket.server";
 import db from "@/config/db";
 import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
 import { and, desc, eq, isNull, ne, or } from "drizzle-orm";
+
+// Generate unique message ID for polling
+let polling_message_counter = 0;
+function generateMessageId(): string {
+  polling_message_counter++;
+  return `${Date.now()}-${polling_message_counter}`;
+}
 
 const set_ws_data = (ws: ElysiaWS, data: WebSocketData) => {
   Object.assign(ws.data, data)
@@ -29,7 +36,6 @@ const broadcast_message = async (data: BroadcastData) => {
     // Get conversation members (LRU -> Redis -> DB)
     members = Array.from(await get_conversation_members(data.conv_id));
   }
-  // if (!data.user_ids) data.user_ids = Array.from(members);
 
   // sent to both specific users and conversation members (if both conv_id & user_ids are provided)
   let recipients_list = [...members];
@@ -41,38 +47,86 @@ const broadcast_message = async (data: BroadcastData) => {
   const online_users_id: number[] = [];
   const offline_users_id: number[] = [];
 
-  // Separate online and offline users
+  // Separate online and offline users across all transport types
   recipients_list.forEach(user_id => {
     if (data.exclude_user_ids && data.exclude_user_ids.includes(user_id)) {
       return; // Skip excluded users
     }
 
-    const connection = socket_connections.get(user_id);
-    if (connection && connection.ws.readyState === 1) {
-      // if (connection) {
+    // Check WebSocket connections
+    const ws_connection = socket_connections.get(user_id);
+    if (ws_connection && ws_connection.ws.readyState === 1) {
       online_users_id.push(user_id);
-    } else {
-      offline_users_id.push(user_id);
+      if (ws_connection.active_conv_id === data.conv_id) {
+        active_in_conv.push(user_id);
+      }
+      return;
     }
-    if (connection && connection.active_conv_id === data.conv_id) {
-      active_in_conv.push(user_id);
-    }
-  });
 
-  // Send to online users
-  // const messageStr = JSON.stringify(message);
-  online_users_id.forEach(user_id => {
-    const connection = socket_connections.get(user_id);
-    if (connection) {
-      try {
-        // connection.ws.send(messageStr);
-        connection.ws.send(data.message, true);
-      } catch (error) {
-        console.error(`[WS] Error sending to user ${user_id}:`, error);
-        // socket_connections.delete(user_id);
+    // Check SSE connections
+    const sse_connection = sse_connections.get(user_id);
+    if (sse_connection) {
+      online_users_id.push(user_id);
+      return;
+    }
+
+    // Check polling connections (consider online if polled recently - within 60s)
+    const polling_connection = polling_connections.get(user_id);
+    if (polling_connection && polling_connection.last_poll) {
+      const timeSinceLastPoll = Date.now() - polling_connection.last_poll.getTime();
+      if (timeSinceLastPoll < 60000) { // 60 seconds
+        online_users_id.push(user_id);
+        return;
       }
     }
+
+    // User is offline
+    offline_users_id.push(user_id);
   });
+
+  // Send to online users via appropriate transport
+  for (const user_id of online_users_id) {
+    // Try WebSocket first
+    const ws_connection = socket_connections.get(user_id);
+    if (ws_connection && ws_connection.ws.readyState === 1) {
+      try {
+        ws_connection.ws.send(data.message, true);
+      } catch (error) {
+        console.error(`[WS] Error sending to user ${user_id}:`, error);
+      }
+      continue;
+    }
+
+    // Try SSE
+    const sse_connection = sse_connections.get(user_id);
+    if (sse_connection) {
+      try {
+        const sseEvent = `data: ${JSON.stringify(data.message)}\n\n`;
+        sse_connection.controller.enqueue(new TextEncoder().encode(sseEvent));
+      } catch (error) {
+        console.error(`[SSE] Error sending to user ${user_id}:`, error);
+        // Remove stale SSE connection
+        sse_connections.delete(user_id);
+      }
+      continue;
+    }
+
+    // Queue for polling
+    const polling_connection = polling_connections.get(user_id);
+    if (polling_connection) {
+      const pending_message: PendingMessage = {
+        message: data.message,
+        timestamp: new Date(),
+        message_id: generateMessageId()
+      };
+      polling_connection.pending_messages.push(pending_message);
+      
+      // Keep only last 100 messages to prevent memory issues
+      if (polling_connection.pending_messages.length > 100) {
+        polling_connection.pending_messages = polling_connection.pending_messages.slice(-100);
+      }
+    }
+  }
 
   return {
     online: online_users_id,

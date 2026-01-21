@@ -9,11 +9,45 @@ interface WebSocketData {
   user_pfp?: string;
 }
 
+// Transport types for fallback support
+type TransportType = 'ws' | 'sse' | 'polling';
+
 // Connection management
 interface UserConnection {
   ws: ElysiaWS;
   connection_status: ConnectionStatusType;
   active_conv_id?: number;
+  transport_type: TransportType;
+  last_ping_sent?: Date;
+  last_pong_received?: Date;
+  missed_pings: number;
+  connected_at: Date;
+  client_ip?: string;
+}
+
+// SSE connection for fallback
+interface SSEConnection {
+  controller: ReadableStreamDefaultController;
+  user_id: number;
+  connected_at: Date;
+  last_keepalive?: Date;
+  client_ip?: string;
+}
+
+// Polling message queue
+interface PendingMessage {
+  message: WSMessage;
+  timestamp: Date;
+  message_id: string;
+}
+
+interface PollingConnection {
+  user_id: number;
+  pending_messages: PendingMessage[];
+  last_poll?: Date;
+  last_message_id?: string;
+  connected_at: Date;
+  client_ip?: string;
 }
 
 type WSMessage = {
@@ -212,6 +246,10 @@ export { WS_MESSAGE_TYPE_CONST, CONNECTION_STATUS_CONST }
 export type {
   WebSocketData,
   UserConnection,
+  TransportType,
+  SSEConnection,
+  PollingConnection,
+  PendingMessage,
   WSMessage,
   WSMessageType,
   ConnectionStatusPayload,
