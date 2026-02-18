@@ -5,7 +5,7 @@ import { customAlphabet } from "nanoid";
 import { parsePhoneNumberFromString } from "libphonenumber-js";
 
 const create_unique_id = () => {
-  const nanoid = customAlphabet("0123456789", 10);
+  const nanoid = customAlphabet("0123456789", 15);
   return Number(nanoid());
 };
 

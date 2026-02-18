@@ -1,34 +1,39 @@
 import db from '@/config/db';
 import { call_model } from '@/models/call.model';
 import { user_model } from '@/models/user.model';
-import { CallSignalingMessage, CallInitPayload, CallEndPayload } from '@/types/call.types';
+import { CallSignalingMessage, CallInitPayload, CallEndPayload, CallStatusType, CallEndReasonsType } from '@/types/call.types';
+import { ResultType } from '@/types/core.types';
 import { eq, and, desc, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
+import { random } from 'nanoid';
+
 
 // Active calls management
 interface ActiveCall {
   id: number;
   caller_id: number;
   callee_id: number;
-  status: 'initiated' | 'ringing' | 'answered';
+  status: CallStatusType;
   started_at: Date;
+  answered_at?: Date;
   timeout_timer?: NodeJS.Timeout;
 }
 
 const active_calls = new Map<number, ActiveCall>();
 const user_calls = new Map<number, number>(); // user_id -> call_id
+export const CALL_TIMEOUT_MS = 60 * 1000; // 60 seconds
 
 export class CallService {
 
   // Initialize a new call
-  static async initiate_call(caller_id: number, callee_id: number) {
+  static async initiate_call(caller_id: number, callee_id: number): Promise<ResultType<{ call_id: number; caller_name: string; }>> {
     try {
       // Check if either user is already in a call
       if (user_calls.has(caller_id) || user_calls.has(callee_id)) {
         return {
           success: false,
-          error: 'User is already in a call',
-          code: 'USER_BUSY'
+          code: 409,
+          message: 'User is already in a call',
         };
       }
 
@@ -44,16 +49,16 @@ export class CallService {
       if (!callee) {
         return {
           success: false,
-          error: 'User not found',
-          code: 'USER_NOT_FOUND'
+          code: 404,
+          message: 'Callee not found',
         };
       }
 
       if (!callee.call_access) {
         return {
           success: false,
-          error: 'User does not have call access enabled',
-          code: 'CALL_ACCESS_DISABLED'
+          code: 401,
+          message: 'Callee does not have call access enabled',
         };
       }
 
@@ -77,42 +82,47 @@ export class CallService {
         started_at: new Date()
       };
 
+      // set call status in the MEMORY
       active_calls.set(new_call.id, active_call);
       user_calls.set(caller_id, new_call.id);
       user_calls.set(callee_id, new_call.id);
 
-      // Set 30 second timeout for missed call
+      // Set timeout for unanswered calls
       active_call.timeout_timer = setTimeout(async () => {
         await this.timeout_call(new_call.id);
-      }, 30000);
+      }, CALL_TIMEOUT_MS);
 
       // console.log(`[CALL] Call initiated: ${new_call.id} from ${caller_id} to ${callee_id}`);
 
       return {
         success: true,
+        code: 201,
+        message: 'Call initiated successfully',
         data: {
-          callId: new_call.id,
-          calleeName: callee.name
+          call_id: new_call.id,
+          caller_name: callee.name
         }
       };
     } catch (error) {
       console.error('[CALL] Error initiating call:', error);
       return {
         success: false,
-        error: 'Failed to initiate call'
+        code: 500,
+        message: 'Failed to initiate call',
+        error: error as any
       };
     }
   }
 
   // Accept a call
-  static async accept_call(call_id: number, user_id: number) {
+  static async accept_call(call_id: number, user_id: number): Promise<ResultType> {
     try {
       const active_call = active_calls.get(call_id);
       if (!active_call) {
         return {
           success: false,
           code: 404,
-          error: 'Call not found'
+          message: 'Call not found',
         };
       }
 
@@ -121,7 +131,7 @@ export class CallService {
         return {
           success: false,
           code: 401,
-          error: 'Unauthorized to accept this call'
+          message: 'You are not the receiver of this call',
         };
       }
 
@@ -147,73 +157,45 @@ export class CallService {
       return {
         success: true,
         code: 200,
-        message: 'Call accepted'
+        message: 'Call accepted successfully',
       };
     } catch (error) {
       console.error('[CALL] Error accepting call:', error);
       return {
         success: false,
         code: 500,
-        error: 'Failed to accept call'
+        message: 'Failed to accept call',
       };
     }
   }
 
-  // Decline a call (can be declined by callee or cancelled by caller)
-  static async decline_call(call_id: number, user_id: number, reason?: string) {
+  static async terminate_call(call_id: number, user_id: number, reason: CallEndReasonsType):
+    Promise<ResultType<{
+      status: CallStatusType;
+      reason: CallEndReasonsType;
+    }>> {
     try {
       const active_call = active_calls.get(call_id);
+
       if (!active_call) {
-        return { success: false, error: 'Call not found' };
+        return {
+          success: false,
+          code: 404,
+          message: 'Call not found',
+        };
       }
 
-      // Either caller or callee can decline/cancel the call
+      // Either caller or callee can terminate the call
       if (active_call.callee_id !== user_id && active_call.caller_id !== user_id) {
-        return { success: false, error: 'Unauthorized to decline this call' };
+        return {
+          success: false,
+          code: 401,
+          message: 'You are not a participant of this call',
+        };
       }
 
       // Determine status based on who is declining
       const status = active_call.caller_id === user_id ? 'ended' : 'declined';
-
-      // Clear timeout
-      if (active_call.timeout_timer) {
-        clearTimeout(active_call.timeout_timer);
-      }
-
-      // Update database
-      await db
-        .update(call_model)
-        .set({
-          status: status,
-          ended_at: new Date(),
-          reason: reason || (active_call.caller_id === user_id ? 'caller_cancelled' : 'callee_declined')
-        })
-        .where(eq(call_model.id, call_id));
-
-      // Remove from active calls
-      this.cleanup_call(call_id);
-
-      console.log(`[CALL] Call ${status}: ${call_id} by user ${user_id}`);
-
-      return { success: true, data: { status } };
-    } catch (error) {
-      console.error('[CALL] Error declining call:', error);
-      return { success: false, error: 'Failed to decline call' };
-    }
-  }
-
-  // End a call
-  static async end_call(call_id: number, user_id: number, reason?: string) {
-    try {
-      const active_call = active_calls.get(call_id);
-      if (!active_call) {
-        return { success: false, error: 'Call not found' };
-      }
-
-      // Either caller or callee can end
-      if (active_call.caller_id !== user_id && active_call.callee_id !== user_id) {
-        return { success: false, error: 'Unauthorized to end this call' };
-      }
 
       // Clear timeout
       if (active_call.timeout_timer) {
@@ -238,25 +220,37 @@ export class CallService {
       await db
         .update(call_model)
         .set({
-          status: 'ended',
+          status: status,
           ended_at: new Date(),
           duration_seconds,
-          reason
+          reason: reason
         })
         .where(eq(call_model.id, call_id));
 
       // Remove from active calls
       this.cleanup_call(call_id);
 
-      // console.log(`[CALL] Call ended: ${call_id}, duration: ${duration_seconds}s`);
+      // console.log(`[CALL] Call ${status}: ${call_id} by user ${user_id}`);
 
       return {
         success: true,
-        data: { duration_seconds }
+        code: 200,
+        message: `Call termination: ${status} successfully`,
+        data: {
+          status,
+          reason
+        }
       };
-    } catch (error) {
-      console.error('[CALL] Error ending call:', error);
-      return { success: false, error: 'Failed to end call' };
+    }
+    catch (error) {
+      console.error('[CALL] Error terminating call:', error);
+      return {
+        success: false,
+        code: 500,
+        message: 'Failed to terminate call for :' + reason,
+        error: error as any
+      };
+
     }
   }
 
@@ -308,44 +302,46 @@ export class CallService {
   }
 
   // Get call history for user
-  static async get_call_history(user_id: number, limit: number = 50) {
+  static async get_call_history(user_id: number, limit: number = 100): Promise<ResultType> {
     try {
       const caller = alias(user_model, 'caller');
       const callee = alias(user_model, 'callee');
 
       const calls = await db
-        .select({
-          id: call_model.id,
-          caller_id: call_model.caller_id,
-          callee_id: call_model.callee_id,
-          status: call_model.status,
-          duration_seconds: call_model.duration_seconds,
-          started_at: call_model.started_at,
-          answered_at: call_model.answered_at,
-          ended_at: call_model.ended_at,
-          reason: call_model.reason,
-          // Contact info (the other person in the call)
-          contact_id: sql`CASE 
-            WHEN ${call_model.caller_id} = ${user_id} THEN ${call_model.callee_id}
-            ELSE ${call_model.caller_id}
-          END`.as('contact_id'),
-          contact_name: sql`CASE 
-            WHEN ${call_model.caller_id} = ${user_id} THEN ${callee.name}
-            ELSE ${caller.name}
-          END`.as('contact_name'),
-          contact_profile_pic: sql`CASE 
-            WHEN ${call_model.caller_id} = ${user_id} THEN ${callee.profile_pic}
-            ELSE ${caller.profile_pic}
-          END`.as('contact_profile_pic'),
-          // Call direction
-          call_type: sql`CASE 
-            WHEN ${call_model.caller_id} = ${user_id} THEN 'outgoing'
-            ELSE 'incoming'
-          END`.as('call_type')
-        })
+        .select(
+        //   {
+        //   id: call_model.id,
+        //   caller_id: call_model.caller_id,
+        //   callee_id: call_model.callee_id,
+        //   status: call_model.status,
+        //   duration_seconds: call_model.duration_seconds,
+        //   started_at: call_model.started_at,
+        //   answered_at: call_model.answered_at,
+        //   ended_at: call_model.ended_at,
+        //   reason: call_model.reason,
+        //   // Contact info (the other person in the call)
+        //   contact_id: sql`CASE 
+        //     WHEN ${call_model.caller_id} = ${user_id} THEN ${call_model.callee_id}
+        //     ELSE ${call_model.caller_id}
+        //   END`.as('contact_id'),
+        //   contact_name: sql`CASE 
+        //     WHEN ${call_model.caller_id} = ${user_id} THEN ${callee.name}
+        //     ELSE ${caller.name}
+        //   END`.as('contact_name'),
+        //   contact_profile_pic: sql`CASE 
+        //     WHEN ${call_model.caller_id} = ${user_id} THEN ${callee.profile_pic}
+        //     ELSE ${caller.profile_pic}
+        //   END`.as('contact_profile_pic'),
+        //   // Call direction
+        //   call_type: sql`CASE 
+        //     WHEN ${call_model.caller_id} = ${user_id} THEN 'outgoing'
+        //     ELSE 'incoming'
+        //   END`.as('call_type')
+        // }
+      )
         .from(call_model)
-        .leftJoin(caller, eq(call_model.caller_id, caller.id))
-        .leftJoin(callee, eq(call_model.callee_id, callee.id))
+        // .leftJoin(caller, eq(call_model.caller_id, caller.id))
+        // .leftJoin(callee, eq(call_model.callee_id, callee.id))
         .where(
           or(
             eq(call_model.caller_id, user_id),
@@ -355,10 +351,28 @@ export class CallService {
         .orderBy(desc(call_model.created_at))
         .limit(limit);
 
-      return { success: true, data: calls };
+      if (calls.length === 0) {
+        return {
+          success: false,
+          code: 404,
+          message: 'No call history found'
+        };
+      }
+
+      return {
+        success: true,
+        code: 200,
+        message: 'Call history retrieved successfully',
+        data: calls
+      };
+
     } catch (error) {
       console.error('[CALL] Error getting call history:', error);
-      return { success: false, error: 'Failed to get call history' };
+      return {
+        success: false,
+        code: 500,
+        message: 'Failed to get call history',
+      };
     }
   }
 }

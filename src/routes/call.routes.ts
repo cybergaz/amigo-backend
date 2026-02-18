@@ -1,6 +1,9 @@
 import { Elysia, t } from "elysia";
 import { CallService } from "@/services/call.service";
 import { app_middleware } from "@/middleware";
+import db from "@/config/db";
+import { eq } from "drizzle-orm";
+import { call_model } from "@/models/call.model";
 
 const call_routes = new Elysia({ prefix: "/call" })
   .state({ id: 0, role: "" })
@@ -68,6 +71,59 @@ const call_routes = new Elysia({ prefix: "/call" })
         message: "Internal server error"
       };
     }
+  })
+
+  .post("/decline/:call_id", async ({ set, params }) => {
+    try {
+      const callId = Number(params.call_id);
+
+      // Get call info from database
+      const [call_info] = await db.select().from(call_model).where(eq(call_model.id, callId)).limit(1);
+
+      if (!call_info) {
+        set.status = 404;
+        return {
+          success: false,
+          message: "Call not found"
+        };
+      }
+
+      // Decline the call
+      await CallService.decline_call(callId, call_info.callee_id);
+
+      set.status = 200;
+      return {
+        success: true,
+        message: "Call declined successfully"
+      };
+    } catch (error) {
+      console.error('[UNPROTECTED CALL ROUTES] Error declining call:', error);
+      set.status = 500;
+      return {
+        success: false,
+        message: "Internal server error"
+      };
+    }
+  })
+
+  .get("/status/:call_id", async ({ set, params }) => {
+    const [call_info] = await db.select().from(call_model).where(eq(call_model.id, Number(params.call_id))).limit(1);
+
+    if (!call_info) {
+      set.status = 404;
+      return {
+        success: false,
+        data: null,
+        message: "Call not found"
+      };
+    }
+
+    set.status = 200;
+    return {
+      success: true,
+      data: call_info,
+      message: "Call status retrieved successfully"
+    };
   })
 
 // .get("/status", async ({ set, store, query }) => {

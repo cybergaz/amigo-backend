@@ -7,6 +7,7 @@ import {
   DBUpdateMessageStatusType,
   message_status_model,
   DBInsertMessageStatusType,
+  DBInsertMessageType,
 } from "@/models/chat.model";
 import { user_model } from "@/models/user.model";
 import { broadcast_message } from "@/sockets/socket.handlers";
@@ -21,9 +22,13 @@ import {
   MediaMetadataRequest,
   MessageType
 } from "@/types/chat.types";
-import { ChatMessageAckPayload, ChatMessagePayload, MessagePinPayload } from "@/types/socket.types";
+import { ResultType } from "@/types/core.types";
+import { ChatMessageAckPayload, ChatMessagePayload, MessagePinPayload, SyncMessagesPayload } from "@/types/socket.types";
 import { create_unique_id } from "@/utils/general.utils";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import Snowflake from "@/utils/snowflake.utils";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { SingleStoreJson } from "drizzle-orm/singlestore-core";
+import { Error } from "postgres";
 
 // Helper function to verify user membership in conversation
 const verify_user_membership = async (conversation_id: number, user_id: number) => {
@@ -50,7 +55,7 @@ const get_user_info = async (user_id: number) => {
   return user;
 };
 
-const store_message = async (payload: ChatMessagePayload) => {
+const store_message = async (payload: ChatMessagePayload, custom_msg_id?: bigint): Promise<ResultType<DBInsertMessageType>> => {
   try {
 
     // Handle reply metadata if applicable
@@ -93,6 +98,7 @@ const store_message = async (payload: ChatMessagePayload) => {
     const [new_message] = await db
       .insert(message_model)
       .values({
+        id: custom_msg_id ? custom_msg_id : payload.id,
         conversation_id: payload.conv_id,
         sender_id: payload.sender_id,
         type: payload.msg_type,
@@ -100,7 +106,7 @@ const store_message = async (payload: ChatMessagePayload) => {
         attachments: payload.attachments,
         metadata: payload.metadata,
         sent_at: new Date(payload.sent_at),
-      }).returning()
+      }).returning();
 
     if (!new_message) {
       return {
@@ -118,14 +124,51 @@ const store_message = async (payload: ChatMessagePayload) => {
     };
   }
   catch (error) {
-    console.error("storing message", error);
+    const err = error as any;
+    // Handle unique constraint violation (message ID already exists)
+    if (err.cause.code == '23505') {
+      return {
+        success: false,
+        code: 409,
+        message: "message id already exists",
+      };
+    }
     return {
       success: false,
       code: 500,
       message: "Failed to store message",
     };
   }
+};
+
+
+interface StoreWithRetryResultType extends ResultType<DBInsertMessageType> {
+  new_id?: bigint; // If a new ID was generated due to collision, return it here
 }
+
+const store_message_with_retry = async (payload: ChatMessagePayload, retry_count: number): Promise<StoreWithRetryResultType> => {
+  // first try with the provided ID (optimistic case)
+  const store_result = await store_message(payload);
+
+  if (store_result.success) {
+    return store_result;
+  }
+  for (let i = 0; i < retry_count; i++) {
+
+    // if failed due to ID collision, generate a new ID and try again
+    const new_id = Snowflake.generateMessageId(payload.sender_id);
+    const store_result = await store_message(payload, new_id);
+    if (store_result.success) {
+      return { ...store_result, new_id: new_id };
+    }
+  }
+
+  return {
+    success: false,
+    code: 500,
+    message: "Failed to store message",
+  };
+};
 
 // Pin messages
 const pin_message = async (payload: PinMessageRequest) => {
@@ -163,7 +206,7 @@ const pin_message = async (payload: PinMessageRequest) => {
           user_id: payload.user_id,
           pinned_at: new Date().toISOString()
         }
-      }
+      };
     } else {
       // Pin the new message (this will replace any existing pinned message)
 
@@ -420,6 +463,7 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: number) =
     const [replyMessage] = await db
       .insert(message_model)
       .values({
+        id: request.message_id,
         conversation_id: request.conversation_id,
         sender_id: user_id,
         type: "text",
@@ -477,46 +521,49 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
       };
     }
 
-    const forwardedMessages: Map<number, (DBMessageType & { conv_type: string })[]> = new Map();
+    const forwardedMessages: Map<number, (DBMessageType & { conv_type: string; })[]> = new Map();
 
     for (const target_conv_id of request.target_conversation_ids) {
 
-      const all_msgs: (DBMessageType & { conv_type: string })[] = [];
+      const all_msgs: (DBMessageType & { conv_type: string; })[] = [];
 
       const [conv] = await db
         .select({ conv_type: conversation_model.type })
         .from(conversation_model)
-        .where(eq(conversation_model.id, target_conv_id))
+        .where(eq(conversation_model.id, target_conv_id));
 
 
       for (const message of original_messages) {
-        const [inserted_msg] = await db.insert(message_model).values({
-          conversation_id: target_conv_id,
-          sender_id: user_id,
-          type: message.type,
-          body: message.body,
-          attachments: message.attachments,
-          metadata: {
-            ...message.metadata as MessageMetadata,
-            forwarded_from: {
-              original_message_id: message.id,
-              original_conversation_id: request.source_conversation_id,
-              original_sender_id: message.sender_id,
-              forwarded_by: user_id,
-              forwarded_at: new Date().toISOString()
-            }
-          },
-          forwarded_from: request.source_conversation_id,
-          sent_at: new Date(),
-        }).returning()
+        const [inserted_msg] = await db
+          .insert(message_model)
+          .values({
+            id: Snowflake.generateMessageId(user_id),
+            conversation_id: target_conv_id,
+            sender_id: user_id,
+            type: message.type,
+            body: message.body,
+            attachments: message.attachments,
+            metadata: {
+              ...message.metadata as MessageMetadata,
+              forwarded_from: {
+                original_message_id: message.id,
+                original_conversation_id: request.source_conversation_id,
+                original_sender_id: message.sender_id,
+                forwarded_by: user_id,
+                forwarded_at: new Date().toISOString()
+              }
+            },
+            forwarded_from: request.source_conversation_id,
+            sent_at: new Date(),
+          }).returning();
 
         all_msgs.push({
           ...inserted_msg,
           conv_type: conv.conv_type
-        })
+        });
       }
 
-      forwardedMessages.set(target_conv_id, all_msgs)
+      forwardedMessages.set(target_conv_id, all_msgs);
     }
 
     return {
@@ -758,56 +805,6 @@ const get_starred_messages = async (user_id: number, conversation_id?: number) =
   }
 };
 
-const store_media = async (request: MediaMetadataRequest, user_id: number) => {
-  try {
-
-    const { conversation_id, category, ...rest_of_the_request } = request;
-
-    // Map category to message type
-    let messageType: string = 'media'; // default
-    if (category === 'images') {
-      messageType = 'image';
-    } else if (category === 'videos') {
-      messageType = 'video';
-    } else if (category === 'audios') {
-      messageType = 'audio';
-    } else if (category === 'docs') {
-      messageType = 'document';
-    }
-
-    const [media] = await db
-      .insert(message_model)
-      .values({
-        conversation_id: request.conversation_id,
-        sender_id: user_id,
-        type: messageType as MessageType,
-        attachments: rest_of_the_request || null,
-      })
-      .returning();
-
-    // Update conversation's last_message_at
-    await db
-      .update(conversation_model)
-      .set({ last_message_at: new Date() })
-      .where(eq(conversation_model.id, request.conversation_id));
-
-    return {
-      success: true,
-      code: 200,
-      message: "Media message stored successfully",
-      data: media,
-    };
-
-  } catch (error) {
-    console.error("store_media error", error);
-    return {
-      success: false,
-      code: 500,
-      message: "ERROR: store_media",
-    };
-  }
-}
-
 const insert_message_status = async (msg_status: Pick<DBInsertMessageStatusType, "user_id" | "message_id" | "conv_id" | "delivered_at" | "read_at">) => {
   try {
 
@@ -821,7 +818,7 @@ const insert_message_status = async (msg_status: Pick<DBInsertMessageStatusType,
         delivered_at: msg_status.delivered_at,
         read_at: msg_status.read_at,
         updated_at: new Date()
-      }).returning()
+      }).returning();
 
     if (!inserted_status) {
       return {
@@ -846,7 +843,7 @@ const insert_message_status = async (msg_status: Pick<DBInsertMessageStatusType,
       message: "ERROR: store_message_status",
     };
   }
-}
+};
 
 const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
   try {
@@ -872,7 +869,7 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
             eq(message_status_model.message_id, msg_status.message_id),
             eq(message_status_model.user_id, msg_status.user_id)
           )
-        ).returning())[0]
+        ).returning())[0];
     }
     else if (!msg_status.delivered_at && msg_status.read_at) {
       updated_status = (await db
@@ -885,7 +882,7 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
             eq(message_status_model.message_id, msg_status.message_id),
             eq(message_status_model.user_id, msg_status.user_id)
           )
-        ).returning())[0]
+        ).returning())[0];
     }
     else {
       // Upsert message status
@@ -900,7 +897,7 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
             eq(message_status_model.message_id, msg_status.message_id),
             eq(message_status_model.user_id, msg_status.user_id)
           )
-        ).returning())[0]
+        ).returning())[0];
     }
 
     if (updated_status === undefined || updated_status === null) {
@@ -926,19 +923,17 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
       message: "ERROR: update_message_status",
     };
   }
-}
+};
 
-/**
- * Batch insert message statuses for multiple messages and users
- * This is MUCH more efficient than calling insert_message_status in a loop
- * 
- * Example: For 20 messages forwarded to 30 conversations with 40 users each:
- * - Old way: 20 * 30 * 40 = 24,000 DB calls
- * - New way: 30 DB calls (one per conversation) or even 1 call if we batch everything
- * 
- * @param statuses Array of message status records to insert
- * @returns Success/failure response
- */
+// Batch insert message statuses for multiple messages and users
+// This is MUCH more efficient than calling insert_message_status in a loop
+// 
+// Example: For 20 messages forwarded to 30 conversations with 40 users each:
+// - Old way: 20 * 30 * 40 = 24,000 DB calls
+// - New way: 30 DB calls (one per conversation) or even 1 call if we batch everything
+// 
+// @param statuses Array of message status records to insert
+// @returns Success/failure response
 const batch_insert_message_status = async (
   statuses: Array<Pick<DBInsertMessageStatusType, "user_id" | "message_id" | "conv_id" | "delivered_at" | "read_at">>
 ) => {
@@ -984,26 +979,24 @@ const batch_insert_message_status = async (
       message: "ERROR: batch_insert_message_status",
     };
   }
-}
+};
 
-/**
- * Batch update message statuses for multiple messages for a single user
- * Useful for marking multiple messages as read/delivered when user opens a conversation
- * 
- * Example: User opens conversation with 50 unread messages
- * - Old way: 50 individual update queries
- * - New way: 1 batch update using SQL WHERE IN clause
- * 
- * @param user_id The user whose message statuses are being updated
- * @param conv_id The conversation ID (optional, for more specific updates)
- * @param message_ids Array of message IDs to update
- * @param status_update Object containing delivered_at and/or read_at timestamps
- * @returns Success/failure response
- */
+// Batch update message statuses for multiple messages for a single user
+// Useful for marking multiple messages as read/delivered when user opens a conversation
+// 
+// Example: User opens conversation with 50 unread messages
+// - Old way: 50 individual update queries
+// - New way: 1 batch update using SQL WHERE IN clause
+// 
+// @param user_id The user whose message statuses are being updated
+// @param conv_id The conversation ID (optional, for more specific updates)
+// @param message_ids Array of message IDs to update
+// @param status_update Object containing delivered_at and/or read_at timestamps
+// @returns Success/failure response
 const batch_update_message_status = async (
   user_id: number,
-  message_ids: number[],
-  status_update: { delivered_at?: Date; read_at?: Date },
+  message_ids: bigint[],
+  status_update: { delivered_at?: Date; read_at?: Date; },
   conv_id?: number
 ) => {
   try {
@@ -1017,7 +1010,7 @@ const batch_update_message_status = async (
     }
 
     // Build the update object dynamically
-    const updateData: { delivered_at?: Date; read_at?: Date; updated_at: Date } = {
+    const updateData: { delivered_at?: Date; read_at?: Date; updated_at: Date; } = {
       updated_at: new Date()
     };
 
@@ -1061,19 +1054,17 @@ const batch_update_message_status = async (
       message: "ERROR: batch_update_message_status",
     };
   }
-}
+};
 
-/**
- * Mark a message as delivered via API (typically from FCM when app was killed)
- * This updates the database and broadcasts a WebSocket message to the sender
- * 
- * @param message_id The ID of the message that was delivered
- * @param conversation_id The conversation ID
- * @param recipient_id The user ID who received the message
- * @returns Success/failure response
- */
+// Mark a message as delivered via API (typically from FCM when app was killed)
+// This updates the database and broadcasts a WebSocket message to the sender
+// 
+// @param message_id The ID of the message that was delivered
+// @param conversation_id The conversation ID
+// @param recipient_id The user ID who received the message
+// @returns Success/failure response
 const mark_message_delivered = async (
-  message_id: number,
+  message_id: bigint,
   conversation_id: number,
   recipient_id: number
 ) => {
@@ -1125,8 +1116,7 @@ const mark_message_delivered = async (
     );
 
     const ack_payload: ChatMessageAckPayload = {
-      optimistic_id: 0, // Not needed for delivery receipts
-      canonical_id: message_id,
+      id: message_id,
       conv_id: conversation_id,
       sender_id: sender_id,
       delivered_at: new Date(),
@@ -1168,10 +1158,11 @@ const mark_message_delivered = async (
       message: "ERROR: mark_message_delivered",
     };
   }
-}
+};
 
 export {
   store_message,
+  store_message_with_retry,
   pin_message,
   unpin_message,
   star_messages,
@@ -1180,10 +1171,9 @@ export {
   delete_messages,
   get_pinned_messages,
   get_starred_messages,
-  store_media,
   insert_message_status,
   update_message_status,
   batch_insert_message_status,
   batch_update_message_status,
-  mark_message_delivered
+  mark_message_delivered,
 };

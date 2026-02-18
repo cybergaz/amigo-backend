@@ -1,5 +1,5 @@
 // Call signaling message types
-export interface CallSignalingMessage {
+interface CallSignalingMessage {
   type: 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed';
   callId: number;
   from: number;
@@ -9,26 +9,60 @@ export interface CallSignalingMessage {
 }
 
 // Call initialization payload
-export interface CallInitPayload {
+interface CallInitPayload {
   callerName: string;
   callerProfilePic?: string;
 }
 
 // WebRTC SDP offer/answer payload
-export interface SDPPayload {
+interface SDPPayload {
   sdp: string;
   type: 'offer' | 'answer';
 }
 
 // ICE candidate payload
-export interface ICEPayload {
+interface ICEPayload {
   candidate: string;
   sdpMLineIndex?: number;
   sdpMid?: string;
 }
 
 // Call end reason
-export interface CallEndPayload {
-  reason?: 'user_hangup' | 'timeout' | 'network_error' | 'busy' | 'no_answer';
+interface CallEndPayload {
+  reason?: CallEndReasonsType;
   duration?: number;
 }
+
+const CALL_STATUS_CONSTS = [
+  "initiated",
+  "ringing",
+  "answered",
+  "ended",
+  "missed",
+  "declined"
+] as const;
+
+const CALL_END_REASONS_CONSTS = [
+  'busy',
+  'timeout',
+  'declined',
+  'abandoned',
+  'caller_hungup',
+  'callee_hungup',
+  'network_error',
+] as const;
+
+type CallStatusType = typeof CALL_STATUS_CONSTS[number];
+type CallEndReasonsType = typeof CALL_END_REASONS_CONSTS[number];
+
+export { CALL_STATUS_CONSTS, CALL_END_REASONS_CONSTS };
+export type {
+  CallSignalingMessage,
+  CallInitPayload,
+  SDPPayload,
+  ICEPayload,
+  CallEndPayload,
+  CallEndReasonsType,
+  CallStatusType
+};
+

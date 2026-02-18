@@ -28,35 +28,35 @@ module.exports = {
     instances: 'max', // Automatically spawn one instance per CPU core
     exec_mode: 'cluster', // Enable load balancing across instances
     interpreter: 'bun',
-    
+
     // Auto restart on file changes during development
     watch: process.env.NODE_ENV === 'development',
     ignore_watch: ['node_modules', 'drizzle', '.git'],
-    
+
     // Environment variables
     env: {
       NODE_ENV: 'production',
       CLUSTER_MODE: 'true',
     },
-    
+
     // Restart settings
     autorestart: true,
     max_restarts: 10,
     min_uptime: '10s',
-    
+
     // Logging
     error_file: './logs/pm2-error.log',
     out_file: './logs/pm2-out.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
     merge_logs: true,
-    
+
     // Memory management
-    max_memory_restart: '1G', // Restart if memory exceeds 1GB
-    
+    max_memory_restart: '4G', // Restart if memory exceeds 1GB
+
     // Kill settings
     kill_timeout: 5000,
     wait_ready: true,
-    
+
     // Health monitoring
     listen_timeout: 10000,
   }]

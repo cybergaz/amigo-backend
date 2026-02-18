@@ -41,12 +41,10 @@ sub.on("message", (channel, message) => {
   // }
 });
 
-/**
- * Get conversation members following the cache flow:
- * 1. Check LRU cache (local)
- * 2. If cache miss, fetch from Redis (SMEMBERS conv:{conv_id}:members)
- * 3. If Redis miss, fetch from DB
-**/
+// Get conversation members following the cache flow:
+// 1. Check LRU cache (local)
+// 2. If cache miss, fetch from Redis (SMEMBERS conv:{conv_id}:members)
+// 3. If Redis miss, fetch from DB
 const get_conversation_members = async (conv_id: number): Promise<Set<number>> => {
   // Step 1: Check LRU cache (local)
   const cached = conv_user_cache.get(conv_id);

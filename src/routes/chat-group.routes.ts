@@ -1,0 +1,111 @@
+import Elysia, { t } from "elysia";
+import { app_middleware } from "@/middleware";
+import { add_new_member, create_group, demote_to_member, get_group_info, promote_to_admin, remove_member, update_group_title } from "@/services/chat-group.service";
+
+export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
+  .state({ id: 0, role: "" })
+  .guard({
+    beforeHandle({ cookie, set, store, headers }) {
+      const state_result = app_middleware({ cookie, headers });
+
+      set.status = state_result.code;
+      if (!state_result.data) return state_result
+
+      store.id = state_result.data.id;
+      store.role = state_result.data.role;
+    }
+  })
+
+  .post("/create-group", async ({ set, store, body }) => {
+    const group_result = await create_group(store.id, body.title, body.member_ids);
+    set.status = group_result.code;
+    return group_result;
+  }, {
+    body: t.Object({
+      title: t.String(),
+      member_ids: t.Optional(t.Array(t.Number()))
+    })
+  })
+
+  .get("/get-group-info/:conversation_id", async ({ set, store, params }) => {
+    const chats_result = await get_group_info(params.conversation_id);
+    set.status = chats_result.code;
+    return chats_result;
+  },
+    {
+      params: t.Object({ conversation_id: t.Number() })
+    }
+  )
+
+  .post("/add-members", async ({ set, store, body }) => {
+    const member_result = await add_new_member(
+      body.conversation_id,
+      body.user_ids,
+      body.role,
+      store.id,
+    );
+    set.status = member_result.code;
+    return member_result;
+  }, {
+    body: t.Object({
+      conversation_id: t.Number(),
+      user_ids: t.Array(t.Number()),
+      role: t.Optional(t.Union([t.Literal("admin"), t.Literal("member")]))
+    })
+  })
+
+  .delete("/remove-member", async ({ set, store, body }) => {
+    const member_result = await remove_member(
+      body.conversation_id,
+      body.user_id,
+      store.id,
+    );
+    set.status = member_result.code;
+    return member_result;
+  }, {
+    body: t.Object({
+      conversation_id: t.Number(),
+      user_id: t.Number()
+    })
+  })
+
+  .post("/promote-to-admin", async ({ set, store, body }) => {
+    const promotion_result = await promote_to_admin(
+      body.conversation_id,
+      body.user_id,
+      store.id,
+    );
+    set.status = promotion_result.code;
+    return promotion_result;
+  }, {
+    body: t.Object({
+      conversation_id: t.Number(),
+      user_id: t.Number(),
+    })
+  })
+
+  .post("/demote-to-member", async ({ set, store, body }) => {
+    const promotion_result = await demote_to_member(
+      body.conversation_id,
+      body.user_id,
+      store.id,
+    );
+    set.status = promotion_result.code;
+    return promotion_result;
+  }, {
+    body: t.Object({
+      conversation_id: t.Number(),
+      user_id: t.Number(),
+    })
+  })
+
+  .put("/update-group-title", async ({ set, store, body }) => {
+    const title_result = await update_group_title(body.conversation_id, body.title);
+    set.status = title_result.code;
+    return title_result;
+  }, {
+    body: t.Object({
+      conversation_id: t.Number(),
+      title: t.String()
+    })
+  })

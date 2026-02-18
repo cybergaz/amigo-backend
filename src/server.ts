@@ -12,6 +12,11 @@ import admin_routes from "./routes/admin.routes";
 import unprotected_call_routes from "./routes/unprotected-calls.routes";
 import web_socket_server from "./sockets/socket.server";
 import { parse_phone } from "./utils/general.utils";
+import Snowflake from "./utils/snowflake.utils";
+import { store_message } from "./services/message.services";
+import { chat_dm_routes } from "./routes/chat-dm.routes";
+import { chat_group_routes } from "./routes/chat-group.routes";
+import { chat_http_routes } from "./routes/chat-http.routes";
 
 const SERVER_PORT = parseInt(process.env.SERVER_PORT || "5000");
 if (!SERVER_PORT || isNaN(SERVER_PORT)) {
@@ -45,14 +50,17 @@ const app = new Elysia({ prefix: "/api" })
     origin: [process.env.FRONTEND_URL || "http://localhost:3000", "https://amigochats.com", "https://www.amigochats.com", "https://admin.amigochats.com"],
     credentials: true,
   }))
+
   .use(auth_routes)
   .use(user_routes)
   .use(chat_routes)
-  .use(media_routes)
+  .use(chat_dm_routes)
+  .use(chat_group_routes)
+  .use(chat_http_routes)
   .use(community_routes)
+  .use(media_routes)
   .use(call_routes)
   .use(admin_routes)
-  .use(unprotected_call_routes)
   // .use(web_socket)
   .use(web_socket_server)
   .listen(SERVER_PORT);
@@ -74,4 +82,4 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-// console.log(((await hash_password("Admin@123"))))
+// console.log((Snowflake.generateMessageId(332323)))

@@ -1,15 +1,7 @@
 import { pgTable, bigserial, bigint, timestamp, varchar, integer } from "drizzle-orm/pg-core";
 import { InferInsertModel, InferSelectModel } from "drizzle-orm";
 import { user_model } from "./user.model";
-
-export const CALL_STATUS_CONSTS = [
-  "initiated",
-  "ringing",
-  "answered",
-  "ended",
-  "missed",
-  "declined"
-] as const;
+import { CALL_END_REASONS_CONSTS, CALL_STATUS_CONSTS } from "@/types/call.types";
 
 export const call_model = pgTable("calls", {
   id: bigserial({ mode: "number" }).primaryKey(),
@@ -20,7 +12,7 @@ export const call_model = pgTable("calls", {
   ended_at: timestamp({ withTimezone: true }),
   duration_seconds: integer().default(0),
   status: varchar({ enum: CALL_STATUS_CONSTS }).notNull(),
-  reason: varchar(),
+  reason: varchar({ enum: CALL_END_REASONS_CONSTS }),
   created_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
 });
 

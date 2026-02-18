@@ -13,6 +13,7 @@ import {
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
 import { eq, and, inArray, ne, sql, or, ilike } from "drizzle-orm";
 import { ConnectionStatusType } from "@/types/socket.types";
+import { store_fcm_token } from "@/services/fcm-token.cache";
 
 type CreateUserParams = {
   name: string;
@@ -177,11 +178,16 @@ export const get_user_details = async (id: number) => {
 
 export const update_user_details = async (id: number, body: UpdateUserType) => {
   try {
+    // If fcm_token is being updated, update the cache first
+    if (body.fcm_token !== undefined) {
+      await store_fcm_token(id, body.fcm_token || null);
+    }
+
     const user_details = await db
       .update(user_model)
       .set(body)
       .where(eq(user_model.id, id))
-      .returning()
+      .returning();
 
     if (user_details.length === 0) {
       return {
@@ -197,6 +203,39 @@ export const update_user_details = async (id: number, body: UpdateUserType) => {
       code: 200,
       message: "User details updated successfully",
       data: user_details[0],
+    };
+  } catch (error) {
+    return {
+      success: false,
+      code: 500,
+      message: "Failed to update user details",
+      data: null,
+    };
+  }
+};
+
+export const batch_update_users_details = async (ids: number[], body: UpdateUserType) => {
+  try {
+    const users_details = await db
+      .update(user_model)
+      .set(body)
+      .where(inArray(user_model.id, ids))
+      .returning();
+
+    if (users_details.length === 0) {
+      return {
+        success: false,
+        code: 404,
+        message: "No Such User",
+        data: null,
+      };
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "User details updated successfully",
+      data: users_details,
     };
   } catch (error) {
     return {
@@ -275,6 +314,7 @@ export const get_available_users = async (self_id: number, phone_numbers: string
       .select({
         id: user_model.id,
         name: user_model.name,
+        role: user_model.role,
         phone: user_model.phone,
         profile_pic: user_model.profile_pic,
       })
@@ -319,7 +359,7 @@ export const get_all_users_paginated = async (page: number = 1, limit: number = 
         ilike(user_model.name, `%${search}%`),
         ilike(user_model.phone, `%${search}%`),
       )
-      : role !== "all" ? eq(user_model.role, role as RoleType) : undefined
+      : role !== "all" ? eq(user_model.role, role as RoleType) : undefined;
 
     // Get total count with search filter
     const totalCountResult = await db

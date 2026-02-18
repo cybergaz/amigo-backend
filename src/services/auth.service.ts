@@ -187,10 +187,8 @@ const handle_refresh_token_mobile = async (token: string) => {
   }
 };
 
-/**
- * Validate if a refresh token is still valid (matches what's in the database)
- * This is a lightweight check to verify if the token was invalidated by a new login
- */
+// Validate if a refresh token is still valid (matches what's in the database)
+// This is a lightweight check to verify if the token was invalidated by a new login
 const validate_refresh_token = async (token: string) => {
   try {
     const [user] = await db
@@ -222,11 +220,9 @@ const validate_refresh_token = async (token: string) => {
   }
 };
 
-/**
- * Force logout all other devices when a user logs in on a new device
- * This sends a WebSocket message to all active connections for the user
- * and closes those connections
- */
+// Force logout all other devices when a user logs in on a new device
+// This sends a WebSocket message to all active connections for the user
+// and closes those connections
 const force_logout_other_devices = async (user_id: number): Promise<void> => {
   try {
     const connection = socket_connections.get(user_id);

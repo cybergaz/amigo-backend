@@ -1,7 +1,6 @@
 import { app_middleware } from "@/middleware";
 import Elysia, { t } from "elysia";
 import { get_all_users_paginated, update_user_role, update_user_call_access, get_dashboard_stats, create_admin_user, get_all_admins, update_admin_permissions, update_admin_status, get_user_permissions, delete_user_permanently } from "@/services/user.services";
-import { get_chat_list, get_group_info, add_new_member, remove_member, get_conversation_history, get_all_conversations_admin, get_conversation_members_admin, get_conversation_history_admin, hard_delete_message, hard_delete_chat, revive_chat, force_declare_group_creater } from "@/services/chat.services";
 import { get_communities, get_community_groups } from "@/services/community.services";
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
@@ -11,6 +10,9 @@ import { REQUEST_STATUS_CONST, RoleType } from "@/types/user.types";
 import { eq, sql } from "drizzle-orm";
 import { community_model } from "@/models/community.model";
 import { update_signup_request_status, get_all_signup_requests } from "@/services/auth.service";
+import { force_declare_group_creater, get_all_conversations_admin, get_conversation_history_admin, get_conversation_members_admin, hard_delete_chat } from "@/services/chat-admin.service";
+import { add_new_member, remove_member } from "@/services/chat-group.service";
+import { hard_delete_message, revive_chat } from "@/services/chat.services";
 
 const admin_routes = new Elysia({ prefix: "/admin" })
   // unauthorized route to create a super admin if none exists
@@ -751,7 +753,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }
   }, {
     params: t.Object({
-      message_id: t.Number()
+      message_id: t.BigInt()
     })
   })
 

@@ -10,7 +10,7 @@ interface WebSocketData {
 }
 
 // Transport types for fallback support
-type TransportType = 'ws' | 'sse' | 'polling';
+type TransportType = 'ws' | 'polling';
 
 // Connection management
 interface UserConnection {
@@ -25,46 +25,30 @@ interface UserConnection {
   client_ip?: string;
 }
 
-// SSE connection for fallback
-interface SSEConnection {
-  controller: ReadableStreamDefaultController;
-  user_id: number;
-  connected_at: Date;
-  last_keepalive?: Date;
-  client_ip?: string;
-}
-
-// Polling message queue
-interface PendingMessage {
-  message: WSMessage;
-  timestamp: Date;
-  message_id: string;
-}
-
 interface PollingConnection {
   user_id: number;
-  pending_messages: PendingMessage[];
+  pending_messages: VitalWSMessage[];
   last_poll?: Date;
-  last_message_id?: string;
+  last_message_id?: bigint;
   connected_at: Date;
   client_ip?: string;
 }
 
-// Ping message for heartbeat
-type PingMessage = {
-  type: 'ping';
-  timestamp: string;
-}
-
-// Pong message for heartbeat response
-type PongMessage = {
-  type: 'pong';
-  timestamp: string;
-}
+// // Ping message for heartbeat
+// type PingMessage = {
+//   type: 'ping';
+//   timestamp: string;
+// }
+//
+// // Pong message for heartbeat response
+// type PongMessage = {
+//   type: 'pong';
+//   timestamp: string;
+// }
 
 // Regular WebSocket message with payload
-type RegularWSMessage = {
-  type: Exclude<WSMessageType, 'ping' | 'pong'>;
+type WSMessage = {
+  type: WSMessageEventsType;
   payload?: ConnectionStatusPayload
   | JoinLeavePayload
   | NewConversationPayload
@@ -80,133 +64,136 @@ type RegularWSMessage = {
   | SyncMessagesPayload
   | MessageDeliveredPayload;
   ws_timestamp?: Date;
+};
+
+// Subset of WSMessage for critical events that must be processed by clients even if they miss some messages (e.g. due to reconnection)
+interface VitalWSMessage {
+  type: VitalWSMessageEventsType;
+  payload:
+  NewConversationPayload
+  | ChatMessagePayload
+  | DeleteMessagePayload
+  | MessagePinPayload
+  | MessageForwardPayload
+  | ConversationActionPayload
+  | MessageDeliveredPayload;
+  ws_timestamp?: Date;
 }
-
-// Union type for all WebSocket messages
-type WSMessage = PingMessage | PongMessage | RegularWSMessage;
-
-// type WSPayload = {
-//   sender_id: number
-//   sender_name?: number
-//   target_user_ids?: number[];
-//   origin_conv_id?: number
-//   target_conv_ids?: number[]
-//   message_ids?: number[]
-//   content?: any
-// }
 
 const CONNECTION_STATUS_CONST = ['foreground', 'background', 'disconnected', 'stale'] as const;
-type ConnectionStatusType = typeof CONNECTION_STATUS_CONST[number]
+type ConnectionStatusType = typeof CONNECTION_STATUS_CONST[number];
 
 type ConnectionStatusPayload = {
-  sender_id: number
-  status: ConnectionStatusType
-}
+  sender_id: number;
+  status: ConnectionStatusType;
+};
 
 type JoinLeavePayload = {
-  conv_id: number
-  conv_type: ChatType
-  user_id: number
-  user_name?: string
-}
+  conv_id: number;
+  conv_type: ChatType;
+  user_id: number;
+  user_name?: string;
+};
 
 type ChatMessagePayload = {
-  optimistic_id: number
-  canonical_id?: number
-  sender_id: number
-  sender_name?: string
-  conv_id: number
-  conv_type: ChatType
-  msg_type: MessageType
-  body?: string
-  attachments?: any
-  metadata?: any
-  reply_to_message_id?: number
-  sent_at: Date
-}
+  id: bigint;
+  sender_id: number;
+  sender_name?: string;
+  conv_id: number;
+  conv_type: ChatType;
+  msg_type: MessageType;
+  body?: string;
+  attachments?: any;
+  metadata?: any;
+  reply_to_message_id?: bigint;
+  sent_at: Date;
+};
 
 type ChatMessageAckPayload = {
-  optimistic_id: number
-  canonical_id: number
-  conv_id: number
-  sender_id: number
-  delivered_at: Date
-  delivered_to?: number[]
-  read_by?: number[]
-  offline_users?: number[]
-}
+  id: bigint;
+  conv_id: number;
+  sender_id: number;
+  delivered_at: Date;
+  delivered_to?: number[];
+  read_by?: number[];
+  offline_users?: number[];
+  is_failed?: boolean;
+  error_code?: number;
+  new_id?: bigint;  // In case of message ID change due to retry or edit
+};
 
 type TypingPayload = {
-  conv_id: number
-  sender_id: number
-  sender_name?: string
-  sender_pfp?: string
-  is_typing: boolean
-}
+  conv_id: number;
+  sender_id: number;
+  sender_name?: string;
+  sender_pfp?: string;
+  is_typing: boolean;
+};
 
 type MessagePinPayload = {
-  conv_id: number
-  message_id: number
-  message_type: MessageType
-  sender_id: number
-  sender_name?: string
-  sender_pfp?: string
-  pin: boolean
-}
+  conv_id: number;
+  message_id: bigint;
+  message_type: MessageType;
+  sender_id: number;
+  sender_name?: string;
+  sender_pfp?: string;
+  pin: boolean;
+};
 
 type MessageForwardPayload = {
-  source_conv_id: number
-  forwarder_id: number
-  forwarder_name?: string
-  forwarded_message_ids: number[]
-  target_conv_ids: number[]
-}
+  source_conv_id: number;
+  forwarder_id: number;
+  forwarder_name?: string;
+  forwarded_message_ids: bigint[];
+  target_conv_ids: number[];
+};
 
 type DeleteMessagePayload = {
-  conv_id: number
-  sender_id: number
-  message_ids: number[]
-}
+  conv_id: number;
+  sender_id: number;
+  message_ids: bigint[];
+};
 
 type NewConversationPayload = {
-  conv_id: number
-  conv_type: ChatType
-  title?: string
-  creater_id: number
-  creater_name: string
-  creater_phone: string
-  creater_pfp?: string
-  members?: MembersType[]
-  joined_at: Date
-}
+  conv_id: number;
+  conv_type: ChatType;
+  title?: string;
+  creater_id: number;
+  creater_name: string;
+  creater_phone: string;
+  creater_pfp?: string;
+  members?: MembersType[];
+  joined_at: Date;
+};
 
 type MembersType = {
-  user_id: number
-  user_name: string
-  user_pfp?: string
-  role: ChatRoleType
-  joined_at: Date
-}
+  user_id: number;
+  user_name: string;
+  user_pfp?: string;
+  role: ChatRoleType;
+  joined_at: Date;
+};
 
 type CallPayload = {
-  call_id?: number
-  caller_id: number
-  caller_name?: string
-  caller_pfp?: string
-  callee_id: number
-  callee_name?: string
-  callee_pfp?: string
-  data?: any
-  error?: any
-  timestamp?: Date
-}
+  call_id?: number;
+  caller_id: number;
+  caller_name?: string;
+  caller_pfp?: string;
+  callee_id: number;
+  callee_name?: string;
+  callee_pfp?: string;
+  callType?: 'audio' | 'video';
+  data?: any;
+  error?: any;
+  timestamp?: Date;
+};
 
 type MiscPayload = {
-  message?: string
-  data?: any
-  code?: number
-  error?: any
-}
+  message?: string;
+  data?: any;
+  code?: number;
+  error?: any;
+};
 
 type ConversationActionType =
   | 'member_added'
@@ -215,50 +202,50 @@ type ConversationActionType =
   | 'member_demoted';
 
 type ConversationActionPayload = {
-  event_id: number
-  conv_id: number
-  conv_type: ChatType
-  action: ConversationActionType
-  members: MembersType[]
-  actor_id?: number
-  actor_name?: string
-  actor_pfp?: string
-  message: string
-  action_at: Date
-}
+  event_id: number;
+  conv_id: number;
+  conv_type: ChatType;
+  action: ConversationActionType;
+  members: MembersType[];
+  actor_id?: number;
+  actor_name?: string;
+  actor_pfp?: string;
+  message: string;
+  action_at: Date;
+};
 
 // Sync payload for missed messages on reconnection
-type SyncMessageItem = {
-  id: number
-  conv_id: number
-  conv_type: ChatType
-  sender_id: number
-  sender_name?: string
-  sender_pfp?: string
-  msg_type: MessageType
-  body?: string
-  attachments?: any
-  metadata?: any
-  sent_at: Date
-  created_at: Date
-}
+// type SyncMessageItem = {
+//   id: number
+//   conv_id: number
+//   conv_type: ChatType
+//   sender_id: number
+//   sender_name?: string
+//   sender_pfp?: string
+//   msg_type: MessageType
+//   body?: string
+//   attachments?: any
+//   metadata?: any
+//   sent_at: Date
+//   created_at: Date
+// }
 
 type SyncMessagesPayload = {
-  messages: SyncMessageItem[]
-  sync_timestamp: Date
-  total_count: number
-}
+  messages: ChatMessagePayload[];
+  sync_timestamp: Date;
+  total_count: number;
+};
 
 // Delivery receipt payload - sent by recipient when message is delivered via FCM
 type MessageDeliveredPayload = {
-  message_id: number
-  conv_id: number
-  sender_id: number
-  recipient_id: number
-  delivered_at: Date
-}
+  message_id: bigint;
+  conv_id: number;
+  sender_id: number;
+  recipient_id: number;
+  delivered_at: Date;
+};
 
-const WS_MESSAGE_TYPE_CONST = [
+const WS_MESSAGE_EVENTS_CONST = [
   'connection:status',
   'conversation:join',
   'conversation:leave',
@@ -277,34 +264,42 @@ const WS_MESSAGE_TYPE_CONST = [
   'call:offer',
   'call:answer',
   'call:ice',
-  'call:accept',
-  'call:decline',
-  'call:end',
   'call:ringing',
-  'call:missed',
+  'call:accept',
+  'call:terminate',
+  // 'call:decline',
+  // 'call:end',
+  // 'call:missed',
   'call:error',
   'socket:health_check',
+  'socket:ping',
+  'socket:pong',
   'socket:error',
   'auth:force_logout',
-  'ping',
-  'pong'
 ] as const;
 
-type WSMessageType = typeof WS_MESSAGE_TYPE_CONST[number];
+const VITAL_WS_EVENTS_CONST = [
+  'conversation:new',
+  'conversation:action',
+  'message:pin',
+  'message:forward',
+  'message:delete',
+  'message:new',
+  'message:delivered',
+] as const;
 
-export { WS_MESSAGE_TYPE_CONST, CONNECTION_STATUS_CONST }
+
+type WSMessageEventsType = typeof WS_MESSAGE_EVENTS_CONST[number];
+type VitalWSMessageEventsType = typeof VITAL_WS_EVENTS_CONST[number];
+
+export { WS_MESSAGE_EVENTS_CONST, CONNECTION_STATUS_CONST, VITAL_WS_EVENTS_CONST };
 export type {
   WebSocketData,
   UserConnection,
   TransportType,
-  SSEConnection,
   PollingConnection,
-  PendingMessage,
-  PingMessage,
-  PongMessage,
-  RegularWSMessage,
   WSMessage,
-  WSMessageType,
+  VitalWSMessage,
   ConnectionStatusPayload,
   JoinLeavePayload,
   ChatMessagePayload,
@@ -319,7 +314,9 @@ export type {
   CallPayload,
   ConnectionStatusType,
   ConversationActionPayload,
-  SyncMessageItem,
+  // SyncMessageItem,
   SyncMessagesPayload,
   MessageDeliveredPayload,
+  WSMessageEventsType,
+  VitalWSMessageEventsType
 };

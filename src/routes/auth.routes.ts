@@ -8,6 +8,7 @@ import { VerifySignupSchema } from "@/types/auth.types";
 import { password } from "bun";
 import Elysia, { t } from "elysia";
 import { eq, sql } from "drizzle-orm";
+import { remove_fcm_token } from "@/services/fcm-token.cache";
 
 // Cookie configuration based on environment
 // Use COOKIE_DOMAIN env var or detect production from FRONTEND_URL
@@ -447,9 +448,13 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     // clean up after logout
     const info = authenticate_jwt(cookie["refresh_token"].value as string);
     if (info.success && info.data?.id) {
+      // Remove FCM token from all 3 tiers (LRU, Redis, DB)
+      await remove_fcm_token(info.data.id);
+      
+      // Update online status in DB
       await db
         .update(user_model)
-        .set({ fcm_token: null, online_status: false })
+        .set({ online_status: false })
         .where(eq(user_model.id, info.data.id));
     }
 

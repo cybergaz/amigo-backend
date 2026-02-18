@@ -18,7 +18,7 @@ type MessageOperationType = typeof MESSAGE_OPERATION_CONSTS[number];
 interface ConversationMetadata {
   // Pin functionality - only one message can be pinned per conversation
   pinned_message?: {
-    message_id: number;
+    message_id: bigint;
     user_id: number;
     pinned_at: string;
   };
@@ -31,7 +31,7 @@ interface ConversationMetadata {
 interface MessageMetadata {
   // Reply functionality
   reply_to?: {
-    message_id: number;
+    message_id: bigint;
     sender_id: number;
     body?: string; // Preview of original message
     created_at: string;
@@ -45,7 +45,7 @@ interface MessageMetadata {
 
   // Forward functionality - track original message info
   forwarded_from?: {
-    original_message_id: number;
+    original_message_id: bigint;
     original_conversation_id: number;
     original_sender_id: number;
     forwarded_by: number;
@@ -71,37 +71,38 @@ interface MessageMetadata {
 
 // Request types for bulk operations
 interface BulkMessageOperation {
-  message_ids: number[];
+  message_ids: bigint[];
   operation: MessageOperationType;
   conversation_id: number;
 }
 
 interface PinMessageRequest {
-  message_id: number;
+  message_id: bigint;
   conv_id: number;
   user_id: number;
 }
 
 interface StarMessageRequest {
-  message_ids: number[];
+  message_ids: bigint[];
   conversation_id: number;
 }
 
 interface ReplyMessageRequest {
-  reply_to_message_id: number;
+  message_id: bigint;
+  reply_to_message_id: bigint;
   conversation_id: number;
   body: string;
   attachments?: any[];
 }
 
 interface ForwardMessageRequest {
-  message_ids: number[];
+  message_ids: bigint[];
   source_conversation_id: number;
   target_conversation_ids: number[];
 }
 
 interface DeleteMessageRequest {
-  message_ids: number[];
+  message_ids: bigint[];
   conversation_id: number;
   // delete_for_everyone?: boolean; // true = delete for all, false = delete for me only
 }

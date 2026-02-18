@@ -105,30 +105,10 @@ const user_routes = new Elysia({ prefix: "/user" })
   )
 
   .post("/update-fcm-token", async ({ set, store, body }) => {
-    try {
-      const result = await FCMService.updateUserFCMToken(store.id, body.fcm_token);
+    const result = await FCMService.update_user_fcm_token(store.id, body.fcm_token);
 
-      if (result) {
-        set.status = 200;
-        return {
-          success: true,
-          message: "FCM token updated successfully",
-        };
-      } else {
-        set.status = 500;
-        return {
-          success: false,
-          message: "Failed to update FCM token",
-        };
-      }
-    } catch (error: any) {
-      console.error("Error updating FCM token:", error);
-      set.status = 500;
-      return {
-        success: false,
-        message: "Internal server error",
-      };
-    }
+    set.status = result.code;
+    return result;
   },
     {
       body: t.Object({

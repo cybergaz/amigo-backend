@@ -92,6 +92,13 @@
       "when": 1767614522820,
       "tag": "0012_cold_warlock",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1770728957119,
+      "tag": "0013_wandering_multiple_man",
+      "breakpoints": true
     }
   ]
 }
