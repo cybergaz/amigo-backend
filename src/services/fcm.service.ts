@@ -6,7 +6,7 @@ import { conversation_member_model } from '@/models/chat.model';
 import { ChatMessagePayload, VitalWSMessage, WSMessage, } from '@/types/socket.types';
 import { MessageType } from '@/types/chat.types';
 import { ResultType } from '@/types/core.types';
-import { store_fcm_token, fetch_fcm_token, fetch_fcm_tokens, remove_fcm_token } from './fcm-token.cache';
+import { store_fcm_token, fetch_fcm_token, fetch_fcm_tokens, remove_fcm_token } from '@/services/cache-management/fcm-token.cache';
 
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
@@ -65,22 +65,23 @@ export class FCMService {
     try {
       // Fetch FCM tokens for all users using the 3-tier cache
       const token_map = await fetch_fcm_tokens(payload.user_ids);
-      
+
       // Filter out users without tokens and send notifications
       const send_promises = Array.from(token_map.entries())
         .filter(([_, token]) => token !== null)
         .map(async ([user_id, fcm_token]) => {
           if (!fcm_token) return false;
-          
+
           try {
             const message: admin.messaging.Message = {
               token: fcm_token,
               notification: payload.fcm_mode === 'notification'
                 ? {
-                    title: payload.title,
-                    body: payload.body,
-                  }
+                  title: payload.title,
+                  body: payload.body,
+                }
                 : undefined,
+
               data: {
                 type: payload.type,
                 ...payload.data,
@@ -97,9 +98,9 @@ export class FCMService {
                   sticky: payload.type === 'call' ? true : false,
                   sound: 'default',
                   vibrateTimingsMillis: [0, 250, 250, 250],
-                  ...(payload.type === 'ws-message' && payload.ws_message?.type === "message:new" ? {
-                    tag: `conversation_${(payload.ws_message?.payload as any).conv_id || "group"}`,
-                  } : {}),
+                  // ...(payload.type === 'ws-message' && payload.ws_message?.type === "message:new" ? {
+                  //   tag: `conversation_${(payload.ws_message?.payload as any).conv_id || "group"}`,
+                  // } : {}),
                 },
               },
               apns: {
@@ -117,8 +118,8 @@ export class FCMService {
             return true;
           } catch (error: any) {
             // Handle invalid token errors
-            if (error.code === 'messaging/registration-token-not-registered' || 
-                error.code === 'messaging/invalid-registration-token') {
+            if (error.code === 'messaging/registration-token-not-registered' ||
+              error.code === 'messaging/invalid-registration-token') {
               // Remove invalid token from cache
               await remove_fcm_token(user_id);
               console.error(`[FCM] Invalid token for user ${user_id}, removed from cache`);
@@ -131,7 +132,7 @@ export class FCMService {
 
       const results = await Promise.allSettled(send_promises);
       const success_count = results.filter(r => r.status === 'fulfilled' && r.value === true).length;
-      
+
       return success_count > 0;
     } catch (error: any) {
       console.error(`[FCM] Error sending notifications:`, error);

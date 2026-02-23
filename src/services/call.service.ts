@@ -304,8 +304,8 @@ export class CallService {
   // Get call history for user
   static async get_call_history(user_id: number, limit: number = 100): Promise<ResultType> {
     try {
-      const caller = alias(user_model, 'caller');
-      const callee = alias(user_model, 'callee');
+      // const caller = alias(user_model, 'caller');
+      // const callee = alias(user_model, 'callee');
 
       const calls = await db
         .select(

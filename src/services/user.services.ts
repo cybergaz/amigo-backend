@@ -13,7 +13,7 @@ import {
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
 import { eq, and, inArray, ne, sql, or, ilike } from "drizzle-orm";
 import { ConnectionStatusType } from "@/types/socket.types";
-import { store_fcm_token } from "@/services/fcm-token.cache";
+import { store_fcm_token } from "@/services/cache-management/fcm-token.cache";
 
 type CreateUserParams = {
   name: string;

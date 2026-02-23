@@ -288,11 +288,19 @@ const VITAL_WS_EVENTS_CONST = [
   'message:delivered',
 ] as const;
 
+const ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD = ['socket:ping', 'socket:pong', 'socket:health_check'] as const;
+
 
 type WSMessageEventsType = typeof WS_MESSAGE_EVENTS_CONST[number];
 type VitalWSMessageEventsType = typeof VITAL_WS_EVENTS_CONST[number];
+type AllowedWSEventsWithoutPayloadType = typeof ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD[number];
 
-export { WS_MESSAGE_EVENTS_CONST, CONNECTION_STATUS_CONST, VITAL_WS_EVENTS_CONST };
+export {
+  WS_MESSAGE_EVENTS_CONST,
+  CONNECTION_STATUS_CONST,
+  VITAL_WS_EVENTS_CONST,
+  ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD
+};
 export type {
   WebSocketData,
   UserConnection,
@@ -318,5 +326,6 @@ export type {
   SyncMessagesPayload,
   MessageDeliveredPayload,
   WSMessageEventsType,
-  VitalWSMessageEventsType
+  VitalWSMessageEventsType,
+  AllowedWSEventsWithoutPayloadType
 };

@@ -8,7 +8,7 @@ import { VerifySignupSchema } from "@/types/auth.types";
 import { password } from "bun";
 import Elysia, { t } from "elysia";
 import { eq, sql } from "drizzle-orm";
-import { remove_fcm_token } from "@/services/fcm-token.cache";
+import { remove_fcm_token } from "@/services/cache-management/fcm-token.cache";
 
 // Cookie configuration based on environment
 // Use COOKIE_DOMAIN env var or detect production from FRONTEND_URL

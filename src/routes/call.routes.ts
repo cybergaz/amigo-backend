@@ -73,7 +73,7 @@ const call_routes = new Elysia({ prefix: "/call" })
     }
   })
 
-  .post("/decline/:call_id", async ({ set, params }) => {
+  .post("/decline/:call_id", async ({ set, params, store }) => {
     try {
       const callId = Number(params.call_id);
 
@@ -89,7 +89,7 @@ const call_routes = new Elysia({ prefix: "/call" })
       }
 
       // Decline the call
-      await CallService.decline_call(callId, call_info.callee_id);
+      await CallService.terminate_call(callId, store.id, "declined");
 
       set.status = 200;
       return {
@@ -124,7 +124,7 @@ const call_routes = new Elysia({ prefix: "/call" })
       data: call_info,
       message: "Call status retrieved successfully"
     };
-  })
+  });
 
 // .get("/status", async ({ set, store, query }) => {
 //   console.log('[CALL ROUTES] /status called with query:', query);

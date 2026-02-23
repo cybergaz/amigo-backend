@@ -5,10 +5,10 @@ import { WSMessageSchema } from "@/types/socket.elysia-schema";
 import { eq, } from "drizzle-orm";
 import Elysia, { t } from "elysia";
 import { broadcast_message, get_connected_users, get_ws_data, set_ws_data, socket_message_handler } from "./socket.handlers";
-import { start_cleanup_cron, stop_cleanup_cron } from "./polling.cache";
 import { ConnectionStatusPayload, PollingConnection, UserConnection, WSMessage } from "@/types/socket.types";
 import { batch_update_users_details, update_user_details } from "@/services/user.services";
-import { sync_missed_messages } from "@/services/chat.services";
+// import { sync_missed_messages } from "@/services/chat.services";
+import { start_cleanup_cron, stop_cleanup_cron } from "@/services/cache-management/polling.cache";
 
 // Connection maps for different transport types
 const socket_connections = new Map<number, UserConnection>(); // user_id -> UserConnection (WebSocket)
@@ -51,7 +51,7 @@ function startHeartbeat() {
       // Send ping to client
       try {
         connection.ws.send({
-          type: 'ping',
+          type: 'socket:ping',
           ws_timestamp: now.toISOString()
         }, true);
         connection.last_ping_sent = now;
@@ -64,39 +64,39 @@ function startHeartbeat() {
     });
 
     // Clean up stale connections
-    staleConnections.forEach(async (user_id) => {
-      const connection = socket_connections.get(user_id);
-      if (connection) {
-        try {
-          connection.ws.close(4000, "Connection timeout - no pong response");
-        } catch (e) {
-          // Ignore close errors
-        }
-        socket_connections.delete(user_id);
-
-        // Notify connected users about this user being offline
-        const connected_users = await get_connected_users(user_id);
-        const message_payload: ConnectionStatusPayload = {
-          sender_id: user_id,
-          status: 'disconnected',
-        };
-        await broadcast_message({
-          to: "users",
-          user_ids: Array.from(connected_users),
-          message: {
-            type: "connection:status",
-            payload: message_payload,
-            ws_timestamp: new Date()
-          },
-          exclude_user_ids: [user_id]
-        });
-
-        console.log(`[WS-HEARTBEAT] Cleaned up stale connection for user ${user_id}. Total connections: ${socket_connections.size}`);
-      }
-    });
+    // staleConnections.forEach(async (user_id) => {
+    //   const connection = socket_connections.get(user_id);
+    //   if (connection) {
+    //     try {
+    //       connection.ws.close(4000, "Connection timeout - no pong response");
+    //     } catch (e) {
+    //       // Ignore close errors
+    //     }
+    //     socket_connections.delete(user_id);
+    //
+    //     // Notify connected users about this user being offline
+    //     const connected_users = await get_connected_users(user_id);
+    //     const message_payload: ConnectionStatusPayload = {
+    //       sender_id: user_id,
+    //       status: 'disconnected',
+    //     };
+    //     await broadcast_message({
+    //       to: "users",
+    //       user_ids: Array.from(connected_users),
+    //       message: {
+    //         type: "connection:status",
+    //         payload: message_payload,
+    //         ws_timestamp: new Date()
+    //       },
+    //       exclude_user_ids: [user_id]
+    //     });
+    //
+    //     console.log(`[WS-HEARTBEAT] Cleaned up stale connection for user ${user_id}. Total connections: ${socket_connections.size}`);
+    //   }
+    // });
 
     // Update user status in DB
-    await batch_update_users_details(staleConnections, { online_status: false, last_seen: new Date() });
+    // await batch_update_users_details(staleConnections, { online_status: false, last_seen: new Date() });
 
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -189,7 +189,7 @@ function logConnectionError(
 
 // Log successful connection with diagnostics
 function logConnectionSuccess(
-  transport: 'ws' | 'sse' | 'polling',
+  transport: 'ws' | 'polling',
   user_id: number,
   client_ip: string,
   additional_info?: Record<string, any>
@@ -243,6 +243,7 @@ const web_socket_server = new Elysia()
 
       case "VALIDATION":
         console.error("[SOCKET] WebSocket server validation error at", path);
+        // console.error(err);
         return {
           type: "socket:error",
           message: "WebSocket validation error",
@@ -280,6 +281,7 @@ const web_socket_server = new Elysia()
               message: err.valueError?.message,
             }
           });
+          // console.log(err);
           return {
             type: "socket:error",
             message: "WebSocket validation error",
@@ -301,9 +303,16 @@ const web_socket_server = new Elysia()
         const url = new URL(ws.data.request.url);
         const token = url.searchParams.get('token');
 
+        if (token == "websocket-connectivity-check") {
+          ws.close(4200, "Connectivity check - no authentication needed");
+          console.log("[SOCKET] Received connectivity check ping, responded with health check message");
+          return;
+        }
+
         if (!token) {
           ws.send({
             type: 'socket:error',
+            error_code: 'AUTH_REQUIRED',
             message: 'Authentication token is required',
             timestamp: new Date().toISOString()
           }, true);
@@ -314,6 +323,13 @@ const web_socket_server = new Elysia()
         // Verify JWT token
         const auth_result = authenticate_jwt(token);
         if (!auth_result.success || !auth_result.data) {
+          // Send error message before closing so client can detect auth failure
+          ws.send({
+            type: 'socket:error',
+            error_code: 'AUTH_INVALID',
+            message: 'Invalid or expired authentication token',
+            timestamp: new Date().toISOString()
+          }, true);
           ws.close(4001, "Invalid authentication token");
           return;
         }
@@ -376,7 +392,7 @@ const web_socket_server = new Elysia()
         // =============================================================================
         // Sync missed messages to the user (this also marks them as delivered)
         // This is critical for users who temporarily lost connection
-        await sync_missed_messages(user_id);
+        // await sync_missed_messages(user_id);
 
       } catch (error) {
         const request = ws.data.request;

@@ -10,7 +10,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
       const state_result = app_middleware({ cookie, headers });
 
       set.status = state_result.code;
-      if (!state_result.data) return state_result
+      if (!state_result.data) return state_result;
 
       store.id = state_result.data.id;
       store.role = state_result.data.role;
@@ -36,6 +36,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
       query.page,
       query.limit
     );
+
     set.status = history_result.code;
     return history_result;
   }, {
@@ -85,21 +86,6 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     params: t.Object({
       conversation_id: t.Number()
     })
-  })
-
-  .delete("/soft-delete-message", async ({ set, store, body }) => {
-    const delete_result = await soft_delete_message(
-      body.message_ids,
-      store.id,
-      body.is_admin_or_staff ?? false
-    );
-    set.status = delete_result.code;
-    return delete_result;
-  }, {
-    body: t.Object({
-      message_ids: t.Array(t.String()),
-      is_admin_or_staff: t.Optional(t.Boolean())
-    })
-  })
+  });
 
 export default chat_routes;

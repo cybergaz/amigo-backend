@@ -1,144 +1,30 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
-import { delete_message_for_me, sync_missed_messages } from "@/services/chat.services";
+import { delete_message_for_me } from "@/services/chat.services";
 import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, reply_to_message, star_messages } from "@/services/message.services";
-import { fetch_pending_messages } from "@/sockets/polling.cache";
+import { fetch_pending_messages } from "@/services/cache-management/polling.cache";
 
-export const chat_http_routes = new Elysia({ prefix: "/chat/http" })
+export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
   .state({ id: 0, role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
 
       set.status = state_result.code;
-      if (!state_result.data) return state_result
+      if (!state_result.data) return state_result;
 
       store.id = state_result.data.id;
       store.role = state_result.data.role;
     }
   })
 
-  .delete("/delete-message-for-me", async ({ set, store, body }) => {
-    const delete_result = await delete_message_for_me(
-      body.message_ids,
-      store.id,
-      body.conversation_id
-    );
-    set.status = delete_result.code;
-    return delete_result;
-  }, {
-    body: t.Object({
-      message_ids: t.Array(t.BigInt()),
-      conversation_id: t.Number()
-    })
-  })
 
-  // // Message operations routes
-  // .post("/messages/pin", async ({ set, store, body }) => {
-  //   const pin_result = await toggle_pin_message({
-  //   conv_id: body.conversation_id,
-  //   message_id: body.message_id,
+  // .get("/sync-messages-via-polling", async ({ set, store, params, query }) => {
+  //   const sync_result = await sync_missed_messages(store.id);
   //
-  // });
-  //   set.status = pin_result.code;
-  //   return pin_result;
-  // }, {
-  //   body: t.Object({
-  //     message_id: t.Number(),
-  //     conversation_id: t.Number()
-  //   })
+  //   set.status = sync_result.code;
+  //   return sync_result;
   // })
-
-  .post("/messages/star", async ({ set, store, body }) => {
-    const star_result = await star_messages(body, store.id);
-    set.status = star_result.code;
-    return star_result;
-  }, {
-    body: t.Object({
-      message_ids: t.Array(t.BigInt()),
-      conversation_id: t.Number()
-    })
-  })
-
-  .post("/messages/reply", async ({ set, store, body }) => {
-    const reply_result = await reply_to_message(body, store.id);
-    set.status = reply_result.code;
-    return reply_result;
-  }, {
-    body: t.Object({
-      message_id: t.BigInt(),
-      reply_to_message_id: t.BigInt(),
-      conversation_id: t.Number(),
-      body: t.String(),
-      attachments: t.Optional(t.Array(t.Any()))
-    })
-  })
-
-  .post("/messages/forward", async ({ set, store, body }) => {
-    const forward_result = await forward_messages(body, store.id);
-    set.status = forward_result.code;
-    return forward_result;
-  }, {
-    body: t.Object({
-      message_ids: t.Array(t.BigInt()),
-      source_conversation_id: t.Number(),
-      target_conversation_ids: t.Array(t.Number())
-    })
-  })
-
-  .delete("/messages/delete", async ({ set, store, body }) => {
-    const delete_result = await delete_messages(body, store.id);
-    set.status = delete_result.code;
-    return delete_result;
-  }, {
-    body: t.Object({
-      message_ids: t.Array(t.BigInt()),
-      conversation_id: t.Number(),
-      delete_for_everyone: t.Optional(t.Boolean())
-    })
-  })
-
-  .get("/messages/pinned/:conversation_id", async ({ set, store, params }) => {
-    const pinned_result = await get_pinned_messages(params.conversation_id, store.id);
-    set.status = pinned_result.code;
-    return pinned_result;
-  }, {
-    params: t.Object({
-      conversation_id: t.Number()
-    })
-  })
-
-  .get("/messages/starred", async ({ set, store, query }) => {
-    const starred_result = await get_starred_messages(store.id, query.conversation_id);
-    set.status = starred_result.code;
-    return starred_result;
-  }, {
-    query: t.Object({
-      conversation_id: t.Optional(t.Number())
-    })
-  })
-
-  .post("/messages/delivered", async ({ set, store, body }) => {
-    const delivery_result = await mark_message_delivered(
-      body.message_id,
-      body.conversation_id,
-      store.id
-    );
-    set.status = delivery_result.code;
-    return delivery_result;
-  }, {
-    body: t.Object({
-      message_id: t.BigInt(),
-      conversation_id: t.Number()
-    })
-  })
-
-  .get("/sync-messages-via-polling", async ({ set, store, params, query }) => {
-    const sync_result = await sync_missed_messages(store.id)
-
-    set.status = sync_result.code;
-    return sync_result;
-  })
 
   // ============================================================================
   // HTTP Long Polling Endpoints - Fallback transport for WebSocket/SSE
@@ -331,12 +217,7 @@ export const chat_http_routes = new Elysia({ prefix: "/chat/http" })
           ? `Fetched ${messages.length} pending message(s)`
           : "No pending messages",
         data: {
-          messages: messages.map(m => ({
-            message_id: m.message_id,
-            event_type: m.event_type,
-            payload: m.ws_message,
-            created_at: m.created_at,
-          })),
+          messages: messages,
           count: messages.length,
           last_message_id: messages.length > 0
             ? messages[messages.length - 1].message_id
@@ -356,4 +237,4 @@ export const chat_http_routes = new Elysia({ prefix: "/chat/http" })
     query: t.Object({
       after_message_id: t.Optional(t.String()),
     })
-  })
+  });

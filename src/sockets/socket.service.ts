@@ -1,10 +1,10 @@
 import { ResultType } from "@/types/core.types";
-import { CallPayload, ChatMessageAckPayload, ChatMessagePayload, ConnectionStatusPayload, JoinLeavePayload, MessageForwardPayload, WSMessageEventsType } from "@/types/socket.types";
-import { broadcast_message, get_connected_users, handle_join_conversation, is_user_online } from "./socket.handlers";
+import { CallPayload, ChatMessageAckPayload, ChatMessagePayload, ConnectionStatusPayload, JoinLeavePayload, MessageForwardPayload, WSMessageEventsType, WSMessage } from "@/types/socket.types";
+import { broadcast_message, get_connected_users, handle_join_conversation, is_user_online, convertBigIntIdsToString } from "./socket.handlers";
 import { update_user_connection_status } from "@/services/user.services";
 import { socket_connections } from "./socket.server";
 import { batch_insert_message_status, forward_messages, store_message_with_retry } from "@/services/message.services";
-import { get_conversation_members } from "./socket.cache";
+import { get_conversation_members } from "@/services/cache-management/socket.cache";
 import db from "@/config/db";
 import { conversation_member_model, message_model } from "@/models/chat.model";
 import { and, eq, sql } from "drizzle-orm";
@@ -253,13 +253,21 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
     }
 
     // update conversaion's last_message metadata and last_updated_at
-    await update_conversation({
+    const res = await update_conversation({
       id: payload.conv_id,
       metadata: { last_message: store_msg_result?.data },
       last_message_at: new Date()
     });
 
     // send fcm notification to offline users
+    // Convert bigint IDs to strings before sending to FCM (JSON.stringify cannot serialize BigInt)
+    const fcm_ws_message: WSMessage = {
+      type: "message:new",
+      payload: updated_message_payload,
+      ws_timestamp: new Date()
+    };
+    const serializable_fcm_message = convertBigIntIdsToString(fcm_ws_message);
+
     await FCMService.send_notification(
       {
         type: "ws-message",
@@ -267,11 +275,7 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
         title: `${updated_message_payload?.sender_name || 'New Message'}`,
         body: FCMService.formatMessageBody(updated_message_payload),
         user_ids: sent_result.offline,
-        ws_message: {
-          type: "message:new",
-          payload: updated_message_payload,
-          ws_timestamp: new Date()
-        }
+        ws_message: serializable_fcm_message
       }
     );
 

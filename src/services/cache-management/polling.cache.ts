@@ -5,6 +5,7 @@ import db from "@/config/db";
 import { missed_ws_messages_model } from "@/models/chat.model";
 import { VITAL_WS_EVENTS_CONST, VitalWSMessage, VitalWSMessageEventsType, WSMessage, WSMessageEventsType } from "@/types/socket.types";
 import { eq, and, lt, asc, gt } from "drizzle-orm";
+import { convertBigIntIdsToString, convertStringIdsToBigInt, convertStringIdsToBigIntForWSMessage } from "@/sockets/socket.handlers";
 
 // ============================================================================
 // Three-tier Polling Cache for Missed WS Messages
@@ -59,6 +60,8 @@ async function store_pending_message(
   const pending_message_id = generate_poll_message_id();
   const now = Date.now();
 
+  // Convert BigInt IDs to strings in the message payload for safe serialization/storage
+  const serialized_ws_meeasge = convertBigIntIdsToString(ws_message);
   const entry: CachedPollMessage = {
     message_id: pending_message_id,
     ws_message,
@@ -78,7 +81,11 @@ async function store_pending_message(
   const redis_promise = (async () => {
     try {
       const key = redis_poll_key(user_id);
-      await redis.rpush(key, JSON.stringify(entry));
+      await redis.rpush(key,
+        JSON.stringify({
+          ...entry,
+          ws_message: serialized_ws_meeasge,
+        }));
       // Trim to cap
       await redis.ltrim(key, -MAX_MESSAGES_PER_USER, -1);
       // Set/refresh TTL
@@ -96,7 +103,7 @@ async function store_pending_message(
           id: pending_message_id,
           user_id,
           event_type: ws_message.type,
-          ws_message: ws_message as any,
+          ws_message: serialized_ws_meeasge, // Use serialized version with BigInt converted to strings
         });
     } catch (err) {
       console.error(`[POLL-CACHE] DB write error for user ${user_id}:`, err);
@@ -144,7 +151,20 @@ async function fetch_pending_messages(
       const raw_messages = await redis.lrange(key, 0, -1);
 
       if (raw_messages.length > 0) {
-        messages = raw_messages.map(raw => JSON.parse(raw) as CachedPollMessage);
+        messages = raw_messages.map(str => {
+          try {
+            const parsed = JSON.parse(str);
+            // Convert ws_message back to VitalWSMessage with proper types deserialization of msg ids
+            // const deserialized_ws_message_payload = convertStringIdsToBigInt(parsed.ws_message, parsed.ws_message.type);
+            return {
+              ...parsed,
+              ws_message: convertStringIdsToBigIntForWSMessage(JSON.stringify(parsed.ws_message)) as VitalWSMessage,
+            } as CachedPollMessage;
+          } catch (err) {
+            console.error(`[POLL-CACHE] Error parsing Redis message for user ${user_id}:`, err);
+            return null;
+          }
+        }).filter((m): m is CachedPollMessage => m !== null);
         // Clear Redis queue after reading
         await redis.del(key);
       }
@@ -166,7 +186,7 @@ async function fetch_pending_messages(
           messages = db_messages.map(row => ({
             message_id: row.id,
             event_type: row.event_type as VitalWSMessageEventsType,
-            ws_message: row.ws_message as VitalWSMessage,
+            ws_message: convertStringIdsToBigIntForWSMessage(JSON.stringify(row.ws_message)) as VitalWSMessage,
             created_at: new Date(row.created_at).getTime(),
           }));
 

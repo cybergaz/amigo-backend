@@ -13,8 +13,9 @@ import {
 } from "@/types/chat.types";
 import { create_unique_id } from "@/utils/general.utils";
 import { and, arrayContains, asc, desc, eq, gt, inArray, isNotNull, isNull, ne, not, or, sql } from "drizzle-orm";
-import { broadcast_message } from "@/sockets/socket.handlers";
+import { broadcast_message, convertStringIdsToBigInt } from "@/sockets/socket.handlers";
 import { ChatMessagePayload, ConversationActionPayload, DeleteMessagePayload, MembersType, SyncMessagesPayload } from "@/types/socket.types";
+import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 
 const build_conversation_action_message = (
   action: ConversationActionPayload["action"],
@@ -135,7 +136,7 @@ const get_chat_list = async (user_id: number, type: string) => {
       .orderBy(
         desc(conversation_model.last_message_at),
         // desc(conversation_member_model.joined_at),
-      )
+      );
 
     // For groups and community groups, we don't need the other user info
     // For DMs, we need to get the other user's info separately
@@ -185,7 +186,7 @@ const get_chat_list = async (user_id: number, type: string) => {
             .where(and(
               eq(conversation_member_model.conversation_id, chat.conversationId),
               eq(conversation_member_model.user_id, user_id)
-            )))[0]
+            )))[0];
 
           final_chat_item = {
             ...chat,
@@ -211,14 +212,14 @@ const get_chat_list = async (user_id: number, type: string) => {
               lastMessageId: metadata.last_message.id,
               lastMessageBody: metadata.last_message.body,
               lastMessageType: metadata.last_message.type,
-            }
+            };
           }
 
           if (metadata.pinned_message != null) {
             final_chat_item = {
               ...final_chat_item,
               pinnedMessageId: metadata.pinned_message.message_id,
-            }
+            };
           }
         }
 
@@ -257,7 +258,7 @@ const update_conversation = async (conv_data: DBUpdateConversationType) => {
         success: false,
         code: 400,
         message: "Conversation ID is required for update",
-      }
+      };
     }
 
     if (conv_data.metadata) {
@@ -269,26 +270,31 @@ const update_conversation = async (conv_data: DBUpdateConversationType) => {
         .limit(1);
 
       if (conversation) {
-        const currentMetadata = (conversation.metadata as ConversationMetadata) || {};
+        // Deserialize existing metadata to merge with new metadata
+        const deserializedMetadata = convertStringToBigInt(conversation.metadata);
+        const currentMetadata = (deserializedMetadata as ConversationMetadata) || {};
 
         conv_data.metadata = {
           ...currentMetadata,
           ...conv_data.metadata
         } as ConversationMetadata;
+        // Serialize metadata back to ensure BigInt values are converted to strings before saving
+        const serializedMetadata = convertBigIntToString(conv_data.metadata);
+        conv_data.metadata = serializedMetadata;
       }
     }
 
     const [updated_conversation] = await db
       .update(conversation_model)
       .set(conv_data)
-      .where(eq(conversation_model.id, conv_data.id))
+      .where(eq(conversation_model.id, conv_data.id));
 
     return {
       success: true,
       code: 200,
       message: "Conversation updated successfully",
       data: updated_conversation,
-    }
+    };
 
 
   }
@@ -297,18 +303,9 @@ const update_conversation = async (conv_data: DBUpdateConversationType) => {
       success: false,
       code: 500,
       message: "ERROR : update_conversation",
-    }
+    };
   }
-
-}
-
-
-
-
-
-
-
-
+};
 
 const soft_delete_chat = async (conversation_id: number, user_id: number) => {
   try {
@@ -403,7 +400,7 @@ const revive_chat = async (conversation_id: number) => {
       data: null,
     };
   }
-}
+};
 
 const soft_delete_message = async (message_ids: string[], user_id: number, is_admin_or_staff?: boolean) => {
   try {
@@ -508,7 +505,7 @@ const soft_delete_message = async (message_ids: string[], user_id: number, is_ad
           await db
             .update(conversation_model)
             .set({
-              metadata: newLastMessage ? {
+              metadata: convertBigIntToString(newLastMessage ? {
                 last_message: {
                   id: newLastMessage.id,
                   conversation_id: newLastMessage.conversation_id,
@@ -519,7 +516,7 @@ const soft_delete_message = async (message_ids: string[], user_id: number, is_ad
                   metadata: newLastMessage.metadata,
                   created_at: newLastMessage.created_at.toISOString(),
                 }
-              } : { last_message: null },
+              } : { last_message: null }),
               last_message_at: newLastMessage ? newLastMessage.created_at : conversation.last_message_at
             })
             .where(eq(conversation_model.id, conversationId));
@@ -828,6 +825,14 @@ const get_conversation_history = async (
     const hasNextPage = page < totalPages;
     const hasPreviousPage = page > 1;
 
+    // convert bigint to string for network transfer
+    // messages.forEach((msg) => {
+    //   msg.id = msg.id.toString();
+    //   if (msg.forwarded_from) {
+    //     msg.forwarded_from = msg.forwarded_from.map((id: bigint) => id.toString());
+    //   }
+    // }
+
     return {
       success: true,
       code: 200,
@@ -1062,14 +1067,14 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
           lastMessageId: metadata.last_message.id,
           lastMessageBody: metadata.last_message.body,
           lastMessageType: metadata.last_message.type,
-        }
+        };
       }
 
       if (metadata.pinned_message != null) {
         final_chat_item = {
           ...final_chat_item,
           pinnedMessageId: metadata.pinned_message.message_id,
-        }
+        };
       }
     }
 
@@ -1081,173 +1086,173 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
 };
 
 // Fetch and send all undelivered messages to a user on reconnection.
-async function sync_missed_messages(user_id: number) {
-  try {
-    // Get all conversations the user is a member of
-    const userConversations = await db
-      .select({
-        conv_id: conversation_member_model.conversation_id,
-        conv_type: conversation_model.type,
-      })
-      .from(conversation_member_model)
-      .innerJoin(
-        conversation_model,
-        eq(conversation_model.id, conversation_member_model.conversation_id)
-      )
-      .where(
-        and(
-          eq(conversation_member_model.user_id, user_id),
-          eq(conversation_member_model.deleted, false)
-        )
-      );
-
-    if (userConversations.length === 0) {
-      console.log(`[SYNC] No conversations found for user ${user_id}`);
-      return {
-        success: true,
-        code: 200,
-        message: "No conversations found, no messages to sync",
-        data: null,
-      }
-    }
-
-    const conversationIds = userConversations.map(c => c.conv_id);
-    const convTypeMap = new Map(userConversations.map(c => [c.conv_id, c.conv_type]));
-
-    // Find all messages in user's conversations that haven't been delivered to this user
-    // These are messages where message_status.delivered_at is NULL for this user
-    const undeliveredStatuses = await db
-      .select({
-        message_id: message_status_model.message_id,
-        conv_id: message_status_model.conv_id,
-      })
-      .from(message_status_model)
-      .where(
-        and(
-          eq(message_status_model.user_id, user_id),
-          inArray(message_status_model.conv_id, conversationIds),
-          isNull(message_status_model.delivered_at)
-        )
-      )
-      .limit(500); // Limit to prevent overwhelming the client
-
-    console.log("undeliveredStatuses -> ", undeliveredStatuses)
-    if (undeliveredStatuses.length === 0) {
-      console.log(`[SYNC] No missed messages for user ${user_id}`);
-      return {
-        success: true,
-        code: 200,
-        message: "No missed messages to sync",
-        data: null,
-      }
-    }
-
-    const messageIds = undeliveredStatuses.map(s => s.message_id);
-
-    // Fetch the actual message data
-    const missedMessages = await db
-      .select({
-        id: message_model.id,
-        conversation_id: message_model.conversation_id,
-        sender_id: message_model.sender_id,
-        type: message_model.type,
-        body: message_model.body,
-        attachments: message_model.attachments,
-        metadata: message_model.metadata,
-        sent_at: message_model.sent_at,
-        created_at: message_model.created_at,
-        status: message_model.status,
-        deleted: message_model.deleted,
-        forwarded_from: message_model.forwarded_from,
-        forwarded_count: message_model.forwarded_to,
-
-        // Sender information
-        sender_name: user_model.name,
-        sender_pfp: user_model.profile_pic,
-      })
-      .from(message_model)
-      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
-      .where(
-        and(
-          inArray(message_model.id, messageIds),
-          eq(message_model.deleted, false)
-        )
-      )
-      .orderBy(desc(message_model.sent_at));
-
-    if (missedMessages.length === 0) {
-      console.log(`[SYNC] No valid missed messages for user ${user_id}`);
-      return {
-        success: true,
-        code: 200,
-        message: "No valid missed messages to sync",
-        data: null,
-      }
-    }
-
-    // Transform to SyncMessageItem format
-    const syncMessages: ChatMessagePayload[] = missedMessages.map(msg => ({
-      id: msg.id,
-      sender_id: msg.sender_id,
-      sender_name: msg.sender_name || undefined,
-      conv_id: msg.conversation_id!,
-      conv_type: (convTypeMap.get(msg.conversation_id!) || 'dm') as any,
-      msg_type: msg.type as any,
-      body: msg.body || undefined,
-      attachments: msg.attachments,
-      metadata: msg.metadata,
-      sender_pfp: msg.sender_pfp || undefined,
-      sent_at: msg.sent_at || new Date(),
-      created_at: msg.created_at,
-    }));
-
-    // Send sync message to user
-    const syncPayload: SyncMessagesPayload = {
-      messages: syncMessages.reverse(), // Send oldest first
-      sync_timestamp: new Date(),
-      total_count: syncMessages.length,
-    };
-
-    // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    const sent_status = await broadcast_message({
-      to: "users",
-      user_ids: [user_id],
-      message: {
-        type: 'message:sync',
-        payload: syncPayload,
-        ws_timestamp: new Date(),
-      },
-    });
-
-    console.log("broadcast_message status-> ", sent_status)
-    // Mark these messages as delivered
-    await db
-      .update(message_status_model)
-      .set({ delivered_at: new Date() })
-      .where(
-        and(
-          eq(message_status_model.user_id, user_id),
-          inArray(message_status_model.message_id, messageIds)
-        )
-      );
-
-    console.log(`[SYNC] Synced ${syncMessages.length} missed messages to user ${user_id}`);
-    return {
-      success: true,
-      code: 200,
-      message: `Synced ${syncMessages.length} missed messages`,
-      data: syncMessages.reverse(), // Send oldest first
-    }
-
-  } catch (error) {
-    console.error(`[SYNC] Error syncing missed messages for user ${user_id}:`, error);
-    return {
-      success: false,
-      code: 500,
-      message: "ERROR: sync_missed_messages",
-    };
-  }
-}
+// async function sync_missed_messages(user_id: number) {
+//   try {
+//     // Get all conversations the user is a member of
+//     const userConversations = await db
+//       .select({
+//         conv_id: conversation_member_model.conversation_id,
+//         conv_type: conversation_model.type,
+//       })
+//       .from(conversation_member_model)
+//       .innerJoin(
+//         conversation_model,
+//         eq(conversation_model.id, conversation_member_model.conversation_id)
+//       )
+//       .where(
+//         and(
+//           eq(conversation_member_model.user_id, user_id),
+//           eq(conversation_member_model.deleted, false)
+//         )
+//       );
+//
+//     if (userConversations.length === 0) {
+//       console.log(`[SYNC] No conversations found for user ${user_id}`);
+//       return {
+//         success: true,
+//         code: 200,
+//         message: "No conversations found, no messages to sync",
+//         data: null,
+//       }
+//     }
+//
+//     const conversationIds = userConversations.map(c => c.conv_id);
+//     const convTypeMap = new Map(userConversations.map(c => [c.conv_id, c.conv_type]));
+//
+//     // Find all messages in user's conversations that haven't been delivered to this user
+//     // These are messages where message_status.delivered_at is NULL for this user
+//     const undeliveredStatuses = await db
+//       .select({
+//         message_id: message_status_model.message_id,
+//         conv_id: message_status_model.conv_id,
+//       })
+//       .from(message_status_model)
+//       .where(
+//         and(
+//           eq(message_status_model.user_id, user_id),
+//           inArray(message_status_model.conv_id, conversationIds),
+//           isNull(message_status_model.delivered_at)
+//         )
+//       )
+//       .limit(500); // Limit to prevent overwhelming the client
+//
+//     console.log("undeliveredStatuses -> ", undeliveredStatuses)
+//     if (undeliveredStatuses.length === 0) {
+//       console.log(`[SYNC] No missed messages for user ${user_id}`);
+//       return {
+//         success: true,
+//         code: 200,
+//         message: "No missed messages to sync",
+//         data: null,
+//       }
+//     }
+//
+//     const messageIds = undeliveredStatuses.map(s => s.message_id);
+//
+//     // Fetch the actual message data
+//     const missedMessages = await db
+//       .select({
+//         id: message_model.id,
+//         conversation_id: message_model.conversation_id,
+//         sender_id: message_model.sender_id,
+//         type: message_model.type,
+//         body: message_model.body,
+//         attachments: message_model.attachments,
+//         metadata: message_model.metadata,
+//         sent_at: message_model.sent_at,
+//         created_at: message_model.created_at,
+//         status: message_model.status,
+//         deleted: message_model.deleted,
+//         forwarded_from: message_model.forwarded_from,
+//         forwarded_count: message_model.forwarded_to,
+//
+//         // Sender information
+//         sender_name: user_model.name,
+//         sender_pfp: user_model.profile_pic,
+//       })
+//       .from(message_model)
+//       .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+//       .where(
+//         and(
+//           inArray(message_model.id, messageIds),
+//           eq(message_model.deleted, false)
+//         )
+//       )
+//       .orderBy(desc(message_model.sent_at));
+//
+//     if (missedMessages.length === 0) {
+//       console.log(`[SYNC] No valid missed messages for user ${user_id}`);
+//       return {
+//         success: true,
+//         code: 200,
+//         message: "No valid missed messages to sync",
+//         data: null,
+//       }
+//     }
+//
+//     // Transform to SyncMessageItem format
+//     const syncMessages: ChatMessagePayload[] = missedMessages.map(msg => ({
+//       id: msg.id,
+//       sender_id: msg.sender_id,
+//       sender_name: msg.sender_name || undefined,
+//       conv_id: msg.conversation_id!,
+//       conv_type: (convTypeMap.get(msg.conversation_id!) || 'dm') as any,
+//       msg_type: msg.type as any,
+//       body: msg.body || undefined,
+//       attachments: msg.attachments,
+//       metadata: msg.metadata,
+//       sender_pfp: msg.sender_pfp || undefined,
+//       sent_at: msg.sent_at || new Date(),
+//       created_at: msg.created_at,
+//     }));
+//
+//     // Send sync message to user
+//     const syncPayload: SyncMessagesPayload = {
+//       messages: syncMessages.reverse(), // Send oldest first
+//       sync_timestamp: new Date(),
+//       total_count: syncMessages.length,
+//     };
+//
+//     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+//     const sent_status = await broadcast_message({
+//       to: "users",
+//       user_ids: [user_id],
+//       message: {
+//         type: 'message:sync',
+//         payload: syncPayload,
+//         ws_timestamp: new Date(),
+//       },
+//     });
+//
+//     console.log("broadcast_message status-> ", sent_status)
+//     // Mark these messages as delivered
+//     await db
+//       .update(message_status_model)
+//       .set({ delivered_at: new Date() })
+//       .where(
+//         and(
+//           eq(message_status_model.user_id, user_id),
+//           inArray(message_status_model.message_id, messageIds)
+//         )
+//       );
+//
+//     console.log(`[SYNC] Synced ${syncMessages.length} missed messages to user ${user_id}`);
+//     return {
+//       success: true,
+//       code: 200,
+//       message: `Synced ${syncMessages.length} missed messages`,
+//       data: syncMessages.reverse(), // Send oldest first
+//     }
+//
+//   } catch (error) {
+//     console.error(`[SYNC] Error syncing missed messages for user ${user_id}:`, error);
+//     return {
+//       success: false,
+//       code: 500,
+//       message: "ERROR: sync_missed_messages",
+//     };
+//   }
+// }
 
 export {
   get_chat_list,
@@ -1261,5 +1266,5 @@ export {
   get_message_statuses,
   getConversationDetailsForUser,
   broadcast_conversation_action,
-  sync_missed_messages
+  // sync_missed_messages
 };

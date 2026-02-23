@@ -24,11 +24,9 @@ import {
 } from "@/types/chat.types";
 import { ResultType } from "@/types/core.types";
 import { ChatMessageAckPayload, ChatMessagePayload, MessagePinPayload, SyncMessagesPayload } from "@/types/socket.types";
-import { create_unique_id } from "@/utils/general.utils";
+import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 import Snowflake from "@/utils/snowflake.utils";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
-import { SingleStoreJson } from "drizzle-orm/singlestore-core";
-import { Error } from "postgres";
 
 // Helper function to verify user membership in conversation
 const verify_user_membership = async (conversation_id: number, user_id: number) => {
@@ -88,10 +86,12 @@ const store_message = async (payload: ChatMessagePayload, custom_msg_id?: bigint
           }
         };
 
-        payload.metadata = {
+        // Merge with existing metadata if any
+        // convert BigInt to string to avoid serialization issues
+        payload.metadata = convertBigIntToString({
           ...(payload.metadata || {}),
           ...replyMetadata
-        };
+        });
       }
     }
 
@@ -223,7 +223,10 @@ const pin_message = async (payload: PinMessageRequest) => {
     // Update conversation metadata
     await db
       .update(conversation_model)
-      .set({ metadata: newMetadata })
+      .set({
+        // convert BigInt to string in metadata to avoid serialization issues
+        metadata: convertBigIntToString(newMetadata)
+      })
       .where(eq(conversation_model.id, payload.conv_id));
 
     return {
@@ -358,7 +361,7 @@ const star_messages = async (request: StarMessageRequest, user_id: number) => {
     // Update messages with star metadata
     const updatedMessages = [];
     for (const message of messages) {
-      const currentMetadata = (message.metadata as MessageMetadata) || {};
+      const currentMetadata = convertStringToBigInt(message.metadata) as MessageMetadata || {};
       const starredBy = currentMetadata.starred_by || [];
 
       // Check if user already starred this message
@@ -379,10 +382,10 @@ const star_messages = async (request: StarMessageRequest, user_id: number) => {
         ];
       }
 
-      const newMetadata: MessageMetadata = {
+      const newMetadata = convertBigIntToString({
         ...currentMetadata,
         starred_by: newStarredBy.length > 0 ? newStarredBy : undefined
-      };
+      });
 
       const [updatedMessage] = await db
         .update(message_model)
@@ -469,7 +472,7 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: number) =
         type: "text",
         body: request.body,
         attachments: request.attachments,
-        metadata: replyMetadata,
+        metadata: convertBigIntToString(replyMetadata),
       })
       .returning();
 
@@ -544,9 +547,9 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
             body: message.body,
             attachments: message.attachments,
             metadata: {
-              ...message.metadata as MessageMetadata,
+              ...message.metadata as any,
               forwarded_from: {
-                original_message_id: message.id,
+                original_message_id: message.id.toString(),
                 original_conversation_id: request.source_conversation_id,
                 original_sender_id: message.sender_id,
                 forwarded_by: user_id,
@@ -639,7 +642,7 @@ const delete_messages = async (request: DeleteMessageRequest, user_id: number) =
           // body: null, // Clear message content
           // attachments: null // Clear attachments
           metadata: {
-            ...(messages.find(m => m.id === message)?.metadata as MessageMetadata || {}),
+            ...(messages.find(m => m.id === message)?.metadata as any || {}),
             deleted_by: {
               user_id,
               deleted_at: new Date().toISOString()

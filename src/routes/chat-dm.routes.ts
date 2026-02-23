@@ -9,7 +9,7 @@ export const chat_dm_routes = new Elysia({ prefix: "/chat/dm" })
       const state_result = app_middleware({ cookie, headers });
 
       set.status = state_result.code;
-      if (!state_result.data) return state_result
+      if (!state_result.data) return state_result;
 
       store.id = state_result.data.id;
       store.role = state_result.data.role;
@@ -34,4 +34,4 @@ export const chat_dm_routes = new Elysia({ prefix: "/chat/dm" })
     params: t.Object({
       conversation_id: t.Number()
     })
-  })
+  });
