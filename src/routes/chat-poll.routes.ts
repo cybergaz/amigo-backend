@@ -3,6 +3,13 @@ import { app_middleware } from "@/middleware";
 import { delete_message_for_me } from "@/services/chat.services";
 import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, reply_to_message, star_messages } from "@/services/message.services";
 import { fetch_pending_messages } from "@/services/cache-management/polling.cache";
+import { socket_message_handler } from "@/sockets/socket.handlers";
+import { ChatMessageAckPayload, ChatMessagePayload, WSMessage } from "@/types/socket.types";
+import db from "@/config/db";
+import { user_model } from "@/models/user.model";
+import { eq } from "drizzle-orm";
+import { polling_connections } from "@/sockets/socket.server";
+import { get_user_details } from "@/services/user.services";
 
 export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
   .state({ id: 0, role: "" })
@@ -31,7 +38,96 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
   // ============================================================================
 
   // POST endpoint to send messages via polling
-  // .post('/chat/poll', async ({ body, set, store }) => {
+  .post('/send-message', async ({ body, set, store, request }) => {
+    try {
+      const user_id = store.id;
+      const message = body as WSMessage;
+
+      // Update polling connection tracking
+      const client_ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+        || request.headers.get('x-real-ip')
+        || 'unknown';
+
+      // Update or create polling connection
+      const existing_connection = polling_connections.get(user_id);
+      if (existing_connection) {
+        existing_connection.last_poll = new Date();
+        existing_connection.client_ip = client_ip;
+      } else {
+        polling_connections.set(user_id, {
+          user_id,
+          last_poll: new Date(),
+          pending_messages: [],
+          client_ip,
+          connected_at: new Date(),
+        });
+      }
+
+      const user_res = await get_user_details(user_id);
+      let user_name = "";
+      let user_pfp = "";
+      if (user_res.success) {
+        user_name = user_res.data?.name || "";
+        user_pfp = user_res.data?.profile_pic || "";
+      }
+
+      // Process the message using the socket handler
+      await socket_message_handler({
+        user_id: user_id,
+        user_name: user_name,
+        user_pfp: user_pfp,
+      }, message);
+
+
+      // ------------------------------------------------------------
+      // temp flow
+      // ------------------------------------------------------------
+      if (message.type == "message:new") {
+        const payload = message.payload as ChatMessagePayload;
+        const ack_message_payload: ChatMessageAckPayload = {
+          id: payload.id,
+          conv_id: payload.conv_id,
+          sender_id: payload.sender_id,
+          delivered_at: new Date(),
+          delivered_to: [],
+          read_by: [],
+          offline_users: [],
+        };
+
+        // Return success - the handler will broadcast responses via polling cache
+        set.status = 200;
+        return {
+          success: true,
+          code: 200,
+          message: "Message processed successfully",
+          data: {
+            type: "message:ack",
+            payload: ack_message_payload,
+            ws_timestamp: new Date()
+          }
+        };
+      }
+
+      // Return success - the handler will broadcast responses via polling cache
+      set.status = 200;
+      return {
+        success: true,
+        code: 200,
+        message: "Message processed successfully",
+      };
+    } catch (error) {
+      console.error("[POLL] Error processing message:", error);
+      set.status = 500;
+      return {
+        success: false,
+        code: 500,
+        message: "Failed to process message",
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }, {
+    body: t.Any(),
+  })
   //
   //   // Get user details for message handling
   //   const user_name = (await db
@@ -206,9 +302,30 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
   //   body: t.Any()
   // })
 
-  .get("/poll-pending-messages", async ({ set, store, query }) => {
+  .get("/poll-pending-messages", async ({ set, store, query, request }) => {
     try {
-      const messages = await fetch_pending_messages(store.id, query.after_message_id);
+      const user_id = store.id;
+      const messages = await fetch_pending_messages(user_id, query.after_message_id);
+
+      // Update polling connection tracking
+      const client_ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
+        || request.headers.get('x-real-ip')
+        || 'unknown';
+
+      // Update or create polling connection
+      const existing_connection = polling_connections.get(user_id);
+      if (existing_connection) {
+        existing_connection.last_poll = new Date();
+        existing_connection.client_ip = client_ip;
+      } else {
+        polling_connections.set(user_id, {
+          user_id,
+          last_poll: new Date(),
+          pending_messages: [],
+          client_ip,
+          connected_at: new Date(),
+        });
+      }
 
       return {
         success: true,

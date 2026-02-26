@@ -70,6 +70,7 @@ export class FCMService {
       const send_promises = Array.from(token_map.entries())
         .filter(([_, token]) => token !== null)
         .map(async ([user_id, fcm_token]) => {
+
           if (!fcm_token) return false;
 
           try {
@@ -92,16 +93,22 @@ export class FCMService {
               android: {
                 priority: 'high',
                 ttl: payload.type === 'call' ? 30000 : 2419200000,
-                notification: {
-                  channelId: payload.type === 'call' ? 'calls' : 'messages',
-                  priority: payload.type === 'call' ? 'max' : 'high',
-                  sticky: payload.type === 'call' ? true : false,
-                  sound: 'default',
-                  vibrateTimingsMillis: [0, 250, 250, 250],
-                  // ...(payload.type === 'ws-message' && payload.ws_message?.type === "message:new" ? {
-                  //   tag: `conversation_${(payload.ws_message?.payload as any).conv_id || "group"}`,
-                  // } : {}),
-                },
+                // Only include android.notification when fcm_mode is 'notification'
+                // This prevents Firebase from auto-displaying notifications for data-only messages
+                ...(payload.fcm_mode === 'notification'
+                  ? {
+                    notification: {
+                      channelId: payload.type === 'call' ? 'calls' : 'messages',
+                      priority: payload.type === 'call' ? 'max' : 'high',
+                      sticky: payload.type === 'call' ? true : false,
+                      sound: 'default',
+                      vibrateTimingsMillis: [0, 250, 250, 250],
+                      // ...(payload.type === 'ws-message' && payload.ws_message?.type === "message:new" ? {
+                      //   tag: `conversation_${(payload.ws_message?.payload as any).conv_id || "group"}`,
+                      // } : {}),
+                    },
+                  }
+                  : {}),
               },
               apns: {
                 payload: {

@@ -18,8 +18,9 @@ export const message_routes = new Elysia({ prefix: "/message" })
   })
 
   .post("/delivered", async ({ set, store, body }) => {
+    console.log("delivered -> ", body);
     const delivery_result = await mark_message_delivered(
-      body.message_id,
+      BigInt(body.message_id),
       body.conversation_id,
       store.id
     );
@@ -27,7 +28,7 @@ export const message_routes = new Elysia({ prefix: "/message" })
     return delivery_result;
   }, {
     body: t.Object({
-      message_id: t.BigInt(),
+      message_id: t.String(),
       conversation_id: t.Number()
     })
   })

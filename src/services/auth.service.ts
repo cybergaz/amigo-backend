@@ -107,7 +107,7 @@ const handle_refresh_token = async (token: string) => {
       .select()
       .from(user_model)
       .where(eq(user_model.refresh_token, token))
-      .limit(1)
+      .limit(1);
 
     if (!user) {
       return {
@@ -150,7 +150,7 @@ const handle_refresh_token_mobile = async (token: string) => {
       .select()
       .from(user_model)
       .where(eq(user_model.refresh_token, token))
-      .limit(1)
+      .limit(1);
 
     if (!user) {
       return {
@@ -268,7 +268,7 @@ const force_logout_other_devices = async (user_id: number): Promise<void> => {
   }
 };
 
-const create_signup_request = async ({ first_name, last_name, phone }: { first_name: string; last_name: string; phone: string }) => {
+const create_signup_request = async ({ first_name, last_name, phone }: { first_name: string; last_name: string; phone: string; }) => {
   try {
     const signup_request = await db
       .insert(signup_request_model)
@@ -279,7 +279,11 @@ const create_signup_request = async ({ first_name, last_name, phone }: { first_n
       })
       .returning();
     if (!signup_request) {
-      return { success: false, code: 404, message: "Signup request not created" };
+      return {
+        success: false,
+        code: 404,
+        message: "Signup request not created"
+      };
     }
 
     // ---------------------------------------------------------
@@ -290,7 +294,7 @@ const create_signup_request = async ({ first_name, last_name, phone }: { first_n
       first_name,
       last_name,
       status: "accepted",
-    })
+    });
 
     return {
       success: true,
@@ -403,6 +407,78 @@ const update_signup_request_status = async (payload: UpdateSignupRequestType) =>
   }
 };
 
+const DEMO_USER_PHONE = '+10000000000';
+const DEMO_USER_NAME = 'Demo User';
+
+const demo_login = async () => {
+  try {
+    // Find existing demo user
+    let demo_user = await db
+      .select()
+      .from(user_model)
+      .where(eq(user_model.phone, DEMO_USER_PHONE))
+      .then((res) => res[0]);
+
+    // Create demo user if doesn't exist
+    if (!demo_user) {
+      const create_res = await create_user({
+        name: DEMO_USER_NAME,
+        password: null,
+        role: 'user',
+        phone: DEMO_USER_PHONE,
+      });
+
+      if (!create_res.success) {
+        return { success: false, code: 500, message: 'Failed to create demo account' };
+      }
+
+      demo_user = await db
+        .select()
+        .from(user_model)
+        .where(eq(user_model.phone, DEMO_USER_PHONE))
+        .then((res) => res[0]);
+    }
+
+    if (!demo_user) {
+      return { success: false, code: 500, message: 'Demo account unavailable' };
+    }
+
+    const access_token = generate_jwt(demo_user.id, demo_user.role || false, '7d');
+    const refresh_token = generate_refresh_jwt(demo_user.id, demo_user.role, '30d');
+
+    // Update refresh token without forcing logout of other demo sessions
+    await db
+      .update(user_model)
+      .set({ refresh_token })
+      .where(eq(user_model.id, demo_user.id));
+
+    return {
+      success: true,
+      code: 200,
+      message: 'Demo login successful',
+      data: {
+        id: demo_user.id,
+        name: demo_user.name,
+        role: demo_user.role,
+        phone: demo_user.phone,
+        email: demo_user.email,
+        profile_pic: demo_user.profile_pic,
+        call_access: demo_user.call_access,
+        created_at: demo_user.created_at,
+        refresh_token,
+        access_token,
+      },
+    };
+  } catch (error: any) {
+    console.error('Demo login error:', error);
+    return {
+      success: false,
+      code: 500,
+      message: 'Internal server error during demo login',
+    };
+  }
+};
+
 export {
   handle_login,
   handle_refresh_token,
@@ -412,5 +488,6 @@ export {
   create_signup_request,
   get_signup_request_status,
   get_all_signup_requests,
-  update_signup_request_status
+  update_signup_request_status,
+  demo_login,
 };

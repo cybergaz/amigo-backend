@@ -89,9 +89,9 @@ const app = new Elysia({ prefix: "/api" })
   // Automatically convert BigInt values to strings in all responses
   // Registered BEFORE routes so it applies to all routes registered after
   .onAfterHandle(({ responseValue, path }) => {
-    console.log("path -> ", path);
+    // console.log("path -> ", path);
     // console.log("responseValue -> ", responseValue);
-    console.log('[BIGINT-SERIALIZATION] Hook called, responseValue type:', typeof responseValue);
+    // console.log('[BIGINT-SERIALIZATION] Hook called, responseValue type:', typeof responseValue);
 
     // Only transform if responseValue is an object/array (not already a string or Response object)
     if (responseValue && typeof responseValue === 'object' && !(responseValue instanceof Response) && !(responseValue instanceof Date)) {
@@ -103,9 +103,9 @@ const app = new Elysia({ prefix: "/api" })
         JSON.stringify(transformed);
 
         // Debug: Log if transformation happened (only for conversation history to avoid spam)
-        if (transformed?.data?.messages) {
-          console.log('[BIGINT-SERIALIZATION] Transformed response, message count:', transformed.data.messages.length);
-        }
+        // if (transformed?.data?.messages) {
+        //   console.log('[BIGINT-SERIALIZATION] Transformed response, message count:', transformed.data.messages.length);
+        // }
 
         // Return the transformed response
         return transformed;

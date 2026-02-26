@@ -271,9 +271,9 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
     await FCMService.send_notification(
       {
         type: "ws-message",
-        fcm_mode: "notification",
-        title: `${updated_message_payload?.sender_name || 'New Message'}`,
-        body: FCMService.formatMessageBody(updated_message_payload),
+        fcm_mode: "data-only",
+        // title: `${updated_message_payload?.sender_name || 'New Message'}`,
+        // body: FCMService.formatMessageBody(updated_message_payload),
         user_ids: sent_result.offline,
         ws_message: serializable_fcm_message
       }
@@ -711,24 +711,27 @@ const handle_call_termination = async (
       // const other_user = caller_id === user_id ? callee_id : caller_id;
       // const is_caller_declining = user_id === caller_id;
 
-      // Notify both parties about the termination
+      // Build the termination payload once
+      const terminate_message_payload = {
+        ...call_decline_payload,
+        data: {
+          success: true,
+          terminated_by: user_id,
+          status: result.data?.status,
+          reason: reason,
+        },
+      };
+
+      // Notify each party individually via WS (if online) or FCM (if offline)
       for (const id of [payload.caller_id, payload.callee_id]) {
         if (is_user_online(id)) {
           // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
           await broadcast_message({
             to: "users",
-            user_ids: [payload.caller_id, payload.callee_id],
+            user_ids: [id],
             message: {
               type: ws_event_type,
-              payload: {
-                ...call_decline_payload,
-                data: {
-                  success: true,
-                  terminated_by: user_id,
-                  status: result.data?.status,
-                  reason: reason,
-                },
-              },
+              payload: terminate_message_payload,
             },
           });
         }
@@ -739,15 +742,7 @@ const handle_call_termination = async (
             user_ids: [id],
             ws_message: {
               type: ws_event_type,
-              payload: {
-                ...call_decline_payload,
-                data: {
-                  success: true,
-                  terminated_by: user_id,
-                  status: result.data?.status,
-                  reason: reason,
-                },
-              },
+              payload: terminate_message_payload,
             }
           });
         }

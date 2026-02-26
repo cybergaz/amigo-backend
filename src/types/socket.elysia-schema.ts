@@ -2,6 +2,11 @@ import { t } from "elysia";
 import { CONNECTION_STATUS_CONST, VITAL_WS_EVENTS_CONST, WS_MESSAGE_EVENTS_CONST } from "./socket.types";
 import { CHAT_TYPE_CONSTS, MESSAGE_TYPE_CONSTS, CHAT_ROLE_CONST, MESSAGE_STATUS_CONSTS } from "./chat.types";
 
+// Flexible date type that accepts Date objects, ISO date-time strings (with or without timezone),
+// and numeric timestamps. Dart's DateTime.toIso8601String() omits the timezone suffix,
+// which fails TypeBox's strict RFC 3339 date-time validation. This helper avoids that.
+const FlexDate = () => t.Union([t.Date(), t.String(), t.Number()]);
+
 // OnlineStatusPayload schema
 const ConnectionStatusPayloadSchema = t.Object({
   sender_id: t.Number(),
@@ -28,7 +33,7 @@ const ChatMessagePayloadSchema = t.Object({
   attachments: t.Optional(t.Any()),
   metadata: t.Optional(t.Any()),
   reply_to_message_id: t.Optional(t.String()), // Accept as string, convert to bigint after validation
-  sent_at: t.Date(),
+  sent_at: FlexDate(),
 });
 
 // ChatMessageAckPayload schema
@@ -36,7 +41,7 @@ const ChatMessageAckPayloadSchema = t.Object({
   id: t.String(), // Accept as string, convert to bigint after validation
   conv_id: t.Number(),
   sender_id: t.Number(),
-  delivered_at: t.Date(),
+  delivered_at: FlexDate(),
   delivered_to: t.Optional(t.Array(t.Number())),
   read_by: t.Optional(t.Array(t.Number())),
   offline_users: t.Optional(t.Array(t.Number())),
@@ -67,7 +72,7 @@ const MembersTypeSchema = t.Object({
   user_name: t.String(),
   user_pfp: t.Optional(t.String()),
   role: t.Enum(Object.fromEntries(CHAT_ROLE_CONST.map(x => [x, x]))),
-  joined_at: t.Date()
+  joined_at: FlexDate()
 });
 
 // NewConversationPayload schema
@@ -80,7 +85,7 @@ const NewConversationPayloadSchema = t.Object({
   creater_phone: t.String(),
   creater_pfp: t.Optional(t.String()),
   members: t.Optional(t.Array(MembersTypeSchema)),
-  joined_at: t.Date()
+  joined_at: FlexDate()
 });
 
 // MiscPayload schema
@@ -100,10 +105,10 @@ const CallPayloadSchema = t.Object({
   callee_id: t.Number(),
   callee_name: t.Optional(t.String()),
   callee_pfp: t.Optional(t.String()),
-  callType: t.Enum({ audio: "audio", video: "video", }),
+  callType: t.Optional(t.Enum({ audio: "audio", video: "video", })),
   data: t.Optional(t.Any()),
   error: t.Optional(t.Any()),
-  timestamp: t.Optional(t.Date()),
+  timestamp: t.Optional(FlexDate()),
 });
 
 // MessagePinPayload schema
@@ -158,7 +163,7 @@ const ConversationActionPayloadSchema = t.Object({
   actor_name: t.Optional(t.String()),
   actor_pfp: t.Optional(t.String()),
   message: t.String(),
-  action_at: t.Date(),
+  action_at: FlexDate(),
 });
 
 // MessageDeliveredPayload schema - for delivery receipts from FCM messages
@@ -167,7 +172,7 @@ const MessageDeliveredPayloadSchema = t.Object({
   conv_id: t.Number(),
   sender_id: t.Number(),
   recipient_id: t.Number(),
-  delivered_at: t.Date(),
+  delivered_at: FlexDate(),
 });
 
 // // Ping message schema (for heartbeat)

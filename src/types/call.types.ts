@@ -1,6 +1,6 @@
 // Call signaling message types
 interface CallSignalingMessage {
-  type: 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:decline' | 'call:end' | 'call:ringing' | 'call:missed';
+  type: 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:terminate' | 'call:ringing';
   callId: number;
   from: number;
   to: number;

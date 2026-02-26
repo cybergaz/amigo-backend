@@ -690,6 +690,7 @@ export const create_admin_user = async (email: string, password: string, permiss
         name: email.split("@")[0], // Use email prefix as name
         email: email,
         role: "sub_admin" as RoleType,
+        call_access: true,
         hashed_password,
         refresh_token,
         permissions: permissions,

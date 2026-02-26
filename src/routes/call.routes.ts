@@ -4,8 +4,107 @@ import { app_middleware } from "@/middleware";
 import db from "@/config/db";
 import { eq } from "drizzle-orm";
 import { call_model } from "@/models/call.model";
+import { broadcast_message, is_user_online } from "@/sockets/socket.handlers";
+import FCMService from "@/services/fcm.service";
 
 const call_routes = new Elysia({ prefix: "/call" })
+
+  // ---- Unprotected routes (accessible from background handlers without auth) ----
+
+  .get("/status/:call_id", async ({ set, params }) => {
+    const [call_info] = await db.select().from(call_model).where(eq(call_model.id, Number(params.call_id))).limit(1);
+
+    if (!call_info) {
+      set.status = 404;
+      return {
+        success: false,
+        data: null,
+        message: "Call not found"
+      };
+    }
+
+    set.status = 200;
+    return {
+      success: true,
+      data: call_info,
+      message: "Call status retrieved successfully"
+    };
+  })
+
+  .post("/decline/:call_id", async ({ set, params }) => {
+    try {
+      const callId = Number(params.call_id);
+
+      // Get call info from database
+      const [call_info] = await db.select().from(call_model).where(eq(call_model.id, callId)).limit(1);
+
+      if (!call_info) {
+        set.status = 404;
+        return {
+          success: false,
+          message: "Call not found"
+        };
+      }
+
+      // Decline the call using the callee_id from the call record
+      const result = await CallService.terminate_call(callId, call_info.callee_id, "declined");
+
+      if (result.success) {
+        // Notify the caller about the decline via WebSocket or FCM
+        // This ensures the caller gets immediate notification instead of waiting for polling
+        const terminate_payload = {
+          call_id: callId,
+          caller_id: call_info.caller_id,
+          callee_id: call_info.callee_id,
+          data: {
+            success: true,
+            terminated_by: call_info.callee_id,
+            status: result.data?.status,
+            reason: "declined",
+          },
+          timestamp: new Date(),
+        };
+
+        if (is_user_online(call_info.caller_id)) {
+          await broadcast_message({
+            to: "users",
+            user_ids: [call_info.caller_id],
+            message: {
+              type: "call:terminate",
+              payload: terminate_payload,
+            },
+          });
+        } else {
+          // Caller might have gone offline - send FCM as fallback
+          await FCMService.send_notification({
+            type: "call",
+            fcm_mode: "data-only",
+            user_ids: [call_info.caller_id],
+            ws_message: {
+              type: "call:terminate",
+              payload: terminate_payload,
+            },
+          });
+        }
+      }
+
+      set.status = 200;
+      return {
+        success: true,
+        message: "Call declined successfully"
+      };
+    } catch (error) {
+      console.error('[CALL ROUTES] Error declining call:', error);
+      set.status = 500;
+      return {
+        success: false,
+        message: "Internal server error"
+      };
+    }
+  })
+
+  // ---- Protected routes (require authentication) ----
+
   .state({ id: 0, role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
@@ -71,59 +170,6 @@ const call_routes = new Elysia({ prefix: "/call" })
         message: "Internal server error"
       };
     }
-  })
-
-  .post("/decline/:call_id", async ({ set, params, store }) => {
-    try {
-      const callId = Number(params.call_id);
-
-      // Get call info from database
-      const [call_info] = await db.select().from(call_model).where(eq(call_model.id, callId)).limit(1);
-
-      if (!call_info) {
-        set.status = 404;
-        return {
-          success: false,
-          message: "Call not found"
-        };
-      }
-
-      // Decline the call
-      await CallService.terminate_call(callId, store.id, "declined");
-
-      set.status = 200;
-      return {
-        success: true,
-        message: "Call declined successfully"
-      };
-    } catch (error) {
-      console.error('[UNPROTECTED CALL ROUTES] Error declining call:', error);
-      set.status = 500;
-      return {
-        success: false,
-        message: "Internal server error"
-      };
-    }
-  })
-
-  .get("/status/:call_id", async ({ set, params }) => {
-    const [call_info] = await db.select().from(call_model).where(eq(call_model.id, Number(params.call_id))).limit(1);
-
-    if (!call_info) {
-      set.status = 404;
-      return {
-        success: false,
-        data: null,
-        message: "Call not found"
-      };
-    }
-
-    set.status = 200;
-    return {
-      success: true,
-      data: call_info,
-      message: "Call status retrieved successfully"
-    };
   });
 
 // .get("/status", async ({ set, store, query }) => {

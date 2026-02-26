@@ -125,9 +125,22 @@ const broadcast_message = async (data: BroadcastData) => {
 
   // Store missed messages in three-tier polling cache for offline users
   // Only allowed event types are cached (message:new, conversation:new, etc.)
-  if (offline_users_id.size > 0 && is_allowed_event(data.message.type)) {
+  // if (offline_users_id.size > 0 && is_allowed_event(data.message.type)) {
+  //   console.log("offline_users_id -> ", offline_users_id);
+  //   store_pending_message_for_users(
+  //     Array.from(offline_users_id),
+  //     data.message as VitalWSMessage,
+  //   ).catch(err => {
+  //     console.error("[BROADCAST] Error storing pending messages for offline users:", err);
+  //   });
+  // }
+  if (is_allowed_event(data.message.type)) {
+    const all_recievers_on_polling_rn = Array.from(new Set([...offline_users_id, ...online_users_id].filter(user_id => {
+      const polling_connection = polling_connections.get(user_id);
+      return polling_connection !== undefined;
+    })));
     store_pending_message_for_users(
-      Array.from(offline_users_id),
+      Array.from(all_recievers_on_polling_rn),
       data.message as VitalWSMessage,
     ).catch(err => {
       console.error("[BROADCAST] Error storing pending messages for offline users:", err);
@@ -419,10 +432,14 @@ const convertStringIdsToBigIntForWSMessage = (ws_message: string): WSMessage => 
   }
 };
 
-const socket_message_handler = async (ws: Prettify<ElysiaWS<Context, RouteSchema>>, message: WSMessage) => {
-  const user_id = Number(get_ws_data(ws, "user_id"));
-  const user_name = String(get_ws_data(ws, "user_name"));
-  const user_pfp = String(get_ws_data(ws, "user_pfp"));
+const socket_message_handler = async (user_details: {
+  user_id?: number,
+  user_name?: string;
+  user_pfp?: string;
+}, message: WSMessage) => {
+  const user_id = user_details.user_id || 0; // Default to 0 if user_id is missing, but ideally should not happen due to authentication middleware
+  const user_name = user_details.user_name || "Unknown User";
+  const user_pfp = user_details.user_pfp || "";
 
   if (!user_id) {
     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>

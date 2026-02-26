@@ -15,9 +15,8 @@ const socket_connections = new Map<number, UserConnection>(); // user_id -> User
 const polling_connections = new Map<number, PollingConnection>(); // user_id -> Polling connection
 
 // Heartbeat configuration
-const HEARTBEAT_INTERVAL_MS = 30000; // Send ping every 30 seconds
-const MAX_MISSED_PINGS = 3; // Close connection after 3 missed pings
-const PING_TIMEOUT_MS = 10000; // Wait 10 seconds for pong response
+const HEARTBEAT_INTERVAL_MS = 10000; // Send ping every 30 seconds
+const MAX_MISSED_PINGS = 5; // Close connection after 3 missed pings
 
 // Heartbeat interval for all WebSocket connections
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
@@ -63,40 +62,45 @@ function startHeartbeat() {
       }
     });
 
-    // Clean up stale connections
-    // staleConnections.forEach(async (user_id) => {
-    //   const connection = socket_connections.get(user_id);
-    //   if (connection) {
-    //     try {
-    //       connection.ws.close(4000, "Connection timeout - no pong response");
-    //     } catch (e) {
-    //       // Ignore close errors
-    //     }
-    //     socket_connections.delete(user_id);
-    //
-    //     // Notify connected users about this user being offline
-    //     const connected_users = await get_connected_users(user_id);
-    //     const message_payload: ConnectionStatusPayload = {
-    //       sender_id: user_id,
-    //       status: 'disconnected',
-    //     };
-    //     await broadcast_message({
-    //       to: "users",
-    //       user_ids: Array.from(connected_users),
-    //       message: {
-    //         type: "connection:status",
-    //         payload: message_payload,
-    //         ws_timestamp: new Date()
-    //       },
-    //       exclude_user_ids: [user_id]
-    //     });
-    //
-    //     console.log(`[WS-HEARTBEAT] Cleaned up stale connection for user ${user_id}. Total connections: ${socket_connections.size}`);
-    //   }
-    // });
+    for (const user_id of staleConnections) {
+      const connection = socket_connections.get(user_id);
+      if (connection) {
+        try {
+          connection.ws.close(4000, "Connection timeout - no pong response");
+        } catch (e) {
+          // Ignore close errors
+        }
+        socket_connections.delete(user_id);
 
-    // Update user status in DB
-    // await batch_update_users_details(staleConnections, { online_status: false, last_seen: new Date() });
+        // Notify connected users about this user being offline
+        try {
+          const connected_users = await get_connected_users(user_id);
+          const message_payload: ConnectionStatusPayload = {
+            sender_id: user_id,
+            status: 'disconnected',
+          };
+          await broadcast_message({
+            to: "users",
+            user_ids: Array.from(connected_users),
+            message: {
+              type: "connection:status",
+              payload: message_payload,
+              ws_timestamp: new Date()
+            },
+            exclude_user_ids: [user_id]
+          });
+        } catch (e) {
+          console.error(`[WS-HEARTBEAT] Error notifying about stale connection for user ${user_id}:`, e);
+        }
+
+        console.log(`[WS-HEARTBEAT] Cleaned up stale connection for user ${user_id}. Total connections: ${socket_connections.size}`);
+      }
+    }
+
+    // Update user status in DB for stale connections
+    if (staleConnections.length > 0) {
+      await batch_update_users_details(staleConnections, { online_status: false, last_seen: new Date() });
+    }
 
   }, HEARTBEAT_INTERVAL_MS);
 
@@ -407,7 +411,11 @@ const web_socket_server = new Elysia()
     message: async (ws, message) => {
 
       // heavy lifting is done in the handler
-      await socket_message_handler(ws, message as WSMessage);
+      await socket_message_handler({
+        user_id: Number(get_ws_data(ws, "user_id")),
+        user_name: String(get_ws_data(ws, "user_name")),
+        user_pfp: String(get_ws_data(ws, "user_pfp"))
+      }, message as WSMessage);
     },
 
     close: async (ws) => {

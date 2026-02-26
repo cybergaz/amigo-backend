@@ -180,11 +180,16 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/verify-login-otp", async ({ body, set, cookie, headers }) => {
-    const otpResponse = await verify_otp(body.otp, body.phone);
+    console.log("body -> ", body);
 
-    if (!otpResponse.success) {
-      set.status = otpResponse.code;
-      return otpResponse;
+    // For testing purposes, allow OTP bypass for specific test numbers
+    if (!body.phone.startsWith("+91100100100")) {
+      const otpResponse = await verify_otp(body.otp, body.phone);
+
+      if (!otpResponse.success) {
+        set.status = otpResponse.code;
+        return otpResponse;
+      }
     }
 
     const login_res = await handle_login({ phone: body.phone });
@@ -215,7 +220,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
 
     set.status = login_res.code;
-    return login_res
+    return login_res;
   },
     {
       body: t.Object({
@@ -260,7 +265,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
 
     set.status = login_res.code;
-    return login_res
+    return login_res;
   },
     {
       body: t.Object({
@@ -359,7 +364,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
 
     set.status = refresh_res.code;
-    return refresh_res
+    return refresh_res;
   })
 
   .post("/refresh-mobile", async ({ cookie, set }) => {
@@ -414,7 +419,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
 
     console.log(`[SERVER] Mobile Token Refreshed for User ID: ${info.data.id} at ${new Date().toLocaleString()}`);
     set.status = refresh_res.code;
-    return refresh_res
+    return refresh_res;
   })
 
   .get("/validate-token", async ({ cookie, set }) => {
@@ -450,7 +455,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     if (info.success && info.data?.id) {
       // Remove FCM token from all 3 tiers (LRU, Redis, DB)
       await remove_fcm_token(info.data.id);
-      
+
       // Update online status in DB
       await db
         .update(user_model)
@@ -502,8 +507,8 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         success: false,
         message: "Error dropping users table",
         error: (error as Error).message,
-      }
+      };
     }
-  })
+  });
 
 export default auth_routes;

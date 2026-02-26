@@ -194,8 +194,14 @@ export class CallService {
         };
       }
 
-      // Determine status based on who is declining
-      const status = active_call.caller_id === user_id ? 'ended' : 'declined';
+      // Determine status based on call state and who is terminating
+      // If the call was answered, it's always 'ended' (hangup by either party)
+      // If the call was NOT answered: caller terminating = 'ended' (cancelled), callee terminating = 'declined'
+      const status = active_call.status === 'answered'
+        ? 'ended'
+        : active_call.caller_id === user_id
+          ? 'ended'
+          : 'declined';
 
       // Clear timeout
       if (active_call.timeout_timer) {
