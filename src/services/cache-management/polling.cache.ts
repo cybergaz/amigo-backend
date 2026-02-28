@@ -5,7 +5,7 @@ import db from "@/config/db";
 import { missed_ws_messages_model } from "@/models/chat.model";
 import { VITAL_WS_EVENTS_CONST, VitalWSMessage, VitalWSMessageEventsType, WSMessage, WSMessageEventsType } from "@/types/socket.types";
 import { eq, and, lt, asc, gt } from "drizzle-orm";
-import { convertBigIntIdsToString, convertStringIdsToBigInt, convertStringIdsToBigIntForWSMessage } from "@/sockets/socket.handlers";
+import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 
 // ============================================================================
 // Three-tier Polling Cache for Missed WS Messages
@@ -61,7 +61,7 @@ async function store_pending_message(
   const now = Date.now();
 
   // Convert BigInt IDs to strings in the message payload for safe serialization/storage
-  const serialized_ws_meeasge = convertBigIntIdsToString(ws_message);
+  const serialized_ws_meeasge = convertBigIntToString(ws_message);
   const entry: CachedPollMessage = {
     message_id: pending_message_id,
     ws_message,
@@ -158,7 +158,7 @@ async function fetch_pending_messages(
             // const deserialized_ws_message_payload = convertStringIdsToBigInt(parsed.ws_message, parsed.ws_message.type);
             return {
               ...parsed,
-              ws_message: convertStringIdsToBigIntForWSMessage(JSON.stringify(parsed.ws_message)) as VitalWSMessage,
+              ws_message: convertStringToBigInt(parsed.ws_message) as VitalWSMessage,
             } as CachedPollMessage;
           } catch (err) {
             console.error(`[POLL-CACHE] Error parsing Redis message for user ${user_id}:`, err);
@@ -186,7 +186,8 @@ async function fetch_pending_messages(
           messages = db_messages.map(row => ({
             message_id: row.id,
             event_type: row.event_type as VitalWSMessageEventsType,
-            ws_message: convertStringIdsToBigIntForWSMessage(JSON.stringify(row.ws_message)) as VitalWSMessage,
+            ws_message: convertStringToBigInt(row.ws_message) as VitalWSMessage,
+            // ws_message: convertStringIdsToBigIntForWSMessage(JSON.stringify(row.ws_message)) as VitalWSMessage,
             created_at: new Date(row.created_at).getTime(),
           }));
 

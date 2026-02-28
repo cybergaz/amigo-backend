@@ -1,15 +1,10 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
-import { delete_message_for_me } from "@/services/chat.services";
-import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, reply_to_message, star_messages } from "@/services/message.services";
 import { fetch_pending_messages } from "@/services/cache-management/polling.cache";
 import { socket_message_handler } from "@/sockets/socket.handlers";
 import { ChatMessageAckPayload, ChatMessagePayload, WSMessage } from "@/types/socket.types";
-import db from "@/config/db";
-import { user_model } from "@/models/user.model";
-import { eq } from "drizzle-orm";
-import { polling_connections } from "@/sockets/socket.server";
 import { get_user_details } from "@/services/user.services";
+import { polling_connections } from "@/sockets/socket.server";
 
 export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
   .state({ id: 0, role: "" })
@@ -55,9 +50,8 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
         existing_connection.client_ip = client_ip;
       } else {
         polling_connections.set(user_id, {
-          user_id,
+          connection_status: "foreground",
           last_poll: new Date(),
-          pending_messages: [],
           client_ip,
           connected_at: new Date(),
         });
@@ -128,179 +122,6 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
   }, {
     body: t.Any(),
   })
-  //
-  //   // Get user details for message handling
-  //   const user_name = (await db
-  //     .select({ name: user_model.name })
-  //     .from(user_model)
-  //     .where(eq(user_model.id, user_id))
-  //     .limit(1))[0]?.name;
-  //
-  //   // Process the message similar to WebSocket message handling
-  //   const message = body as any;
-  //
-  //   // For now, support basic message types that don't require WebSocket-specific handling
-  //   switch (message.type) {
-  //     case 'ping':
-  //       return { type: 'pong', timestamp: new Date().toISOString() };
-  //
-  //     case 'message:new':
-  //       if (message.payload) {
-  //         const payload = message.payload as ChatMessagePayload;
-  //
-  //         // Store the message in DB
-  //         const stored_message = await store_message(payload);
-  //         if (!stored_message?.success) {
-  //           set.status = 500;
-  //           return { error: 'Failed to store message' };
-  //         }
-  //
-  //         const new_message_payload: ChatMessagePayload = {
-  //           ...payload,
-  //           canonical_id: stored_message?.data?.id,
-  //           sender_name: payload.sender_name || user_name || undefined,
-  //         };
-  //
-  //         // Broadcast to conversation members
-  //         const sent_result = await broadcast_message({
-  //           to: "conversation",
-  //           conv_id: payload.conv_id,
-  //           message: {
-  //             type: "message:new",
-  //             payload: new_message_payload,
-  //             ws_timestamp: new Date()
-  //           },
-  //           exclude_user_ids: [payload.sender_id]
-  //         });
-  //
-  //         console.log("sent_result -> ", sent_result)
-  //
-  //         if (stored_message.data) {
-  //           const conv_members = await get_conversation_members(payload.conv_id);
-  //           const message_statuses: Array<{ user_id: number; message_id: number; conv_id: number; delivered_at: Date | null; read_at: Date | null }> = [];
-  //
-  //           for (const member_id of conv_members) {
-  //             if (member_id !== payload.sender_id) {
-  //
-  //               // const is_member_online = socket_connections.has(member_id);
-  //               // const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === member_id;
-  //
-  //               message_statuses.push({
-  //                 user_id: member_id,
-  //                 message_id: stored_message.data.id,
-  //                 conv_id: payload.conv_id,
-  //                 delivered_at: sent_result.online.includes(member_id) ? new Date() : null,
-  //                 read_at: sent_result.active_in_conv.includes(member_id) ? new Date() : null,
-  //               });
-  //             }
-  //           }
-  //
-  //           // Batch insert message statuses for all recipients
-  //           if (message_statuses.length > 0) {
-  //             await batch_insert_message_status(message_statuses);
-  //           }
-  //
-  //           // Special handling for DMs: update message status in messages table
-  //           if (conv_members.size === 2) {
-  //             const copy_conv_member = [...conv_members];
-  //
-  //             const reciepient_id = Array.from(copy_conv_member)[0] == payload.sender_id
-  //               ? Array.from(copy_conv_member)[1]   // for DMs only
-  //               : Array.from(copy_conv_member)[0]
-  //             if (reciepient_id) {
-  //               // update message status in messages table (for DMs)
-  //               await db.update(message_model).set({
-  //                 status: sent_result.active_in_conv.includes(reciepient_id)
-  //                   ? "read"
-  //                   : sent_result.online.includes(reciepient_id)
-  //                     ? "delivered"
-  //                     : "sent"
-  //               }).where(
-  //                 and(
-  //                   eq(message_model.id, stored_message.data.id),
-  //                   eq(message_model.conversation_id, payload.conv_id)
-  //                 )
-  //               )
-  //             }
-  //           }
-  //
-  //           const offline_and_inactive_users = new Set([...sent_result.offline, ...sent_result.online]);
-  //           for (const user_id of offline_and_inactive_users) {
-  //             // insert into missed_messages table
-  //             await db.update(conversation_member_model)
-  //               .set({
-  //                 unread_count: sql`${conversation_member_model.unread_count} + 1`,
-  //                 last_delivered_message_id: sent_result.online.includes(user_id) || sent_result.active_in_conv.includes(user_id)
-  //                   ? stored_message.data.id
-  //                   : sql`${conversation_member_model.last_delivered_message_id}`,
-  //                 last_read_message_id: sent_result.active_in_conv.includes(user_id)
-  //                   ? stored_message.data.id
-  //                   : sql`${conversation_member_model.last_read_message_id}`,
-  //               })
-  //               .where(
-  //                 and(
-  //                   eq(conversation_member_model.conversation_id, payload.conv_id),
-  //                   eq(conversation_member_model.user_id, user_id)
-  //                 )
-  //               )
-  //           }
-  //         }
-  //
-  //         // update conversaion's last_message metadata and last_updated_at
-  //         await update_conversation({
-  //           id: payload.conv_id,
-  //           metadata: { last_message: stored_message?.data },
-  //           last_message_at: new Date()
-  //         })
-  //
-  //         // send fcm notification to offline users
-  //         await FCMService.sendBulkMessageNotifications(
-  //           sent_result.offline,
-  //           new_message_payload
-  //         );
-  //
-  //         // Return acknowledgment
-  //         return {
-  //           type: "message:ack",
-  //           payload: {
-  //             optimistic_id: payload.optimistic_id,
-  //             canonical_id: stored_message?.data?.id,
-  //             conv_id: payload.conv_id,
-  //             sender_id: payload.sender_id,
-  //             delivered_at: new Date(),
-  //             delivered_to: sent_result.online,
-  //             offline_users: sent_result.offline,
-  //           }
-  //         };
-  //       }
-  //       break;
-  //
-  //     case 'conversation:typing':
-  //       if (message.payload) {
-  //         const payload = message.payload as TypingPayload;
-  //         await broadcast_message({
-  //           to: "conversation",
-  //           conv_id: payload.conv_id,
-  //           message: {
-  //             type: "conversation:typing",
-  //             payload: payload,
-  //             ws_timestamp: new Date()
-  //           },
-  //           exclude_user_ids: [payload.sender_id],
-  //         });
-  //         return { success: true };
-  //       }
-  //       break;
-  //
-  //     default:
-  //       return { error: `Unsupported message type for polling: ${message.type}` };
-  //   }
-  //
-  //   return { success: true };
-  // }, {
-  //   query: t.Object({ token: t.String() }),
-  //   body: t.Any()
-  // })
 
   .get("/poll-pending-messages", async ({ set, store, query, request }) => {
     try {
@@ -319,9 +140,8 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
         existing_connection.client_ip = client_ip;
       } else {
         polling_connections.set(user_id, {
-          user_id,
+          connection_status: "foreground",
           last_poll: new Date(),
-          pending_messages: [],
           client_ip,
           connected_at: new Date(),
         });

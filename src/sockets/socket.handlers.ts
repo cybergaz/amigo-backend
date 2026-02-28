@@ -1,15 +1,14 @@
 import { WebSocketData, WSMessage, ConnectionStatusPayload, JoinLeavePayload, ChatMessagePayload, WSMessageEventsType, ChatMessageAckPayload, TypingPayload, MessagePinPayload, MessageForwardPayload, MessageDeliveredPayload, DeleteMessagePayload, MiscPayload, VitalWSMessage, VITAL_WS_EVENTS_CONST, VitalWSMessageEventsType, CallPayload, ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD, type AllowedWSEventsWithoutPayloadType } from "@/types/socket.types";
 import { ElysiaWS } from "elysia/dist/ws";
 import { get_conversation_members, get_user_conversations } from "@/services/cache-management/socket.cache";
-import { socket_connections, polling_connections, handlePongResponse } from "./socket.server";
-import { store_pending_message_for_users, is_allowed_event } from "@/services/cache-management/polling.cache";
+import { socket_connections, handlePongResponse, polling_connections } from "./socket.server";
+import { store_pending_message_for_users, is_allowed_event, store_pending_message } from "@/services/cache-management/polling.cache";
 import db from "@/config/db";
 import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
 import { and, desc, eq, isNull, ne, or, sql } from "drizzle-orm";
-import { Prettify, RouteSchema } from "elysia/dist/types";
-import { Context } from "elysia/dist/context";
 import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_connection_status, handle_conv_join_leave, handle_message_new } from "./socket.service";
 import { pin_message, unpin_message } from "@/services/message.services";
+import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 
 // Generate unique message ID for polling
 let polling_message_counter = 0;
@@ -44,7 +43,6 @@ type BroadcastData = {
 };
 
 const broadcast_message = async (data: BroadcastData) => {
-
   let members: number[] = [];
   if (data.to === "conversation" && data.conv_id) {
     // Get conversation members (LRU -> Redis -> DB)
@@ -60,11 +58,12 @@ const broadcast_message = async (data: BroadcastData) => {
   const active_in_conv: Set<number> = new Set<number>();
   const online_users_id: Set<number> = new Set<number>();
   const offline_users_id: Set<number> = new Set<number>();
+  const polling_users_id: Set<number> = new Set<number>();
 
   // console.log("all ws connections:", socket_connections)
 
   // Separate online and offline users across all transport types
-  recipients_list.forEach(user_id => {
+  recipients_list.forEach(async user_id => {
     if (data.exclude_user_ids && data.exclude_user_ids.includes(user_id)) {
       return; // Skip excluded users
     }
@@ -72,85 +71,61 @@ const broadcast_message = async (data: BroadcastData) => {
     // Check WebSocket connections
     const ws_connection = socket_connections.get(user_id);
     if (ws_connection && ws_connection.ws.readyState === 1) {
+      // User is online via WebSocket
       online_users_id.add(user_id);
-      if (ws_connection.active_conv_id === data.conv_id) {
+      if (data.conv_id && ws_connection.active_conv_id === data.conv_id) {
+        // User is active in the conversation 
         active_in_conv.add(user_id);
       }
-      return;
-    }
 
-    // Check polling connections (consider online if polled recently - within 10s)
-    const polling_connection = polling_connections.get(user_id);
-    if (polling_connection && polling_connection.last_poll) {
-      const timeSinceLastPoll = Date.now() - polling_connection.last_poll.getTime();
-      if (timeSinceLastPoll < 10000) { // 10 seconds
-        online_users_id.add(user_id);
-        return;
-      }
-    }
-
-    // User is offline
-    offline_users_id.add(user_id);
-  });
-
-  // Convert bigint IDs to strings before sending (JSON.stringify cannot serialize BigInt)
-  const messageToSend = convertBigIntIdsToString(data.message);
-
-  // Send to online users via appropriate transport
-  for (const user_id of online_users_id) {
-
-    // Try WebSocket first
-    const ws_connection = socket_connections.get(user_id);
-    if (ws_connection && ws_connection.ws.readyState === 1) {
+      // Send message immediately via WebSocket
       try {
+        // Convert bigint IDs to strings before sending (JSON.stringify cannot serialize BigInt)
+        const messageToSend = convertBigIntToString(data.message);
+
         ws_connection.ws.send(messageToSend, true);
       } catch (error) {
         console.error(`[WS] Error sending to user ${user_id}:`, error);
       }
-      continue;
+
+      return;
     }
 
-    // Queue for polling
-    const polling_connection = polling_connections.get(user_id);
-    //  check if the event type is allowed for polling before adding to pending messages
-    if (polling_connection && is_allowed_event(data.message.type)) {
-      polling_connection.pending_messages.push(messageToSend as VitalWSMessage);
-
-      // Keep only last 100 messages to prevent memory issues
-      if (polling_connection.pending_messages.length > 100) {
-        polling_connection.pending_messages = polling_connection.pending_messages.slice(-100);
+    // check polling connections for users who are not connected via WebSocket
+    const poll_connection = polling_connections.get(user_id);
+    if (poll_connection) {
+      if (poll_connection.last_poll) {
+        const timeSinceLastPoll = Date.now() - poll_connection.last_poll.getTime();
+        // Consider users with a poll in the last 10 seconds as online for polling transport
+        if (timeSinceLastPoll < 10000) {
+          polling_users_id.add(user_id);
+        }
+        // remove the stale polling connections
+        polling_connections.delete(user_id);
       }
-    }
-  }
 
-  // Store missed messages in three-tier polling cache for offline users
-  // Only allowed event types are cached (message:new, conversation:new, etc.)
-  // if (offline_users_id.size > 0 && is_allowed_event(data.message.type)) {
-  //   console.log("offline_users_id -> ", offline_users_id);
-  //   store_pending_message_for_users(
-  //     Array.from(offline_users_id),
-  //     data.message as VitalWSMessage,
-  //   ).catch(err => {
-  //     console.error("[BROADCAST] Error storing pending messages for offline users:", err);
-  //   });
-  // }
-  if (is_allowed_event(data.message.type)) {
-    const all_recievers_on_polling_rn = Array.from(new Set([...offline_users_id, ...online_users_id].filter(user_id => {
-      const polling_connection = polling_connections.get(user_id);
-      return polling_connection !== undefined;
-    })));
-    store_pending_message_for_users(
-      Array.from(all_recievers_on_polling_rn),
-      data.message as VitalWSMessage,
-    ).catch(err => {
-      console.error("[BROADCAST] Error storing pending messages for offline users:", err);
-    });
-  }
+      // Store missed messages in three-tier polling cache for offline users
+      // Only allowed event types are cached (message:new, conversation:new, etc.)
+      if (is_allowed_event(data.message.type)) {
+        await store_pending_message(
+          user_id,
+          data.message as VitalWSMessage,
+        ).catch(err => {
+          console.error("[BROADCAST] Error storing pending messages for offline users:", err);
+        });
+      }
+
+      return;
+    }
+    // User is offline
+    offline_users_id.add(user_id);
+  });
 
   return {
     online: Array.from(online_users_id),
     offline: Array.from(offline_users_id),
-    active_in_conv: Array.from(active_in_conv)
+    polling: Array.from(polling_users_id),
+    active_in_conv: Array.from(active_in_conv),
   };
 };
 
@@ -257,180 +232,180 @@ const handle_join_conversation = async ({
 };
 
 // Helper function to convert string IDs to bigint in payloads (for incoming messages)
-const convertStringIdsToBigInt = (payload: any, messageType: string): any => {
-  if (!payload) return payload;
-
-  switch (messageType) {
-    case 'message:new': {
-      const chatPayload = payload as any;
-      return {
-        ...chatPayload,
-        id: BigInt(String(chatPayload.id)),
-        reply_to_message_id: chatPayload.reply_to_message_id
-          ? BigInt(String(chatPayload.reply_to_message_id))
-          : undefined,
-      } as ChatMessagePayload;
-    }
-    case 'message:ack': {
-      const ackPayload = payload as any;
-      return {
-        ...ackPayload,
-        id: BigInt(String(ackPayload.id)),
-        new_id: ackPayload.new_id
-          ? BigInt(String(ackPayload.new_id))
-          : undefined,
-      } as ChatMessageAckPayload;
-    }
-    case 'message:delete': {
-      const deletePayload = payload as any;
-      return {
-        ...deletePayload,
-        message_ids: (deletePayload.message_ids as any[]).map(id => BigInt(String(id))),
-      } as DeleteMessagePayload;
-    }
-    case 'message:pin': {
-      const pinPayload = payload as any;
-      return {
-        ...pinPayload,
-        message_id: BigInt(String(pinPayload.message_id)),
-      } as MessagePinPayload;
-    }
-    case 'message:forward': {
-      const forwardPayload = payload as any;
-      return {
-        ...forwardPayload,
-        forwarded_message_ids: (forwardPayload.forwarded_message_ids as any[]).map(id => BigInt(String(id))),
-      } as MessageForwardPayload;
-    }
-    case 'message:delivered': {
-      const deliveredPayload = payload as any;
-      return {
-        ...deliveredPayload,
-        message_id: BigInt(String(deliveredPayload.message_id)),
-      } as MessageDeliveredPayload;
-    }
-    default:
-      return payload;
-  }
-};
+// const convertStringIdsToBigInt = (payload: any, messageType: string): any => {
+//   if (!payload) return payload;
+//
+//   switch (messageType) {
+//     case 'message:new': {
+//       const chatPayload = payload as any;
+//       return {
+//         ...chatPayload,
+//         id: BigInt(String(chatPayload.id)),
+//         reply_to_message_id: chatPayload.reply_to_message_id
+//           ? BigInt(String(chatPayload.reply_to_message_id))
+//           : undefined,
+//       } as ChatMessagePayload;
+//     }
+//     case 'message:ack': {
+//       const ackPayload = payload as any;
+//       return {
+//         ...ackPayload,
+//         id: BigInt(String(ackPayload.id)),
+//         new_id: ackPayload.new_id
+//           ? BigInt(String(ackPayload.new_id))
+//           : undefined,
+//       } as ChatMessageAckPayload;
+//     }
+//     case 'message:delete': {
+//       const deletePayload = payload as any;
+//       return {
+//         ...deletePayload,
+//         message_ids: (deletePayload.message_ids as any[]).map(id => BigInt(String(id))),
+//       } as DeleteMessagePayload;
+//     }
+//     case 'message:pin': {
+//       const pinPayload = payload as any;
+//       return {
+//         ...pinPayload,
+//         message_id: BigInt(String(pinPayload.message_id)),
+//       } as MessagePinPayload;
+//     }
+//     case 'message:forward': {
+//       const forwardPayload = payload as any;
+//       return {
+//         ...forwardPayload,
+//         forwarded_message_ids: (forwardPayload.forwarded_message_ids as any[]).map(id => BigInt(String(id))),
+//       } as MessageForwardPayload;
+//     }
+//     case 'message:delivered': {
+//       const deliveredPayload = payload as any;
+//       return {
+//         ...deliveredPayload,
+//         message_id: BigInt(String(deliveredPayload.message_id)),
+//       } as MessageDeliveredPayload;
+//     }
+//     default:
+//       return payload;
+//   }
+// };
 
 // Helper function to convert bigint IDs to strings in payloads (for outgoing messages)
 // This creates a serializable version of the message for JSON.stringify
-const convertBigIntIdsToString = (message: WSMessage): any => {
-  if (!message.payload) return message;
-
-  const payload = message.payload as any;
-
-  switch (message.type) {
-    case 'message:new': {
-      const chatPayload = payload as ChatMessagePayload;
-      return {
-        ...message,
-        payload: {
-          ...chatPayload,
-          id: typeof chatPayload.id === 'bigint' ? chatPayload.id.toString() : String(chatPayload.id),
-          reply_to_message_id: chatPayload.reply_to_message_id
-            ? (typeof chatPayload.reply_to_message_id === 'bigint'
-              ? chatPayload.reply_to_message_id.toString()
-              : String(chatPayload.reply_to_message_id))
-            : undefined,
-        },
-      };
-    }
-    case 'message:ack': {
-      const ackPayload = payload as ChatMessageAckPayload;
-      return {
-        ...message,
-        payload: {
-          ...ackPayload,
-          id: typeof ackPayload.id === 'bigint' ? ackPayload.id.toString() : String(ackPayload.id),
-          new_id: ackPayload.new_id
-            ? (typeof ackPayload.new_id === 'bigint'
-              ? ackPayload.new_id.toString()
-              : String(ackPayload.new_id))
-            : undefined,
-        },
-      };
-    }
-    case 'message:delete': {
-      const deletePayload = payload as DeleteMessagePayload;
-      return {
-        ...message,
-        payload: {
-          ...deletePayload,
-          message_ids: deletePayload.message_ids.map((id: bigint | string) =>
-            typeof id === 'bigint' ? id.toString() : String(id)
-          ),
-        },
-      };
-    }
-    case 'message:pin': {
-      const pinPayload = payload as MessagePinPayload;
-      return {
-        ...message,
-        payload: {
-          ...pinPayload,
-          message_id: typeof pinPayload.message_id === 'bigint'
-            ? pinPayload.message_id.toString()
-            : String(pinPayload.message_id),
-        },
-      };
-    }
-    case 'message:forward': {
-      const forwardPayload = payload as MessageForwardPayload;
-      return {
-        ...message,
-        payload: {
-          ...forwardPayload,
-          forwarded_message_ids: forwardPayload.forwarded_message_ids.map((id: bigint | string) =>
-            typeof id === 'bigint' ? id.toString() : String(id)
-          ),
-        },
-      };
-    }
-    case 'message:delivered': {
-      const deliveredPayload = payload as MessageDeliveredPayload;
-      return {
-        ...message,
-        payload: {
-          ...deliveredPayload,
-          message_id: typeof deliveredPayload.message_id === 'bigint'
-            ? deliveredPayload.message_id.toString()
-            : String(deliveredPayload.message_id),
-        },
-      };
-    }
-    default:
-      return message;
-  }
-};
-
-// Helper function to convert a JSON string WSMessage back to WSMessage with BigInt IDs
-// Useful when reading messages from database (JSONB) or Redis (JSON string)
-const convertStringIdsToBigIntForWSMessage = (ws_message: string): WSMessage => {
-  try {
-    const parsed = JSON.parse(ws_message) as any;
-
-    // Convert ws_timestamp string back to Date if present
-    const ws_timestamp = parsed.ws_timestamp
-      ? (typeof parsed.ws_timestamp === 'string' ? new Date(parsed.ws_timestamp) : parsed.ws_timestamp)
-      : undefined;
-
-    // Convert string IDs in payload back to BigInt
-    const payload = parsed.payload
-      ? convertStringIdsToBigInt(parsed.payload, parsed.type)
-      : undefined;
-
-    return {
-      type: parsed.type,
-      payload,
-      ws_timestamp,
-    } as WSMessage;
-  } catch (error) {
-    console.error('[WS] Error parsing WSMessage from string:', error);
-    throw new Error(`Failed to parse WSMessage: ${error}`);
-  }
-};
+// const convertBigIntIdsToString = (message: WSMessage): any => {
+//   if (!message.payload) return message;
+//
+//   const payload = message.payload as any;
+//
+//   switch (message.type) {
+//     case 'message:new': {
+//       const chatPayload = payload as ChatMessagePayload;
+//       return {
+//         ...message,
+//         payload: {
+//           ...chatPayload,
+//           id: typeof chatPayload.id === 'bigint' ? chatPayload.id.toString() : String(chatPayload.id),
+//           reply_to_message_id: chatPayload.reply_to_message_id
+//             ? (typeof chatPayload.reply_to_message_id === 'bigint'
+//               ? chatPayload.reply_to_message_id.toString()
+//               : String(chatPayload.reply_to_message_id))
+//             : undefined,
+//         },
+//       };
+//     }
+//     case 'message:ack': {
+//       const ackPayload = payload as ChatMessageAckPayload;
+//       return {
+//         ...message,
+//         payload: {
+//           ...ackPayload,
+//           id: typeof ackPayload.id === 'bigint' ? ackPayload.id.toString() : String(ackPayload.id),
+//           new_id: ackPayload.new_id
+//             ? (typeof ackPayload.new_id === 'bigint'
+//               ? ackPayload.new_id.toString()
+//               : String(ackPayload.new_id))
+//             : undefined,
+//         },
+//       };
+//     }
+//     case 'message:delete': {
+//       const deletePayload = payload as DeleteMessagePayload;
+//       return {
+//         ...message,
+//         payload: {
+//           ...deletePayload,
+//           message_ids: deletePayload.message_ids.map((id: bigint | string) =>
+//             typeof id === 'bigint' ? id.toString() : String(id)
+//           ),
+//         },
+//       };
+//     }
+//     case 'message:pin': {
+//       const pinPayload = payload as MessagePinPayload;
+//       return {
+//         ...message,
+//         payload: {
+//           ...pinPayload,
+//           message_id: typeof pinPayload.message_id === 'bigint'
+//             ? pinPayload.message_id.toString()
+//             : String(pinPayload.message_id),
+//         },
+//       };
+//     }
+//     case 'message:forward': {
+//       const forwardPayload = payload as MessageForwardPayload;
+//       return {
+//         ...message,
+//         payload: {
+//           ...forwardPayload,
+//           forwarded_message_ids: forwardPayload.forwarded_message_ids.map((id: bigint | string) =>
+//             typeof id === 'bigint' ? id.toString() : String(id)
+//           ),
+//         },
+//       };
+//     }
+//     case 'message:delivered': {
+//       const deliveredPayload = payload as MessageDeliveredPayload;
+//       return {
+//         ...message,
+//         payload: {
+//           ...deliveredPayload,
+//           message_id: typeof deliveredPayload.message_id === 'bigint'
+//             ? deliveredPayload.message_id.toString()
+//             : String(deliveredPayload.message_id),
+//         },
+//       };
+//     }
+//     default:
+//       return message;
+//   }
+// };
+//
+// // Helper function to convert a JSON string WSMessage back to WSMessage with BigInt IDs
+// // Useful when reading messages from database (JSONB) or Redis (JSON string)
+// const convertStringIdsToBigIntForWSMessage = (ws_message: string): WSMessage => {
+//   try {
+//     const parsed = JSON.parse(ws_message) as any;
+//
+//     // Convert ws_timestamp string back to Date if present
+//     const ws_timestamp = parsed.ws_timestamp
+//       ? (typeof parsed.ws_timestamp === 'string' ? new Date(parsed.ws_timestamp) : parsed.ws_timestamp)
+//       : undefined;
+//
+//     // Convert string IDs in payload back to BigInt
+//     const payload = parsed.payload
+//       ? convertStringIdsToBigInt(parsed.payload, parsed.type)
+//       : undefined;
+//
+//     return {
+//       type: parsed.type,
+//       payload,
+//       ws_timestamp,
+//     } as WSMessage;
+//   } catch (error) {
+//     console.error('[WS] Error parsing WSMessage from string:', error);
+//     throw new Error(`Failed to parse WSMessage: ${error}`);
+//   }
+// };
 
 const socket_message_handler = async (user_details: {
   user_id?: number,
@@ -467,7 +442,7 @@ const socket_message_handler = async (user_details: {
 
     // Convert string IDs to bigint after validation (before processing)
     if (message.payload) {
-      message.payload = convertStringIdsToBigInt(message.payload, message.type) as any;
+      message.payload = convertStringToBigInt(message.payload);
     }
 
     // Handle incoming messages 
@@ -884,7 +859,7 @@ export {
   get_connected_users,
   handle_join_conversation,
   socket_message_handler,
-  convertBigIntIdsToString,
-  convertStringIdsToBigInt,
-  convertStringIdsToBigIntForWSMessage
+  // convertBigIntIdsToString,
+  // convertStringIdsToBigInt,
+  // convertStringIdsToBigIntForWSMessage
 };

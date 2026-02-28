@@ -13,8 +13,8 @@ import {
 } from "@/types/chat.types";
 import { create_unique_id } from "@/utils/general.utils";
 import { and, arrayContains, asc, desc, eq, gt, inArray, isNotNull, isNull, ne, not, or, sql } from "drizzle-orm";
-import { broadcast_message, convertBigIntIdsToString, convertStringIdsToBigInt } from "@/sockets/socket.handlers";
-import { ChatMessagePayload, ConversationActionPayload, DeleteMessagePayload, MembersType, SyncMessagesPayload } from "@/types/socket.types";
+import { broadcast_message } from "@/sockets/socket.handlers";
+import { ConversationActionPayload, DeleteMessagePayload, MembersType, SyncMessagesPayload } from "@/types/socket.types";
 import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 import FCMService from "./fcm.service";
 import { get_conversation_members } from "./cache-management/socket.cache";

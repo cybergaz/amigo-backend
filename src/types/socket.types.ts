@@ -17,34 +17,25 @@ interface UserConnection {
   ws: ElysiaWS;
   connection_status: ConnectionStatusType;
   active_conv_id?: number;
-  transport_type: TransportType;
+  // transport_type: TransportType;
   last_ping_sent?: Date;
   last_pong_received?: Date;
   missed_pings: number;
+  // last_poll?: Date;
+  // last_poll_message_id?: bigint;
   connected_at: Date;
   client_ip?: string;
 }
 
 interface PollingConnection {
-  user_id: number;
-  pending_messages: VitalWSMessage[];
+  // transport_type: TransportType;
+  connection_status: ConnectionStatusType;
+  active_conv_id?: number;
   last_poll?: Date;
-  last_message_id?: bigint;
+  last_poll_message_id?: bigint;
   connected_at: Date;
   client_ip?: string;
 }
-
-// // Ping message for heartbeat
-// type PingMessage = {
-//   type: 'ping';
-//   timestamp: string;
-// }
-//
-// // Pong message for heartbeat response
-// type PongMessage = {
-//   type: 'pong';
-//   timestamp: string;
-// }
 
 // Regular WebSocket message with payload
 type WSMessage = {
@@ -72,6 +63,7 @@ interface VitalWSMessage {
   payload:
   NewConversationPayload
   | ChatMessagePayload
+  | ChatMessageAckPayload
   | DeleteMessagePayload
   | MessagePinPayload
   | MessageForwardPayload
@@ -285,6 +277,7 @@ const VITAL_WS_EVENTS_CONST = [
   'message:forward',
   'message:delete',
   'message:new',
+  'message:ack',
   'message:delivered',
 ] as const;
 
@@ -304,8 +297,8 @@ export {
 export type {
   WebSocketData,
   UserConnection,
-  TransportType,
   PollingConnection,
+  TransportType,
   WSMessage,
   VitalWSMessage,
   ConnectionStatusPayload,

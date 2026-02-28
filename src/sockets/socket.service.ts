@@ -1,6 +1,6 @@
 import { ResultType } from "@/types/core.types";
 import { CallPayload, ChatMessageAckPayload, ChatMessagePayload, ConnectionStatusPayload, JoinLeavePayload, MessageForwardPayload, WSMessageEventsType, WSMessage } from "@/types/socket.types";
-import { broadcast_message, get_connected_users, handle_join_conversation, is_user_online, convertBigIntIdsToString } from "./socket.handlers";
+import { broadcast_message, get_connected_users, handle_join_conversation, is_user_online, } from "./socket.handlers";
 import { update_user_connection_status } from "@/services/user.services";
 import { socket_connections } from "./socket.server";
 import { batch_insert_message_status, forward_messages, store_message_with_retry } from "@/services/message.services";
@@ -12,6 +12,7 @@ import { update_conversation } from "@/services/chat.services";
 import FCMService from "@/services/fcm.service";
 import { ChatType } from "@/types/chat.types";
 import { CALL_TIMEOUT_MS, CallService } from "@/services/call.service";
+import { convertBigIntToString } from "@/utils/serialization.utils";
 
 const handle_connection_status = async (payload: ConnectionStatusPayload): Promise<ResultType> => {
   try {
@@ -266,7 +267,7 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       payload: updated_message_payload,
       ws_timestamp: new Date()
     };
-    const serializable_fcm_message = convertBigIntIdsToString(fcm_ws_message);
+    const serialized_fcm_message = convertBigIntToString(fcm_ws_message);
 
     await FCMService.send_notification(
       {
@@ -275,7 +276,7 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
         // title: `${updated_message_payload?.sender_name || 'New Message'}`,
         // body: FCMService.formatMessageBody(updated_message_payload),
         user_ids: sent_result.offline,
-        ws_message: serializable_fcm_message
+        ws_message: serialized_fcm_message
       }
     );
 
