@@ -1148,12 +1148,12 @@ const mark_message_delivered = async (
     // ------------------------------------------------------------------
     // remove the message:new from missed_msgs for the recipients
     const missed_msg_key = Snowflake.correlationId(recipient_id, "message:new", message_id);
-    console.log(`[API] Removing pending message key ${missed_msg_key} for recipient ${recipient_id}`);
+    // console.log(`[API] Removing pending message key ${missed_msg_key} for recipient ${recipient_id}`);
     await remove_pending_message(recipient_id, missed_msg_key);
-    console.log(`[API] Removed pending message key ${missed_msg_key} for recipient ${recipient_id}`);
-    log_current_cache_state(recipient_id);
+    // console.log(`[API] Removed pending message key ${missed_msg_key} for recipient ${recipient_id}`);
+    // log_current_cache_state(recipient_id);
 
-    console.log(`[API] Delivery receipt processed: message ${message_id} delivered to user ${recipient_id}`);
+    // console.log(`[API] Delivery receipt processed: message ${message_id} delivered to user ${recipient_id}`);
 
     return {
       success: true,
@@ -1190,7 +1190,7 @@ const mark_messages_delivered_batch = async (
   const succeeded = results.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<any>).value?.success).length;
   const failed = results.length - succeeded;
 
-  console.log(`[API] Batch delivery: ${succeeded} succeeded, ${failed} failed for user ${recipient_id}`);
+  // console.log(`[API] Batch delivery: ${succeeded} succeeded, ${failed} failed for user ${recipient_id}`);
 
   return {
     success: succeeded > 0,
@@ -1205,7 +1205,7 @@ const verify_message_ids = async (
   conversation_id: number,
   sender_id: number
 ): Promise<ResultType<{
-  found: Record<string, { delivered_to: number[]; read_by: number[] }>;
+  found: Record<string, { delivered_to: number[]; read_by: number[]; }>;
   not_found: string[];
 }>> => {
   try {
@@ -1236,7 +1236,7 @@ const verify_message_ids = async (
       .filter((id) => !foundIds.has(id.toString()))
       .map((id) => id.toString());
 
-    const found: Record<string, { delivered_to: number[]; read_by: number[] }> = {};
+    const found: Record<string, { delivered_to: number[]; read_by: number[]; }> = {};
     if (rows.length > 0) {
       for (const r of rows) found[r.id.toString()] = { delivered_to: [], read_by: [] };
 

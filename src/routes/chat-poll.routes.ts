@@ -150,11 +150,6 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
         }
       }
 
-      console.log(`[POLL] Fetched pending message for user ${user_id}:`);
-      messages.map(msg => {
-        console.log(`[POLL] message id ${msg.message_id}`);
-      });
-
       return {
         success: true,
         code: 200,

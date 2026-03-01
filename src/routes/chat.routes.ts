@@ -30,8 +30,8 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   )
 
   .get("/get-conversation-history/:conversation_id", async ({ set, store, params, query }) => {
-    console.log("get conv history -> ", params);
-    console.log("query -> ", query);
+    // console.log("get conv history -> ", params);
+    // console.log("query -> ", query);
     const history_result = await get_conversation_history(
       params.conversation_id,
       store.id,

@@ -213,12 +213,12 @@ async function fetch_pending_messages(
   }
 
   // Remove from all 3 tiers upon fetching success (await all removals)
-  console.log(`[POLL-CACHE] removing ${messages.size} pending messages for user ${user_id} from all tiers...`);
+  // console.log(`[POLL-CACHE] removing ${messages.size} pending messages for user ${user_id} from all tiers...`);
   await Promise.allSettled(
     Array.from(messages.keys()).map(msg_id => remove_pending_message(user_id, msg_id))
   );
-  console.log(`[POLL-CACHE] removed ${messages.size} pending messages for user ${user_id} from all tiers`);
-  log_current_cache_state(user_id);
+  // console.log(`[POLL-CACHE] removed ${messages.size} pending messages for user ${user_id} from all tiers`);
+  // log_current_cache_state(user_id);
 
   // Filter by after_message_id if provided (cursor-based pagination)
   let result = Array.from(messages.values()).sort((a, b) => a.created_at - b.created_at);
