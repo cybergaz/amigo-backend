@@ -1200,6 +1200,76 @@ const mark_messages_delivered_batch = async (
   };
 };
 
+const verify_message_ids = async (
+  message_ids: bigint[],
+  conversation_id: number,
+  sender_id: number
+): Promise<ResultType<{
+  found: Record<string, { delivered_to: number[]; read_by: number[] }>;
+  not_found: string[];
+}>> => {
+  try {
+    if (message_ids.length === 0) {
+      return {
+        success: true,
+        code: 200,
+        message: "No IDs to verify",
+        data: { found: {}, not_found: [] },
+      };
+    }
+
+    // Only fetch messages where sender matches auth user (security)
+    const rows = await db
+      .select({ id: message_model.id })
+      .from(message_model)
+      .where(
+        and(
+          inArray(message_model.id, message_ids),
+          eq(message_model.conversation_id, conversation_id),
+          eq(message_model.sender_id, sender_id),
+          eq(message_model.deleted, false),
+        )
+      );
+
+    const foundIds = new Set(rows.map((r) => r.id.toString()));
+    const not_found = message_ids
+      .filter((id) => !foundIds.has(id.toString()))
+      .map((id) => id.toString());
+
+    const found: Record<string, { delivered_to: number[]; read_by: number[] }> = {};
+    if (rows.length > 0) {
+      for (const r of rows) found[r.id.toString()] = { delivered_to: [], read_by: [] };
+
+      const statusRows = await db
+        .select({
+          message_id: message_status_model.message_id,
+          user_id: message_status_model.user_id,
+          delivered_at: message_status_model.delivered_at,
+          read_at: message_status_model.read_at,
+        })
+        .from(message_status_model)
+        .where(
+          and(
+            inArray(message_status_model.message_id, rows.map((r) => r.id)),
+            eq(message_status_model.conv_id, conversation_id),
+          )
+        );
+
+      for (const s of statusRows) {
+        const key = s.message_id.toString();
+        if (!found[key]) continue;
+        if (s.delivered_at) found[key].delivered_to.push(Number(s.user_id));
+        if (s.read_at) found[key].read_by.push(Number(s.user_id));
+      }
+    }
+
+    return { success: true, code: 200, message: "OK", data: { found, not_found } };
+  } catch (e) {
+    console.error("verify_message_ids error", e);
+    return { success: false, code: 500, message: "ERROR: verify_message_ids" };
+  }
+};
+
 export {
   store_message,
   store_message_with_retry,
@@ -1217,4 +1287,5 @@ export {
   batch_update_message_status,
   mark_message_delivered,
   mark_messages_delivered_batch,
+  verify_message_ids,
 };

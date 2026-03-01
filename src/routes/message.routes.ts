@@ -1,7 +1,7 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
 import { delete_message_for_me, soft_delete_message } from "@/services/chat.services";
-import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, mark_messages_delivered_batch, reply_to_message, star_messages } from "@/services/message.services";
+import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, mark_messages_delivered_batch, reply_to_message, star_messages, verify_message_ids } from "@/services/message.services";
 
 export const message_routes = new Elysia({ prefix: "/message" })
   .state({ id: 0, role: "" })
@@ -160,5 +160,17 @@ export const message_routes = new Elysia({ prefix: "/message" })
       message_ids: t.Array(t.String()),
       is_admin_or_staff: t.Optional(t.Boolean())
     })
+  })
+
+  .post("/verify-ids", async ({ set, store, body }) => {
+    const ids = body.message_ids.map((id: string) => BigInt(id));
+    const result = await verify_message_ids(ids, body.conversation_id, store.id);
+    set.status = result.code;
+    return result;
+  }, {
+    body: t.Object({
+      message_ids: t.Array(t.String()),
+      conversation_id: t.Number(),
+    }),
   });
 
