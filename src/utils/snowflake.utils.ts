@@ -1,3 +1,4 @@
+import { VitalWSMessageEventsType, WSMessageEventsType } from "@/types/socket.types";
 import { createHash, randomInt } from "crypto";
 
 class Snowflake {
@@ -75,6 +76,29 @@ class Snowflake {
 
     return id;
   }
+
+  /**
+   * Build a correlation/dedup key for a WebSocket event.
+   *
+   * Format (with messageId):    `{userId}:{wsEventType}:{messageId}`
+   * Format (without messageId): `{userId}::{wsEventType}:{monotonicId}`
+   *
+   * The monotonic counter is process-scoped and increments on every call
+   * that omits a messageId, guaranteeing uniqueness within a process restart.
+   */
+  static correlationId(
+    userId: number | bigint,
+    wsEventType: VitalWSMessageEventsType,
+    messageId?: number | bigint | string,
+  ): string {
+    if (messageId !== undefined && messageId !== null) {
+      return `${userId}:${wsEventType}:${messageId}`;
+    }
+    const mono = ++Snowflake._monotonicCounter;
+    return `${userId}:${wsEventType}:${mono}`;
+  }
+
+  private static _monotonicCounter = 0;
 
   /**
    * Generate a random 15‑digit positive integer (no leading zeros).

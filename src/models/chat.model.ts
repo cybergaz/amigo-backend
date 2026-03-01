@@ -62,8 +62,9 @@ const message_status_model = pgTable("message_status", {
 );
 
 const missed_ws_messages_model = pgTable("missed_ws_messages", {
-  id: varchar({ length: 60 }).primaryKey(),
+  id: varchar({ length: 100 }).primaryKey(),
   user_id: bigint({ mode: "number" }).references(() => user_model.id, { onDelete: "cascade" }).notNull(),
+  // message_id: bigint({ mode: "bigint" }).references(() => message_model.id, { onDelete: "cascade" }),
   event_type: varchar({ enum: VITAL_WS_EVENTS_CONST }).notNull(),  // WS event type e.g. 'message:new', 'conversation:action'
   ws_message: jsonb().notNull(),  // Store the entire message payload that was missed
   created_at: timestamp({ withTimezone: true }).defaultNow().notNull(),

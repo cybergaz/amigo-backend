@@ -10,6 +10,7 @@ import { conversation_member_model, message_model } from "@/models/chat.model";
 import { and, eq, sql } from "drizzle-orm";
 import { update_conversation } from "@/services/chat.services";
 import FCMService from "@/services/fcm.service";
+import { queue_message_fcm } from "@/services/fcm-batch.service";
 import { ChatType } from "@/types/chat.types";
 import { CALL_TIMEOUT_MS, CallService } from "@/services/call.service";
 import { convertBigIntToString } from "@/utils/serialization.utils";
@@ -269,16 +270,10 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
     };
     const serialized_fcm_message = convertBigIntToString(fcm_ws_message);
 
-    await FCMService.send_notification(
-      {
-        type: "ws-message",
-        fcm_mode: "data-only",
-        // title: `${updated_message_payload?.sender_name || 'New Message'}`,
-        // body: FCMService.formatMessageBody(updated_message_payload),
-        user_ids: sent_result.offline,
-        ws_message: serialized_fcm_message
-      }
-    );
+    // Queue each offline user's message into the batch (5s window / 4 msgs / 4KB)
+    for (const user_id of sent_result.offline) {
+      await queue_message_fcm(user_id, serialized_fcm_message);
+    }
 
     return {
       success: true,

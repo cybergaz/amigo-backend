@@ -12,8 +12,9 @@ const socket_connections = new Map<number, UserConnection>(); // user_id -> User
 const polling_connections = new Map<number, PollingConnection>(); // user_id -> UserConnection (WebSocket)
 
 // configuration
-const HEARTBEAT_INTERVAL_MS = 20000;
-const MAX_MISSED_PINGS = 3;
+// Heartbeat: client pings every 12s, server checks every 15s, 2 missed = ~24-27s detection
+const HEARTBEAT_INTERVAL_MS = 15000;
+const MAX_MISSED_PINGS = 2;
 const STATS_LOGGING_INTERVAL_MS = 20000;
 
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
@@ -24,6 +25,7 @@ const web_socket_server = new Elysia({
   websocket: {
     idleTimeout: 60, // x seconds of inactivity before closing the connection
     sendPings: true,
+    perMessageDeflate: true, // RFC 7692 compression — reduces mobile fragmentation risk
   }
 })
   .onError(({ error, path }) => {
@@ -224,32 +226,42 @@ const web_socket_server = new Elysia({
       if (user_id) {
         socket_connections.delete(user_id);
 
-        // Notify all connected users about this user being offline
-        const connected_users = await get_connected_users(user_id);
-        const message_payload: ConnectionStatusPayload = {
-          sender_id: user_id,
-          status: 'disconnected',
-        };
-        // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        await broadcast_message({
-          to: "users",
-          user_ids: Array.from(connected_users),
-          message: {
-            type: "connection:status",
-            payload: message_payload,
-            ws_timestamp: new Date()
-          },
-          exclude_user_ids: [user_id]
-        });
+        // Delay offline broadcast by 10s to handle brief reconnects (e.g. WS restart)
+        // Only mark offline if the user hasn't reconnected in that window
+        setTimeout(async () => {
+          // If user has reconnected, a new entry will be in socket_connections
+          if (socket_connections.has(user_id)) {
+            console.log(`[CONNECTION-DISCONNECT] User ${user_id} reconnected within 10s, skipping offline broadcast`);
+            return;
+          }
 
-        // update the online status of user in the DB
-        await update_user_details(user_id, { online_status: false, last_seen: new Date() });
+          // Notify all connected users about this user being offline
+          const connected_users = await get_connected_users(user_id);
+          const message_payload: ConnectionStatusPayload = {
+            sender_id: user_id,
+            status: 'disconnected',
+          };
+          // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+          await broadcast_message({
+            to: "users",
+            user_ids: Array.from(connected_users),
+            message: {
+              type: "connection:status",
+              payload: message_payload,
+              ws_timestamp: new Date()
+            },
+            exclude_user_ids: [user_id]
+          });
 
-        const stats = getConnectionStats();
-        console.log(`[CONNECTION-DISCONNECT] ${JSON.stringify({
-          timestamp: new Date().toISOString(),
-          ...stats,
-        })}`);
+          // update the online status of user in the DB
+          await update_user_details(user_id, { online_status: false, last_seen: new Date() });
+
+          const stats = getConnectionStats();
+          console.log(`[CONNECTION-DISCONNECT] ${JSON.stringify({
+            timestamp: new Date().toISOString(),
+            ...stats,
+          })}`);
+        }, 10000); // 10s grace period for reconnects
       }
     }
   })

@@ -60,8 +60,8 @@ type WSMessage = {
 // Subset of WSMessage for critical events that must be processed by clients even if they miss some messages (e.g. due to reconnection)
 interface VitalWSMessage {
   type: VitalWSMessageEventsType;
-  payload:
-  NewConversationPayload
+  payload: JoinLeavePayload
+  | NewConversationPayload
   | ChatMessagePayload
   | ChatMessageAckPayload
   | DeleteMessagePayload
@@ -271,6 +271,8 @@ const WS_MESSAGE_EVENTS_CONST = [
 ] as const;
 
 const VITAL_WS_EVENTS_CONST = [
+  'conversation:join',
+  'conversation:leave',
   'conversation:new',
   'conversation:action',
   'message:pin',
@@ -280,6 +282,13 @@ const VITAL_WS_EVENTS_CONST = [
   'message:ack',
   'message:delivered',
 ] as const;
+
+// const EVENTS_WITH_MESSAGE_ID_CONST = [
+//   'message:new',
+//   'message:ack',
+//   'message:delivered',
+//   'message:pin',
+// ] as const;
 
 const ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD = ['socket:ping', 'socket:pong', 'socket:health_check'] as const;
 

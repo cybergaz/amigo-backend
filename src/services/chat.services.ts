@@ -14,9 +14,10 @@ import {
 import { create_unique_id } from "@/utils/general.utils";
 import { and, arrayContains, asc, desc, eq, gt, inArray, isNotNull, isNull, ne, not, or, sql } from "drizzle-orm";
 import { broadcast_message } from "@/sockets/socket.handlers";
-import { ConversationActionPayload, DeleteMessagePayload, MembersType, SyncMessagesPayload } from "@/types/socket.types";
+import { ConversationActionPayload, DeleteMessagePayload, MembersType, SyncMessagesPayload, WSMessage } from "@/types/socket.types";
 import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 import FCMService from "./fcm.service";
+import { queue_message_fcm } from "./fcm-batch.service";
 import { get_conversation_members } from "./cache-management/socket.cache";
 
 const build_conversation_action_message = (
@@ -478,16 +479,14 @@ const soft_delete_message = async (message_ids: string[], user_id: number, is_ad
       });
 
       const members = await get_conversation_members(conversationId);
-      await FCMService.send_notification({
-        type: "ws-message",
-        fcm_mode: "data-only",
-        user_ids: Array.from(members),
-        ws_message: {
-          type: "message:delete",
-          payload: convertBigIntToString(message_payload),
-          ws_timestamp: new Date()
-        }
-      });
+      const delete_ws_message: WSMessage = {
+        type: "message:delete",
+        payload: convertBigIntToString(message_payload),
+        ws_timestamp: new Date()
+      };
+      for (const user_id of Array.from(members)) {
+        await queue_message_fcm(user_id, delete_ws_message);
+      }
 
       // Check if any deleted message was the last_message and update if needed
       const [conversation] = await db

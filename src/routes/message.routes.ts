@@ -1,7 +1,7 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
 import { delete_message_for_me, soft_delete_message } from "@/services/chat.services";
-import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, reply_to_message, star_messages } from "@/services/message.services";
+import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, mark_messages_delivered_batch, reply_to_message, star_messages } from "@/services/message.services";
 
 export const message_routes = new Elysia({ prefix: "/message" })
   .state({ id: 0, role: "" })
@@ -18,7 +18,7 @@ export const message_routes = new Elysia({ prefix: "/message" })
   })
 
   .post("/delivered", async ({ set, store, body }) => {
-    console.log("delivered -> ", body);
+    // console.log("delivered ack through api -> ", body);
     const delivery_result = await mark_message_delivered(
       BigInt(body.message_id),
       body.conversation_id,
@@ -30,6 +30,19 @@ export const message_routes = new Elysia({ prefix: "/message" })
     body: t.Object({
       message_id: t.String(),
       conversation_id: t.Number()
+    })
+  })
+
+  .post("/delivered/batch", async ({ set, store, body }) => {
+    const delivery_result = await mark_messages_delivered_batch(body.messages, store.id);
+    set.status = delivery_result.code;
+    return delivery_result;
+  }, {
+    body: t.Object({
+      messages: t.Array(t.Object({
+        message_id: t.String(),
+        conversation_id: t.Number()
+      }))
     })
   })
 

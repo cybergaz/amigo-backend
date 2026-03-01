@@ -128,24 +128,32 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
       const user_id = store.id;
       const messages = await fetch_pending_messages(user_id, query.after_message_id);
 
+
       // Update polling connection tracking
       const client_ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
         || request.headers.get('x-real-ip')
         || 'unknown';
 
-      // Update or create polling connection
-      const existing_connection = polling_connections.get(user_id);
-      if (existing_connection) {
-        existing_connection.last_poll = new Date();
-        existing_connection.client_ip = client_ip;
-      } else {
-        polling_connections.set(user_id, {
-          connection_status: "foreground",
-          last_poll: new Date(),
-          client_ip,
-          connected_at: new Date(),
-        });
+      if (!query.for_sync) {
+        // Update or create polling connection
+        const existing_connection = polling_connections.get(user_id);
+        if (existing_connection) {
+          existing_connection.last_poll = new Date();
+          existing_connection.client_ip = client_ip;
+        } else {
+          polling_connections.set(user_id, {
+            connection_status: "foreground",
+            last_poll: new Date(),
+            client_ip,
+            connected_at: new Date(),
+          });
+        }
       }
+
+      console.log(`[POLL] Fetched pending message for user ${user_id}:`);
+      messages.map(msg => {
+        console.log(`[POLL] message id ${msg.message_id}`);
+      });
 
       return {
         success: true,
@@ -173,5 +181,6 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
   }, {
     query: t.Object({
       after_message_id: t.Optional(t.String()),
+      for_sync: t.Optional(t.Boolean()), // If true, indicates this poll is for syncing missed messages after reconnection
     })
   });

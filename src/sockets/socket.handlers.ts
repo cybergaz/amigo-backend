@@ -7,7 +7,7 @@ import db from "@/config/db";
 import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
 import { and, desc, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_connection_status, handle_conv_join_leave, handle_message_new } from "./socket.service";
-import { pin_message, unpin_message } from "@/services/message.services";
+import { pin_message, unpin_message, mark_message_delivered } from "@/services/message.services";
 import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 
 // Generate unique message ID for polling
@@ -70,6 +70,9 @@ const broadcast_message = async (data: BroadcastData) => {
 
     // Check WebSocket connections
     const ws_connection = socket_connections.get(user_id);
+    // check polling connections for users who are not connected via WebSocket
+    const poll_connection = polling_connections.get(user_id);
+
     if (ws_connection && ws_connection.ws.readyState === 1) {
       // User is online via WebSocket
       online_users_id.add(user_id);
@@ -88,12 +91,11 @@ const broadcast_message = async (data: BroadcastData) => {
         console.error(`[WS] Error sending to user ${user_id}:`, error);
       }
 
-      return;
+      // store every message as missed_ws_message and remove upon recieving delivery reciept from client
+      // return;
     }
 
-    // check polling connections for users who are not connected via WebSocket
-    const poll_connection = polling_connections.get(user_id);
-    if (poll_connection) {
+    else if (poll_connection) {
       if (poll_connection.last_poll) {
         const timeSinceLastPoll = Date.now() - poll_connection.last_poll.getTime();
         // Consider users with a poll in the last 10 seconds as online for polling transport
@@ -104,21 +106,25 @@ const broadcast_message = async (data: BroadcastData) => {
         polling_connections.delete(user_id);
       }
 
-      // Store missed messages in three-tier polling cache for offline users
-      // Only allowed event types are cached (message:new, conversation:new, etc.)
-      if (is_allowed_event(data.message.type)) {
-        await store_pending_message(
-          user_id,
-          data.message as VitalWSMessage,
-        ).catch(err => {
-          console.error("[BROADCAST] Error storing pending messages for offline users:", err);
-        });
-      }
-
-      return;
+      // don't return as we yet to store message for polling users
+      // return;
+    } else {
+      // User is offline
+      offline_users_id.add(user_id);
     }
-    // User is offline
-    offline_users_id.add(user_id);
+
+    // Store missed messages in three-tier polling cache for offline users
+    // Only allowed event types are cached (message:new, conversation:new, etc.)
+    if (is_allowed_event(data.message.type)) {
+      await store_pending_message(
+        user_id,
+        data.message as VitalWSMessage,
+      ).then(() => {
+        // console.log("stored in missed_ws_message ", data.message.type);
+      }).catch(err => {
+        console.error("[BROADCAST] Error storing pending messages for offline users:", err);
+      });
+    }
   });
 
   return {
@@ -201,6 +207,20 @@ const handle_join_conversation = async ({
       // }
     }
 
+    // Capture unread messages BEFORE marking them read, so we can push real read receipts to senders
+    const unread_messages = await db
+      .select({ message_id: message_status_model.message_id, sender_id: message_model.sender_id })
+      .from(message_status_model)
+      .innerJoin(message_model, eq(message_status_model.message_id, message_model.id))
+      .where(
+        and(
+          eq(message_status_model.conv_id, conv_id),
+          eq(message_status_model.user_id, user_id),
+          isNull(message_status_model.read_at),
+          ne(message_model.sender_id, user_id),
+        )
+      );
+
     // update message_status to set read_at for all messages in this conversation for this user
     await db
       .update(message_status_model)
@@ -213,7 +233,7 @@ const handle_join_conversation = async ({
         )
       );
 
-    // special handling for DMs: updating message table for sent status 
+    // special handling for DMs: updating message table for sent status
     await db
       .update(message_model)
       .set({ status: "read" })
@@ -225,187 +245,43 @@ const handle_join_conversation = async ({
         )
       );
 
+    // Push real read receipts to senders so they can correct optimistic pre-fills
+    // Group messages by sender and push message:ack with read_by=[user_id] to each unique sender
+    if (unread_messages.length > 0) {
+      const now = new Date();
+      // Group latest message ID per sender (client marks all earlier messages read on single ack)
+      const latest_per_sender = new Map<number, bigint>();
+      for (const row of unread_messages) {
+        latest_per_sender.set(row.sender_id, row.message_id);
+      }
+
+      for (const [sender_id, message_id] of latest_per_sender) {
+        const ack_payload: ChatMessageAckPayload = {
+          id: message_id,
+          conv_id,
+          sender_id,
+          delivered_at: now,
+          read_by: [user_id],
+          delivered_to: [],
+          offline_users: [],
+        };
+        await broadcast_message({
+          to: "users",
+          user_ids: [sender_id],
+          message: {
+            type: "message:ack",
+            payload: ack_payload,
+            ws_timestamp: now,
+          },
+        });
+      }
+    }
+
   }
   catch (error) {
     console.error("[WS] Error in handle_join_conversation:", error);
   }
 };
-
-// Helper function to convert string IDs to bigint in payloads (for incoming messages)
-// const convertStringIdsToBigInt = (payload: any, messageType: string): any => {
-//   if (!payload) return payload;
-//
-//   switch (messageType) {
-//     case 'message:new': {
-//       const chatPayload = payload as any;
-//       return {
-//         ...chatPayload,
-//         id: BigInt(String(chatPayload.id)),
-//         reply_to_message_id: chatPayload.reply_to_message_id
-//           ? BigInt(String(chatPayload.reply_to_message_id))
-//           : undefined,
-//       } as ChatMessagePayload;
-//     }
-//     case 'message:ack': {
-//       const ackPayload = payload as any;
-//       return {
-//         ...ackPayload,
-//         id: BigInt(String(ackPayload.id)),
-//         new_id: ackPayload.new_id
-//           ? BigInt(String(ackPayload.new_id))
-//           : undefined,
-//       } as ChatMessageAckPayload;
-//     }
-//     case 'message:delete': {
-//       const deletePayload = payload as any;
-//       return {
-//         ...deletePayload,
-//         message_ids: (deletePayload.message_ids as any[]).map(id => BigInt(String(id))),
-//       } as DeleteMessagePayload;
-//     }
-//     case 'message:pin': {
-//       const pinPayload = payload as any;
-//       return {
-//         ...pinPayload,
-//         message_id: BigInt(String(pinPayload.message_id)),
-//       } as MessagePinPayload;
-//     }
-//     case 'message:forward': {
-//       const forwardPayload = payload as any;
-//       return {
-//         ...forwardPayload,
-//         forwarded_message_ids: (forwardPayload.forwarded_message_ids as any[]).map(id => BigInt(String(id))),
-//       } as MessageForwardPayload;
-//     }
-//     case 'message:delivered': {
-//       const deliveredPayload = payload as any;
-//       return {
-//         ...deliveredPayload,
-//         message_id: BigInt(String(deliveredPayload.message_id)),
-//       } as MessageDeliveredPayload;
-//     }
-//     default:
-//       return payload;
-//   }
-// };
-
-// Helper function to convert bigint IDs to strings in payloads (for outgoing messages)
-// This creates a serializable version of the message for JSON.stringify
-// const convertBigIntIdsToString = (message: WSMessage): any => {
-//   if (!message.payload) return message;
-//
-//   const payload = message.payload as any;
-//
-//   switch (message.type) {
-//     case 'message:new': {
-//       const chatPayload = payload as ChatMessagePayload;
-//       return {
-//         ...message,
-//         payload: {
-//           ...chatPayload,
-//           id: typeof chatPayload.id === 'bigint' ? chatPayload.id.toString() : String(chatPayload.id),
-//           reply_to_message_id: chatPayload.reply_to_message_id
-//             ? (typeof chatPayload.reply_to_message_id === 'bigint'
-//               ? chatPayload.reply_to_message_id.toString()
-//               : String(chatPayload.reply_to_message_id))
-//             : undefined,
-//         },
-//       };
-//     }
-//     case 'message:ack': {
-//       const ackPayload = payload as ChatMessageAckPayload;
-//       return {
-//         ...message,
-//         payload: {
-//           ...ackPayload,
-//           id: typeof ackPayload.id === 'bigint' ? ackPayload.id.toString() : String(ackPayload.id),
-//           new_id: ackPayload.new_id
-//             ? (typeof ackPayload.new_id === 'bigint'
-//               ? ackPayload.new_id.toString()
-//               : String(ackPayload.new_id))
-//             : undefined,
-//         },
-//       };
-//     }
-//     case 'message:delete': {
-//       const deletePayload = payload as DeleteMessagePayload;
-//       return {
-//         ...message,
-//         payload: {
-//           ...deletePayload,
-//           message_ids: deletePayload.message_ids.map((id: bigint | string) =>
-//             typeof id === 'bigint' ? id.toString() : String(id)
-//           ),
-//         },
-//       };
-//     }
-//     case 'message:pin': {
-//       const pinPayload = payload as MessagePinPayload;
-//       return {
-//         ...message,
-//         payload: {
-//           ...pinPayload,
-//           message_id: typeof pinPayload.message_id === 'bigint'
-//             ? pinPayload.message_id.toString()
-//             : String(pinPayload.message_id),
-//         },
-//       };
-//     }
-//     case 'message:forward': {
-//       const forwardPayload = payload as MessageForwardPayload;
-//       return {
-//         ...message,
-//         payload: {
-//           ...forwardPayload,
-//           forwarded_message_ids: forwardPayload.forwarded_message_ids.map((id: bigint | string) =>
-//             typeof id === 'bigint' ? id.toString() : String(id)
-//           ),
-//         },
-//       };
-//     }
-//     case 'message:delivered': {
-//       const deliveredPayload = payload as MessageDeliveredPayload;
-//       return {
-//         ...message,
-//         payload: {
-//           ...deliveredPayload,
-//           message_id: typeof deliveredPayload.message_id === 'bigint'
-//             ? deliveredPayload.message_id.toString()
-//             : String(deliveredPayload.message_id),
-//         },
-//       };
-//     }
-//     default:
-//       return message;
-//   }
-// };
-//
-// // Helper function to convert a JSON string WSMessage back to WSMessage with BigInt IDs
-// // Useful when reading messages from database (JSONB) or Redis (JSON string)
-// const convertStringIdsToBigIntForWSMessage = (ws_message: string): WSMessage => {
-//   try {
-//     const parsed = JSON.parse(ws_message) as any;
-//
-//     // Convert ws_timestamp string back to Date if present
-//     const ws_timestamp = parsed.ws_timestamp
-//       ? (typeof parsed.ws_timestamp === 'string' ? new Date(parsed.ws_timestamp) : parsed.ws_timestamp)
-//       : undefined;
-//
-//     // Convert string IDs in payload back to BigInt
-//     const payload = parsed.payload
-//       ? convertStringIdsToBigInt(parsed.payload, parsed.type)
-//       : undefined;
-//
-//     return {
-//       type: parsed.type,
-//       payload,
-//       ws_timestamp,
-//     } as WSMessage;
-//   } catch (error) {
-//     console.error('[WS] Error parsing WSMessage from string:', error);
-//     throw new Error(`Failed to parse WSMessage: ${error}`);
-//   }
-// };
 
 const socket_message_handler = async (user_details: {
   user_id?: number,
@@ -608,61 +484,24 @@ const socket_message_handler = async (user_details: {
       //   }
 
 
-      // // ----------------------------------------------------
-      // case 'message:delivered':
-      //   // --------------------------------------------------
-      //   // Delivery receipt from recipient (typically from FCM message when app was killed)
-      //   if (message.payload) {
-      //     const payload = message.payload as MessageDeliveredPayload;
-      //
-      //     console.log(`[WS] Received delivery receipt for message ${payload.message_id} from user ${payload.recipient_id}`);
-      //
-      //     // Update message status in the database
-      //     await update_message_status({
-      //       message_id: payload.message_id,
-      //       user_id: payload.recipient_id,
-      //       delivered_at: new Date(payload.delivered_at),
-      //     });
-      //
-      //     // Update the message status in the messages table (for DMs)
-      //     await db.update(message_model).set({
-      //       status: "delivered"
-      //     }).where(
-      //       and(
-      //         eq(message_model.id, payload.message_id),
-      //         eq(message_model.conversation_id, payload.conv_id),
-      //         eq(message_model.status, "sent") // Only update if still "sent"
-      //       )
-      //     );
-      //
-      //     // Broadcast acknowledgment to the original sender so they can update UI
-      //     const ack_payload: ChatMessageAckPayload = {
-      //       id: payload.message_id,
-      //       conv_id: payload.conv_id,
-      //       sender_id: payload.sender_id,
-      //       delivered_at: new Date(payload.delivered_at),
-      //       delivered_to: [payload.recipient_id],
-      //       read_by: [],
-      //       offline_users: [],
-      //     };
-      //
-      //     // Send ack to the original message sender
-      //     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-      //     await broadcast_message({
-      //       to: "users",
-      //       user_ids: [payload.sender_id],
-      //       message: {
-      //         type: "message:ack",
-      //         payload: ack_payload,
-      //         ws_timestamp: new Date()
-      //       },
-      //     });
-      //
-      //     console.log(`[WS] Delivery receipt processed: message ${payload.message_id} delivered to user ${payload.recipient_id}`);
-      //   } else {
-      //     console.error('[WS] message:delivered payload missing');
-      //   }
-      //   break;
+      // ----------------------------------------------------
+      case 'message:delivered':
+        // --------------------------------------------------
+        {
+          // Real delivery receipt from recipient's device
+          // This reconciles the optimistic pre-fill ACK with ground truth
+          if (message.payload) {
+            const payload = message.payload as MessageDeliveredPayload;
+            await mark_message_delivered(
+              payload.message_id,
+              payload.conv_id,
+              payload.recipient_id,
+            );
+          } else {
+            console.error('[WS] message:delivered payload missing');
+          }
+          break;
+        }
 
 
       // ----------------------------------------------------

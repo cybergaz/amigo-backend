@@ -28,7 +28,8 @@ interface FCMPayload {
   user_ids: number[];
   title?: string;
   body?: string;
-  ws_message?: WSMessage;
+  ws_message?: WSMessage;   // single — used for calls
+  ws_messages?: WSMessage[]; // batched — used for chat messages
   data?: Record<string, any>;
 }
 
@@ -88,6 +89,9 @@ export class FCMService {
                 ...payload.data,
                 ...(payload.ws_message
                   ? { ws_message: JSON.stringify(payload.ws_message) }
+                  : {}),
+                ...(payload.ws_messages
+                  ? { ws_messages: JSON.stringify(payload.ws_messages) }
                   : {}),
               },
               android: {

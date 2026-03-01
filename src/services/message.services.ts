@@ -27,6 +27,7 @@ import { ChatMessageAckPayload, ChatMessagePayload, MessagePinPayload, SyncMessa
 import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 import Snowflake from "@/utils/snowflake.utils";
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { log_current_cache_state, remove_pending_message } from "./cache-management/polling.cache";
 
 // Helper function to verify user membership in conversation
 const verify_user_membership = async (conversation_id: number, user_id: number) => {
@@ -1108,15 +1109,18 @@ const mark_message_delivered = async (
     });
 
     // Update message status in messages table (for DMs)
-    await db.update(message_model).set({
-      status: "delivered"
-    }).where(
-      and(
-        eq(message_model.id, message_id),
-        eq(message_model.conversation_id, conversation_id),
-        eq(message_model.status, "sent") // Only update if still "sent"
-      )
-    );
+    await db
+      .update(message_model)
+      .set({
+        status: "delivered"
+      })
+      .where(
+        and(
+          eq(message_model.id, message_id),
+          eq(message_model.conversation_id, conversation_id),
+          eq(message_model.status, "sent") // Only update if still "sent"
+        )
+      );
 
     const ack_payload: ChatMessageAckPayload = {
       id: message_id,
@@ -1138,6 +1142,16 @@ const mark_message_delivered = async (
         ws_timestamp: new Date()
       },
     });
+
+    // ------------------------------------------------------------------
+    // WARNING: TEMP LOGIC
+    // ------------------------------------------------------------------
+    // remove the message:new from missed_msgs for the recipients
+    const missed_msg_key = Snowflake.correlationId(recipient_id, "message:new", message_id);
+    console.log(`[API] Removing pending message key ${missed_msg_key} for recipient ${recipient_id}`);
+    await remove_pending_message(recipient_id, missed_msg_key);
+    console.log(`[API] Removed pending message key ${missed_msg_key} for recipient ${recipient_id}`);
+    log_current_cache_state(recipient_id);
 
     console.log(`[API] Delivery receipt processed: message ${message_id} delivered to user ${recipient_id}`);
 
@@ -1163,6 +1177,29 @@ const mark_message_delivered = async (
   }
 };
 
+const mark_messages_delivered_batch = async (
+  messages: Array<{ message_id: string; conversation_id: number; }>,
+  recipient_id: number
+) => {
+  const results = await Promise.allSettled(
+    messages.map(({ message_id, conversation_id }) =>
+      mark_message_delivered(BigInt(message_id), conversation_id, recipient_id)
+    )
+  );
+
+  const succeeded = results.filter(r => r.status === 'fulfilled' && (r as PromiseFulfilledResult<any>).value?.success).length;
+  const failed = results.length - succeeded;
+
+  console.log(`[API] Batch delivery: ${succeeded} succeeded, ${failed} failed for user ${recipient_id}`);
+
+  return {
+    success: succeeded > 0,
+    code: 200,
+    message: `Batch delivery processed: ${succeeded}/${results.length} succeeded`,
+    data: { succeeded, failed },
+  };
+};
+
 export {
   store_message,
   store_message_with_retry,
@@ -1179,4 +1216,5 @@ export {
   batch_insert_message_status,
   batch_update_message_status,
   mark_message_delivered,
+  mark_messages_delivered_batch,
 };
