@@ -2,7 +2,7 @@ import { WSMessage } from '@/types/socket.types';
 import FCMService from './fcm.service';
 
 const MAX_MESSAGES = 4;
-const WINDOW_MS = 5000;
+const WINDOW_MS = 4000;
 // Reserve ~300 bytes for FCM envelope overhead (token, type, android config, etc.)
 const MAX_WS_MESSAGES_BYTES = 3700;
 

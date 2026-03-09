@@ -1061,16 +1061,21 @@ const batch_update_message_status = async (
 };
 
 // Mark a message as delivered via API (typically from FCM when app was killed)
-// This updates the database and broadcasts a WebSocket message to the sender
-// 
+// This updates the database and broadcasts a WebSocket message to the sender.
+// When is_active_in_conv is true (recipient is currently viewing the conversation)
+// the message is also marked as read in the message_status table and the ack
+// includes read_by so the sender's read-receipt widget updates in real time.
+//
 // @param message_id The ID of the message that was delivered
 // @param conversation_id The conversation ID
 // @param recipient_id The user ID who received the message
+// @param is_active_in_conv Whether the recipient is currently active in the conv
 // @returns Success/failure response
 const mark_message_delivered = async (
   message_id: bigint,
   conversation_id: number,
-  recipient_id: number
+  recipient_id: number,
+  is_active_in_conv: boolean = false,
 ) => {
   try {
     // Get message details to find sender
@@ -1100,15 +1105,19 @@ const mark_message_delivered = async (
     }
 
     const sender_id = message.sender_id;
+    const now = new Date();
 
-    // Update message status in message_status table
+    // Update message_status table — always set delivered_at; also set read_at
+    // when the recipient is actively viewing the conversation.
     await update_message_status({
       message_id: message_id,
       user_id: recipient_id,
-      delivered_at: new Date(),
+      delivered_at: now,
+      ...(is_active_in_conv && { read_at: now }),
     });
 
-    // Update message status in messages table (for DMs)
+    // Update message status in messages table (for DMs only — group aggregate
+    // status lives per-member in message_status, not in the messages row).
     await db
       .update(message_model)
       .set({
@@ -1126,9 +1135,9 @@ const mark_message_delivered = async (
       id: message_id,
       conv_id: conversation_id,
       sender_id: sender_id,
-      delivered_at: new Date(),
-      delivered_to: [recipient_id],
-      read_by: [],
+      delivered_at: now,
+      delivered_to: is_active_in_conv ? [] : [recipient_id],
+      read_by: is_active_in_conv ? [recipient_id] : [],
       offline_users: [],
     };
 

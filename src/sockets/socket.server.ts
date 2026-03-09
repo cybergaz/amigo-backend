@@ -16,6 +16,7 @@ const polling_connections = new Map<number, PollingConnection>(); // user_id -> 
 const HEARTBEAT_INTERVAL_MS = 15000;
 const MAX_MISSED_PINGS = 2;
 const STATS_LOGGING_INTERVAL_MS = 20000;
+const OFFLINE_STATUS_BROADCAST_DELAY_MS = 5000;
 
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let statsInterval: ReturnType<typeof setInterval> | null = null;
@@ -226,7 +227,7 @@ const web_socket_server = new Elysia({
       if (user_id) {
         socket_connections.delete(user_id);
 
-        // Delay offline broadcast by 10s to handle brief reconnects (e.g. WS restart)
+        // Delay offline broadcast by x to handle brief reconnects (e.g. WS restart)
         // Only mark offline if the user hasn't reconnected in that window
         setTimeout(async () => {
           // If user has reconnected, a new entry will be in socket_connections
@@ -261,7 +262,7 @@ const web_socket_server = new Elysia({
             timestamp: new Date().toISOString(),
             ...stats,
           })}`);
-        }, 10000); // 10s grace period for reconnects
+        }, OFFLINE_STATUS_BROADCAST_DELAY_MS);
       }
     }
   })

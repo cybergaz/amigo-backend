@@ -6,7 +6,7 @@ import { store_pending_message_for_users, is_allowed_event, store_pending_messag
 import db from "@/config/db";
 import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
 import { and, desc, eq, isNull, ne, or, sql } from "drizzle-orm";
-import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_connection_status, handle_conv_join_leave, handle_message_new } from "./socket.service";
+import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_connection_status, handle_conv_join_leave, handle_message_forward, handle_message_new } from "./socket.service";
 import { pin_message, unpin_message, mark_message_delivered } from "@/services/message.services";
 import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 
@@ -459,29 +459,29 @@ const socket_message_handler = async (user_details: {
         }
 
 
-      // // ----------------------------------------------------
-      // case 'message:forward':
-      //   // --------------------------------------------------
-      //   {
-      //     const result = await handle_message_forward(message.payload as MessageForwardPayload, user_name)
-      //     if (!result.success) {
-      //       // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-      //       await broadcast_message({
-      //         to: "users",
-      //         user_ids: [Number(user_id)],
-      //         message: {
-      //           type: "socket:error",
-      //           payload: {
-      //             code: result.code || 500,
-      //             message: result.message || "Error handling new message",
-      //             error: result.error
-      //           },
-      //           ws_timestamp: new Date()
-      //         }
-      //       })
-      //     }
-      //     break;
-      //   }
+      // ----------------------------------------------------
+      case 'message:forward':
+        // --------------------------------------------------
+        {
+          const result = await handle_message_forward(message.payload as MessageForwardPayload, user_name);
+          if (!result.success) {
+            // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            await broadcast_message({
+              to: "users",
+              user_ids: [Number(user_id)],
+              message: {
+                type: "socket:error",
+                payload: {
+                  code: result.code || 500,
+                  message: result.message || "Error handling new message",
+                  error: result.error
+                },
+                ws_timestamp: new Date()
+              }
+            });
+          }
+          break;
+        }
 
 
       // ----------------------------------------------------
@@ -492,10 +492,15 @@ const socket_message_handler = async (user_details: {
           // This reconciles the optimistic pre-fill ACK with ground truth
           if (message.payload) {
             const payload = message.payload as MessageDeliveredPayload;
+            // If the recipient is currently active in this conversation their
+            // delivery receipt also implies they are reading — mark as read.
+            const recipient_conn = socket_connections.get(payload.recipient_id);
+            const is_active_in_conv = recipient_conn?.active_conv_id === payload.conv_id;
             await mark_message_delivered(
               payload.message_id,
               payload.conv_id,
               payload.recipient_id,
+              is_active_in_conv,
             );
           } else {
             console.error('[WS] message:delivered payload missing');

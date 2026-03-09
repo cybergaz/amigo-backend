@@ -145,6 +145,7 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
 
     const updated_message_payload: ChatMessagePayload = {
       ...payload,
+      id: store_msg_result.new_id ? store_msg_result.new_id : payload.id,  // update message ID if it was changed during retry
       sender_name: payload.sender_name || String(user_name) || undefined,
     };
 
@@ -165,6 +166,9 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
     // const is_sender_in_conv = socket_connections.get(payload.sender_id)?.active_conv_id === payload.conv_id;
     const sent_res_ack: ChatMessageAckPayload = {
       ...ack_message_payload,
+      ...(store_msg_result.new_id !== undefined && {
+        new_id: store_msg_result.new_id,
+      }),  // update message ID if it was changed during retry
       delivered_to: sent_result.online,
       read_by: sent_result.active_in_conv,
       offline_users: sent_result.offline,
@@ -336,7 +340,7 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
               payload: new_chat_msg_payload,
               ws_timestamp: new Date()
             },
-            exclude_user_ids: [payload.forwarder_id],
+            // exclude_user_ids: [payload.forwarder_id],
           });
 
           // Prepare message status records for all members except sender
