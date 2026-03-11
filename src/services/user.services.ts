@@ -22,7 +22,7 @@ type CreateUserParams = {
   phone: string;
 };
 
-export const create_user = async ({
+const create_user = async ({
   name,
   password,
   role,
@@ -87,7 +87,7 @@ export const create_user = async ({
   }
 };
 
-export const find_user_by_id = async (id: number) => {
+const find_user_by_id = async (id: number) => {
   try {
     const existing_user = (
       await db.select().from(user_model).where(eq(user_model.id, id)).limit(1)
@@ -106,7 +106,7 @@ export const find_user_by_id = async (id: number) => {
   }
 };
 
-export const find_user_by_phone = async (phone: string) => {
+const find_user_by_phone = async (phone: string) => {
   try {
     const existing_user = (
       await db
@@ -130,7 +130,7 @@ export const find_user_by_phone = async (phone: string) => {
   }
 };
 
-export const get_user_details = async (id: number) => {
+const get_user_details = async (id: number) => {
   try {
     if (!id) {
       return {
@@ -176,7 +176,7 @@ export const get_user_details = async (id: number) => {
   }
 };
 
-export const update_user_details = async (id: number, body: UpdateUserType) => {
+const update_user_details = async (id: number, body: UpdateUserType) => {
   try {
     // If fcm_token is being updated, update the cache first
     if (body.fcm_token !== undefined) {
@@ -214,7 +214,7 @@ export const update_user_details = async (id: number, body: UpdateUserType) => {
   }
 };
 
-export const batch_update_users_details = async (ids: number[], body: UpdateUserType) => {
+const batch_update_users_details = async (ids: number[], body: UpdateUserType) => {
   try {
     const users_details = await db
       .update(user_model)
@@ -247,7 +247,7 @@ export const batch_update_users_details = async (ids: number[], body: UpdateUser
   }
 };
 
-export const get_all_users = async () => {
+const get_all_users = async () => {
   try {
     const users = await db
       .select({
@@ -274,7 +274,7 @@ export const get_all_users = async () => {
   }
 };
 
-export const get_available_users = async (self_id: number, phone_numbers: string[]) => {
+const get_available_users = async (self_id: number, phone_numbers: string[]) => {
   // console.log("phone_numbers ->", phone_numbers)
 
   const [self] = await db
@@ -349,7 +349,7 @@ export const get_available_users = async (self_id: number, phone_numbers: string
   }
 };
 
-export const get_all_users_paginated = async (page: number = 1, limit: number = 10, search: string = '', role: string) => {
+const get_all_users_paginated = async (page: number = 1, limit: number = 10, search: string = '', role: string) => {
   try {
     const offset = (page - 1) * limit;
 
@@ -423,7 +423,7 @@ export const get_all_users_paginated = async (page: number = 1, limit: number = 
   }
 };
 
-export const update_user_role = async (id: number, role: RoleType) => {
+const update_user_role = async (id: number, role: RoleType) => {
   try {
     await db
       .update(user_model)
@@ -446,7 +446,7 @@ export const update_user_role = async (id: number, role: RoleType) => {
   }
 };
 
-export const update_user_connection_status = async (id: number, status: ConnectionStatusType) => {
+const update_user_connection_status = async (id: number, status: ConnectionStatusType) => {
   try {
     await db
       .update(user_model)
@@ -469,7 +469,7 @@ export const update_user_connection_status = async (id: number, status: Connecti
   }
 };
 
-export const update_user_call_access = async (id: number, call_access: boolean) => {
+const update_user_call_access = async (id: number, call_access: boolean) => {
   try {
     await db
       .update(user_model)
@@ -492,7 +492,7 @@ export const update_user_call_access = async (id: number, call_access: boolean) 
   }
 };
 
-export const update_profile_image = async (id: number, file: File) => {
+const update_profile_image = async (id: number, file: File) => {
   try {
     if (!id) {
       return {
@@ -576,7 +576,7 @@ export const update_profile_image = async (id: number, file: File) => {
   }
 };
 
-export const get_dashboard_stats = async () => {
+const get_dashboard_stats = async () => {
   try {
     // Get total users count
     const totalUsersResult = await db
@@ -623,7 +623,7 @@ export const get_dashboard_stats = async () => {
   }
 };
 
-export const get_all_admins = async () => {
+const get_all_admins = async () => {
   try {
     const admins = await db
       .select({
@@ -654,7 +654,7 @@ export const get_all_admins = async () => {
   }
 };
 
-export const create_admin_user = async (email: string, password: string, permissions: string[]) => {
+const create_admin_user = async (email: string, password: string, permissions: string[]) => {
   try {
     // Check if email already exists
     const existingUser = await db
@@ -721,7 +721,7 @@ export const create_admin_user = async (email: string, password: string, permiss
   }
 };
 
-export const update_admin_permissions = async (id: number, permissions: string[]) => {
+const update_admin_permissions = async (id: number, permissions: string[]) => {
   try {
     // Check if user exists and is an admin
     const user = await db
@@ -778,7 +778,7 @@ export const update_admin_permissions = async (id: number, permissions: string[]
   }
 };
 
-export const update_admin_status = async (id: number, active: boolean) => {
+const update_admin_status = async (id: number, active: boolean) => {
   try {
     // Check if user exists and is an admin
     const user = await db
@@ -835,7 +835,7 @@ export const update_admin_status = async (id: number, active: boolean) => {
   }
 };
 
-export const get_user_permissions = async (id: number) => {
+const get_user_permissions = async (id: number) => {
   try {
     const user = await db
       .select({
@@ -902,7 +902,7 @@ export const get_user_permissions = async (id: number) => {
   }
 };
 
-export const delete_user_permanently = async (user_id: number) => {
+const delete_user_permanently = async (user_id: number) => {
   try {
     // Check if user exists
     const existingUser = await db
@@ -996,4 +996,106 @@ export const delete_user_permanently = async (user_id: number) => {
       data: null,
     };
   }
+};
+
+const admin_update_user_phone_number = async (user_id: number, new_phone: string) => {
+  // const parsed_new_phone = parse_phone(new_phone)
+  try {
+    const [existingUser] = await db
+      .select()
+      .from(user_model)
+      .where(eq(user_model.id, user_id))
+      .limit(1);
+
+    if (!existingUser || existingUser.phone === null) {
+      return {
+        success: false,
+        code: 404,
+        message: "Either user or phone number for user not found",
+        data: null,
+      };
+    }
+
+
+    // Check if new phone number already exists for another user
+    const phoneExists = await db
+      .select()
+      .from(user_model)
+      .where(
+        and(
+          eq(user_model.phone, new_phone.replace(" ", "")),
+          ne(user_model.id, user_id),
+        ),
+      )
+      .limit(1);
+
+    if (phoneExists.length > 0) {
+      return {
+        success: false,
+        code: 409,
+        message: "Phone number already in use by another user",
+        data: null,
+      };
+    }
+
+    // Update user's phone number
+    const updatedUser = await db
+      .update(user_model)
+      .set({ phone: new_phone.replace(" ", "") })
+      .where(eq(user_model.id, user_id))
+      .returning({
+        id: user_model.id,
+        name: user_model.name,
+        phone: user_model.phone,
+        email: user_model.email,
+        role: user_model.role,
+        profile_pic: user_model.profile_pic,
+        created_at: user_model.created_at,
+        last_seen: user_model.last_seen,
+        call_access: user_model.call_access,
+        online_status: user_model.online_status,
+        location: user_model.location,
+        ip_address: user_model.ip_address,
+      });
+
+    return {
+      success: true,
+      code: 200,
+      message: "User phone number updated successfully",
+      data: updatedUser[0],
+    };
+  }
+  catch (error) {
+    console.error("Error changing user phone number:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "Failed to change user phone number",
+      data: null,
+    };
+  }
+};
+
+export {
+  create_user,
+  find_user_by_id,
+  find_user_by_phone,
+  get_user_details,
+  update_user_details,
+  batch_update_users_details,
+  get_all_users,
+  get_available_users,
+  get_all_users_paginated,
+  update_user_role,
+  update_user_connection_status,
+  update_user_call_access,
+  update_profile_image,
+  get_dashboard_stats,
+  get_all_admins,
+  create_admin_user,
+  update_admin_permissions,
+  update_admin_status,
+  get_user_permissions,
+  delete_user_permanently,
+  admin_update_user_phone_number,
 };

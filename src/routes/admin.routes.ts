@@ -1,6 +1,6 @@
 import { app_middleware } from "@/middleware";
 import Elysia, { t } from "elysia";
-import { get_all_users_paginated, update_user_role, update_user_call_access, get_dashboard_stats, create_admin_user, get_all_admins, update_admin_permissions, update_admin_status, get_user_permissions, delete_user_permanently } from "@/services/user.services";
+import { get_all_users_paginated, update_user_role, update_user_call_access, get_dashboard_stats, create_admin_user, get_all_admins, update_admin_permissions, update_admin_status, get_user_permissions, delete_user_permanently, update_user_details, admin_update_user_phone_number } from "@/services/user.services";
 import { get_communities, get_community_groups } from "@/services/community.services";
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
@@ -26,7 +26,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
         role: "admin" as RoleType,
         hashed_password: "$2b$10$F0.mx/.RuN.J3NDSxzvUBOyiFYdiktAPuMCJWUs.08uOmOmNGdXpG",
         refresh_token: "temp_token_to_be_changed",
-      })
+      });
 
     if (!newAdmin) {
       set.status = 500;
@@ -51,7 +51,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       const state_result = app_middleware({ cookie, headers, allowed: ["admin", "sub_admin"] });
 
       set.status = state_result.code;
-      if (!state_result.data) return state_result
+      if (!state_result.data) return state_result;
 
       store.id = state_result.data.id;
       store.role = state_result.data.role;
@@ -103,7 +103,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       const { email, password, permissions } = body as {
         email: string;
         password: string;
-        permissions: string[]
+        permissions: string[];
       };
 
       if (!email || !password || !permissions || !Array.isArray(permissions)) {
@@ -150,7 +150,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
         };
       }
 
-      const { id, permissions } = body as { id: number; permissions: string[] };
+      const { id, permissions } = body as { id: number; permissions: string[]; };
 
       if (!id || !permissions || !Array.isArray(permissions)) {
         set.status = 400;
@@ -195,7 +195,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
         };
       }
 
-      const { id, active } = body as { id: number; active: boolean };
+      const { id, active } = body as { id: number; active: boolean; };
 
       if (!id || typeof active !== 'boolean') {
         set.status = 400;
@@ -296,7 +296,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
 
   .put("/update-user-role", async ({ body, set, store }) => {
     try {
-      const { id, role } = body as { id: number; role: string };
+      const { id, role } = body as { id: number; role: string; };
 
       if (!id || !role) {
         set.status = 400;
@@ -325,7 +325,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
 
   .put("/update-user-call-access", async ({ body, set, store }) => {
     try {
-      const { id, call_access } = body as { id: number; call_access: boolean };
+      const { id, call_access } = body as { id: number; call_access: boolean; };
 
       if (!id || typeof call_access !== 'boolean') {
         set.status = 400;
@@ -808,6 +808,18 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       rejected_reason: t.Optional(t.String()),
     })
   })
+
+  .post("/user/update-phone-number", async ({ set, body }) => {
+    const change_phone_result = await admin_update_user_phone_number(body.user_id, body.phone);
+    set.status = change_phone_result.code;
+    return change_phone_result;
+
+  }, {
+    body: t.Object({
+      phone: t.String(),
+      user_id: t.Number(),
+    })
+  });
 
 
 export default admin_routes;
