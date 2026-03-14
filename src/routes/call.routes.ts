@@ -31,6 +31,58 @@ const call_routes = new Elysia({ prefix: "/call" })
     };
   })
 
+  .post("/accept/:call_id", async ({ set, params }) => {
+    try {
+      const callId = Number(params.call_id);
+      const [call_info] = await db.select().from(call_model).where(eq(call_model.id, callId)).limit(1);
+
+      if (!call_info) {
+        set.status = 404;
+        return { success: false, message: "Call not found" };
+      }
+
+      const result = await CallService.accept_call(callId, call_info.callee_id);
+
+      if (result.success) {
+        const accept_payload = {
+          call_id: callId,
+          caller_id: call_info.caller_id,
+          callee_id: call_info.callee_id,
+          timestamp: new Date(),
+          data: { success: true },
+        };
+
+        broadcast_message({
+          to: "users",
+          user_ids: [call_info.caller_id],
+          message: { type: "call:accept", payload: accept_payload },
+        });
+
+        if (is_user_online(call_info.callee_id)) {
+          await broadcast_message({
+            to: "users",
+            user_ids: [call_info.callee_id],
+            message: { type: "call:accept", payload: accept_payload },
+          });
+        }
+
+        await FCMService.send_notification({
+          type: "call",
+          fcm_mode: "data-only",
+          user_ids: [call_info.caller_id, call_info.callee_id],
+          ws_message: { type: "call:accept", payload: accept_payload },
+        });
+      }
+
+      set.status = 200;
+      return { success: true, message: "Call accepted successfully" };
+    } catch (error) {
+      console.error('[CALL ROUTES] Error accepting call:', error);
+      set.status = 500;
+      return { success: false, message: "Internal server error" };
+    }
+  })
+
   .post("/decline/:call_id", async ({ set, params }) => {
     try {
       const callId = Number(params.call_id);

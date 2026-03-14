@@ -4,9 +4,6 @@ import { user_model } from '@/models/user.model';
 import { CallSignalingMessage, CallInitPayload, CallEndPayload, CallStatusType, CallEndReasonsType } from '@/types/call.types';
 import { ResultType } from '@/types/core.types';
 import { eq, and, desc, or, sql } from 'drizzle-orm';
-import { alias } from 'drizzle-orm/pg-core';
-import { random } from 'nanoid';
-
 
 // Active calls management
 interface ActiveCall {
@@ -116,6 +113,9 @@ export class CallService {
 
   // Accept a call
   static async accept_call(call_id: number, user_id: number): Promise<ResultType> {
+    console.log("--------------------------------------------------------------------");
+    console.log("accept_call ->", { call_id, user_id });
+    console.log("--------------------------------------------------------------------");
     try {
       const active_call = active_calls.get(call_id);
       if (!active_call) {
@@ -276,6 +276,13 @@ export class CallService {
         })
         .where(eq(call_model.id, call_id));
 
+      // Notify callee of missed call (via WS if online, always via FCM)
+      if (_missedCallNotifier) {
+        await _missedCallNotifier(active_call.callee_id, call_id, active_call.caller_id).catch(err => {
+          console.error('[CALL] Error sending missed-call notification:', err);
+        });
+      }
+
       // Remove from active calls
       this.cleanup_call(call_id);
 
@@ -305,6 +312,60 @@ export class CallService {
   static get_user_active_call(user_id: number): ActiveCall | null {
     const call_id = user_calls.get(user_id);
     return call_id ? active_calls.get(call_id) || null : null;
+  }
+
+  // Get call info by call ID, try from active calls first, then database
+  static async get_call_info(call_id: number): Promise<ResultType<ActiveCall>> {
+    try {
+      // Check active calls first
+      const active_call = active_calls.get(call_id);
+      if (active_call) {
+        return {
+          success: true,
+          code: 200,
+          message: 'Active call info retrieved successfully',
+          data: active_call
+        };
+      }
+
+      // If not active, check database for call history
+      const [call_info] = await db
+        .select(
+          {
+            id: call_model.id,
+            caller_id: call_model.caller_id,
+            callee_id: call_model.callee_id,
+            status: call_model.status,
+            started_at: call_model.started_at,
+            answered_at: call_model.answered_at,
+          }
+        )
+        .from(call_model)
+        .where(eq(call_model.id, call_id))
+        .limit(1);
+
+      if (!call_info) {
+        return {
+          success: false,
+          code: 404,
+          message: 'Call not found',
+        };
+      }
+
+      return {
+        success: true,
+        code: 200,
+        message: 'Call info retrieved successfully',
+        data: call_info as ActiveCall
+      };
+    } catch (error) {
+      console.error('[CALL] Error getting call info:', error);
+      return {
+        success: false,
+        code: 500,
+        message: 'Failed to get call info',
+      };
+    }
   }
 
   // Get call history for user
@@ -385,3 +446,13 @@ export class CallService {
 
 // Export active calls for WebSocket handlers
 export { active_calls, user_calls };
+
+// Missed-call notification callback (registered by socket.service to avoid circular imports)
+type MissedCallNotifier = (callee_id: number, call_id: number, caller_id: number) => Promise<void>;
+let _missedCallNotifier: MissedCallNotifier | undefined;
+
+export function register_missed_call_notifier(fn: MissedCallNotifier) {
+  _missedCallNotifier = fn;
+}
+
+export { _missedCallNotifier };

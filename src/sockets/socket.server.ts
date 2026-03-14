@@ -15,8 +15,8 @@ const polling_connections = new Map<number, PollingConnection>(); // user_id -> 
 // Heartbeat: client pings every 12s, server checks every 15s, 2 missed = ~24-27s detection
 const HEARTBEAT_INTERVAL_MS = 15000;
 const MAX_MISSED_PINGS = 2;
-const STATS_LOGGING_INTERVAL_MS = 20000;
-const OFFLINE_STATUS_BROADCAST_DELAY_MS = 5000;
+const STATS_LOGGING_INTERVAL_MS = 60000;
+const OFFLINE_STATUS_BROADCAST_DELAY_MS = 8000;
 
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let statsInterval: ReturnType<typeof setInterval> | null = null;
@@ -184,7 +184,7 @@ const web_socket_server = new Elysia({
           },
         });
 
-        logConnectionSuccess('ws', user_id, client_ip, { user_name: user_res.data?.name });
+        // logConnectionSuccess('ws', user_id, client_ip, { user_name: user_res.data?.name });
 
         // =============================================================================
         // Message Sync on Reconnection
@@ -232,7 +232,7 @@ const web_socket_server = new Elysia({
         setTimeout(async () => {
           // If user has reconnected, a new entry will be in socket_connections
           if (socket_connections.has(user_id)) {
-            console.log(`[CONNECTION-DISCONNECT] User ${user_id} reconnected within 10s, skipping offline broadcast`);
+            console.log(`[CONNECTION-DISCONNECT] User ${user_id} reconnected within ${OFFLINE_STATUS_BROADCAST_DELAY_MS}, skipping offline broadcast`);
             return;
           }
 
@@ -257,11 +257,11 @@ const web_socket_server = new Elysia({
           // update the online status of user in the DB
           await update_user_details(user_id, { online_status: false, last_seen: new Date() });
 
-          const stats = getConnectionStats();
-          console.log(`[CONNECTION-DISCONNECT] ${JSON.stringify({
-            timestamp: new Date().toISOString(),
-            ...stats,
-          })}`);
+          // const stats = getConnectionStats();
+          // console.log(`[CONNECTION-DISCONNECT] ${JSON.stringify({
+          //   timestamp: new Date().toISOString(),
+          //   ...stats,
+          // })}`);
         }, OFFLINE_STATUS_BROADCAST_DELAY_MS);
       }
     }

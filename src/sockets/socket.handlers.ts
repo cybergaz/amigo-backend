@@ -6,7 +6,7 @@ import { store_pending_message_for_users, is_allowed_event, store_pending_messag
 import db from "@/config/db";
 import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
 import { and, desc, eq, isNull, ne, or, sql } from "drizzle-orm";
-import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_connection_status, handle_conv_join_leave, handle_message_forward, handle_message_new } from "./socket.service";
+import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_connection_status, handle_conv_join_leave, handle_message_forward, handle_message_new } from "./socket.service";
 import { pin_message, unpin_message, mark_message_delivered } from "@/services/message.services";
 import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 
@@ -577,6 +577,25 @@ const socket_message_handler = async (user_details: {
                   message: result.message || "Error accepting call",
                   error: result.error
                 },
+                ws_timestamp: new Date()
+              }
+            });
+          }
+          break;
+        }
+
+      // ----------------------------------------------------
+      case 'call:hold':
+        // --------------------------------------------------
+        {
+          const result = await handle_call_hold(message.payload as CallPayload, user_id);
+          if (!result.success) {
+            await broadcast_message({
+              to: "users",
+              user_ids: [Number(user_id)],
+              message: {
+                type: "socket:error",
+                payload: { code: result.code || 500, message: result.message || "Error handling call:hold", error: result.error },
                 ws_timestamp: new Date()
               }
             });

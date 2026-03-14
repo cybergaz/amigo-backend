@@ -12,7 +12,8 @@ import { update_conversation } from "@/services/chat.services";
 import FCMService from "@/services/fcm.service";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
 import { ChatType } from "@/types/chat.types";
-import { CALL_TIMEOUT_MS, CallService } from "@/services/call.service";
+import { CALL_TIMEOUT_MS, CallService, active_calls, register_missed_call_notifier } from "@/services/call.service";
+import { call_model } from "@/models/call.model";
 import { convertBigIntToString } from "@/utils/serialization.utils";
 
 const handle_connection_status = async (payload: ConnectionStatusPayload): Promise<ResultType> => {
@@ -423,8 +424,8 @@ const handle_call_init = async (payload: CallPayload, user_id: number, user_name
     const call_init_payload: CallPayload = {
       call_id: result.data?.call_id,
       caller_id: payload.caller_id || Number(user_id),
-      caller_name: payload.caller_name || String(user_name),
-      caller_pfp: payload.caller_pfp || user_pfp,
+      caller_name: payload.caller_name || user_name,
+      caller_pfp: payload.caller_pfp || undefined,
       callee_id: payload.callee_id,
       timestamp: new Date(),
     };
@@ -459,9 +460,8 @@ const handle_call_init = async (payload: CallPayload, user_id: number, user_name
         },
       });
 
-      // Send ringing to user, via WebSocket if online, and push notification if offline
+      // Send ringing to callee via WebSocket if online
       if (is_user_online(payload.callee_id)) {
-        // send ringing websocket message
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         await broadcast_message({
           to: "users",
@@ -473,18 +473,19 @@ const handle_call_init = async (payload: CallPayload, user_id: number, user_name
           },
         });
       }
-      else {
-        await FCMService.send_notification({
-          type: "call",
-          fcm_mode: "data-only",
-          user_ids: [payload.callee_id],
-          ws_message: {
-            type: "call:ringing",
-            payload: call_init_payload,
-            ws_timestamp: new Date()
-          }
-        });
-      }
+
+      // Always send FCM regardless of WS status - ensures delivery on lock screen,
+      // background, and as a backup when WS drops momentarily
+      await FCMService.send_notification({
+        type: "call",
+        fcm_mode: "data-only",
+        user_ids: [payload.callee_id],
+        ws_message: {
+          type: "call:ringing",
+          payload: call_init_payload,
+          ws_timestamp: new Date()
+        }
+      });
 
     }
     else {
@@ -599,24 +600,40 @@ const handle_call_accept = async (payload: CallPayload, user_id: number): Promis
       };
     }
 
+    // Look up caller_id/callee_id from DB — client payload may have truncated IDs
+    // (e.g. Kotlin optInt overflow for user IDs > 2^31)
+    const call_info = await CallService.get_call_info(payload.call_id);
+    if (!call_info) {
+      console.error(`Call info not found for call_id ${payload.call_id}`);
+      return {
+        success: false,
+        code: 404,
+        message: `Call not found for call_id ${payload.call_id}`
+      };
+    }
+
+    const caller_id = call_info?.data?.caller_id ?? payload.caller_id;
+    const callee_id = call_info?.data?.callee_id ?? payload.callee_id;
+
     const result = await CallService.accept_call(payload.call_id, user_id);
 
     const call_accept_payload: CallPayload = {
       call_id: payload.call_id,
-      caller_id: payload.caller_id,
-      callee_id: payload.callee_id,
+      caller_id: caller_id,
+      callee_id: callee_id,
       timestamp: new Date(),
     };
+
     if (result.success) {
       // Notify both parties
       const active_call = CallService.get_user_active_call(user_id);
+
       if (active_call) {
-        // Notify caller
-        // Acknowledge to callee
+        // Notify caller & Acknowledge to callee
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         await broadcast_message({
           to: "users",
-          user_ids: [payload.caller_id, payload.callee_id],
+          user_ids: [caller_id, callee_id],
           message: {
             type: "call:accept",
             payload: {
@@ -631,7 +648,7 @@ const handle_call_accept = async (payload: CallPayload, user_id: number): Promis
       // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
       await broadcast_message({
         to: "users",
-        user_ids: [payload.caller_id, payload.callee_id],
+        user_ids: [caller_id, callee_id],
         message: {
           type: "call:error",
           payload: {
@@ -651,7 +668,6 @@ const handle_call_accept = async (payload: CallPayload, user_id: number): Promis
       code: 200,
       message: "Call accept processed successfully"
     };
-
   }
   catch (error) {
     console.error(`[WS] Error handling call accept:`, error);
@@ -784,6 +800,51 @@ const handle_call_termination = async (
 };
 
 
+// Register missed-call notifier so call.service can send WS+FCM without circular imports
+register_missed_call_notifier(async (callee_id, call_id, caller_id) => {
+  const missed_payload: CallPayload = {
+    call_id,
+    caller_id,
+    callee_id,
+    timestamp: new Date(),
+  };
+  if (is_user_online(callee_id)) {
+    await broadcast_message({
+      to: "users",
+      user_ids: [callee_id],
+      message: { type: "call:missed", payload: missed_payload, ws_timestamp: new Date() },
+    });
+  }
+  await FCMService.send_notification({
+    type: "call",
+    fcm_mode: "data-only",
+    user_ids: [callee_id],
+    ws_message: { type: "call:missed", payload: missed_payload, ws_timestamp: new Date() },
+  });
+});
+
+const handle_call_hold = async (payload: CallPayload, user_id: number): Promise<ResultType> => {
+  try {
+    if (!payload.call_id) {
+      return { success: false, code: 400, message: "call_id missing in call:hold payload" };
+    }
+    const active_call = active_calls.get(Number(payload.call_id));
+    if (!active_call) {
+      return { success: false, code: 404, message: "Active call not found for call:hold" };
+    }
+    const recipient_id = active_call.caller_id === user_id ? active_call.callee_id : active_call.caller_id;
+    await broadcast_message({
+      to: "users",
+      user_ids: [recipient_id],
+      message: { type: "call:hold", payload, ws_timestamp: new Date() },
+    });
+    return { success: true, code: 200, message: "call:hold forwarded" };
+  } catch (error) {
+    console.error("[WS] Error handling call:hold:", error);
+    return { success: false, code: 500, message: "Failed to handle call:hold", error: error as any };
+  }
+};
+
 export {
   handle_connection_status,
   handle_conv_join_leave,
@@ -793,4 +854,5 @@ export {
   handle_call_signaling,
   handle_call_accept,
   handle_call_termination,
+  handle_call_hold,
 };
