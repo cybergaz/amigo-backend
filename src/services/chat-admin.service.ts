@@ -1,9 +1,6 @@
 import db from "@/config/db";
-import {
-  conversation_model,
-  conversation_member_model,
-  message_model,
-} from "@/models/chat.model";
+import { conversation_model, conversation_member_model } from "@/models/chat.model";
+import { message_model } from "@/models/message.model";
 import { user_model } from "@/models/user.model";
 import {
   ChatRoleType,

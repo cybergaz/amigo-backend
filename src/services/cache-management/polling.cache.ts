@@ -2,7 +2,7 @@ import "dotenv/config";
 import LRUCache from "@/utils/cache.utils";
 import { redis } from "@/config/redis";
 import db from "@/config/db";
-import { missed_ws_messages_model } from "@/models/chat.model";
+import { missed_ws_messages_model } from "@/models/message.model";
 import { VITAL_WS_EVENTS_CONST, VitalWSMessage, VitalWSMessageEventsType, WSMessage, WSMessageEventsType } from "@/types/socket.types";
 import { eq, and, lt, asc, gt } from "drizzle-orm";
 import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";

@@ -4,7 +4,8 @@ import { get_conversation_members, get_user_conversations } from "@/services/cac
 import { socket_connections, handlePongResponse, polling_connections } from "./socket.server";
 import { store_pending_message_for_users, is_allowed_event, store_pending_message } from "@/services/cache-management/polling.cache";
 import db from "@/config/db";
-import { conversation_member_model, message_model, message_status_model } from "@/models/chat.model";
+import { conversation_member_model } from "@/models/chat.model";
+import { message_model, message_status_model } from "@/models/message.model";
 import { and, desc, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_connection_status, handle_conv_join_leave, handle_message_forward, handle_message_new } from "./socket.service";
 import { pin_message, unpin_message, mark_message_delivered } from "@/services/message.services";

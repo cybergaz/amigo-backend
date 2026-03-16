@@ -2,10 +2,9 @@ import db from "@/config/db";
 import {
   conversation_model,
   conversation_member_model,
-  message_model,
-  message_status_model,
   DBUpdateConversationType,
 } from "@/models/chat.model";
+import { message_model, message_status_model } from "@/models/message.model";
 import { user_model } from "@/models/user.model";
 import {
   ChatType,
