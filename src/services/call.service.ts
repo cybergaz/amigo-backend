@@ -113,9 +113,6 @@ export class CallService {
 
   // Accept a call
   static async accept_call(call_id: number, user_id: number): Promise<ResultType> {
-    console.log("--------------------------------------------------------------------");
-    console.log("accept_call ->", { call_id, user_id });
-    console.log("--------------------------------------------------------------------");
     try {
       const active_call = active_calls.get(call_id);
       if (!active_call) {

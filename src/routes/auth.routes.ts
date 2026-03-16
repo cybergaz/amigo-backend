@@ -180,7 +180,6 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/verify-login-otp", async ({ body, set, cookie, headers }) => {
-    console.log("body -> ", body);
 
     // For testing purposes, allow OTP bypass for specific test numbers
     if (!body.phone.startsWith("+91100100100")) {
