@@ -4,7 +4,7 @@ import {
   conversation_member_model,
   DBUpdateConversationType,
 } from "@/models/chat.model";
-import { message_model, message_status_model } from "@/models/message.model";
+import { message_model, message_info_model } from "@/models/message.model";
 import { user_model } from "@/models/user.model";
 import {
   ChatType,
@@ -606,16 +606,16 @@ const delete_message_for_me = async (
     // Update or insert message_status with deleted_at timestamp
     // First, try to update existing records
     const updatedStatuses = await db
-      .update(message_status_model)
+      .update(message_info_model)
       .set({
         deleted_at: new Date(),
         updated_at: new Date(),
       })
       .where(
         and(
-          inArray(message_status_model.message_id, message_ids),
-          eq(message_status_model.user_id, user_id),
-          eq(message_status_model.conv_id, conversation_id)
+          inArray(message_info_model.message_id, message_ids),
+          eq(message_info_model.user_id, user_id),
+          eq(message_info_model.conv_id, conversation_id)
         )
       )
       .returning();
@@ -628,7 +628,7 @@ const delete_message_for_me = async (
 
     if (messagesToInsert.length > 0) {
       await db
-        .insert(message_status_model)
+        .insert(message_info_model)
         .values(
           messagesToInsert.map(msg => ({
             message_id: msg.id,
@@ -639,8 +639,8 @@ const delete_message_for_me = async (
         )
         .onConflictDoUpdate({
           target: [
-            message_status_model.message_id,
-            message_status_model.user_id
+            message_info_model.message_id,
+            message_info_model.user_id
           ],
           set: {
             deleted_at: new Date(),
@@ -761,13 +761,13 @@ const get_conversation_history = async (
 
     // Get message IDs deleted by this user (delete for me)
     const userDeletedMessages = await db
-      .select({ message_id: message_status_model.message_id })
-      .from(message_status_model)
+      .select({ message_id: message_info_model.message_id })
+      .from(message_info_model)
       .where(
         and(
-          eq(message_status_model.user_id, user_id),
-          eq(message_status_model.conv_id, conversation_id),
-          isNotNull(message_status_model.deleted_at)
+          eq(message_info_model.user_id, user_id),
+          eq(message_info_model.conv_id, conversation_id),
+          isNotNull(message_info_model.deleted_at)
         )
       );
 
@@ -909,21 +909,21 @@ const get_message_statuses = async (
     // This includes statuses for all users in the conversation
     const statuses = await db
       .select()
-      .from(message_status_model)
+      .from(message_info_model)
       .where(
         and(
-          eq(message_status_model.conv_id, conversation_id)
+          eq(message_info_model.conv_id, conversation_id)
         )
       )
-      .orderBy(desc(message_status_model.updated_at))
+      .orderBy(desc(message_info_model.updated_at))
       .limit(limit)
       .offset(offset);
 
     // Get total count for pagination info
     const totalCountResult = await db
       .select({ count: sql<number>`count(*)` })
-      .from(message_status_model)
-      .where(eq(message_status_model.conv_id, conversation_id));
+      .from(message_info_model)
+      .where(eq(message_info_model.conv_id, conversation_id));
 
     const totalCount = totalCountResult[0]?.count || 0;
     const totalPages = Math.ceil(totalCount / limit);
@@ -1135,15 +1135,15 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
 //     // These are messages where message_status.delivered_at is NULL for this user
 //     const undeliveredStatuses = await db
 //       .select({
-//         message_id: message_status_model.message_id,
-//         conv_id: message_status_model.conv_id,
+//         message_id: message_info_model.message_id,
+//         conv_id: message_info_model.conv_id,
 //       })
-//       .from(message_status_model)
+//       .from(message_info_model)
 //       .where(
 //         and(
-//           eq(message_status_model.user_id, user_id),
-//           inArray(message_status_model.conv_id, conversationIds),
-//           isNull(message_status_model.delivered_at)
+//           eq(message_info_model.user_id, user_id),
+//           inArray(message_info_model.conv_id, conversationIds),
+//           isNull(message_info_model.delivered_at)
 //         )
 //       )
 //       .limit(500); // Limit to prevent overwhelming the client
@@ -1239,12 +1239,12 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
 //     console.log("broadcast_message status-> ", sent_status)
 //     // Mark these messages as delivered
 //     await db
-//       .update(message_status_model)
+//       .update(message_info_model)
 //       .set({ delivered_at: new Date() })
 //       .where(
 //         and(
-//           eq(message_status_model.user_id, user_id),
-//           inArray(message_status_model.message_id, messageIds)
+//           eq(message_info_model.user_id, user_id),
+//           inArray(message_info_model.message_id, messageIds)
 //         )
 //       );
 //

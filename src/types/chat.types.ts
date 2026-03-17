@@ -11,7 +11,7 @@ const CHAT_ROLE_CONST = ["member", "admin"] as const;
 type ChatRoleType = typeof CHAT_ROLE_CONST[number];
 
 // Message operations types
-const MESSAGE_OPERATION_CONSTS = ["pin", "star", "reply", "forward", "delete"] as const;
+const MESSAGE_OPERATION_CONSTS = ["pin", "star", "reply", "forward", "delete", "react"] as const;
 type MessageOperationType = typeof MESSAGE_OPERATION_CONSTS[number];
 
 // Conversation metadata structure
@@ -65,6 +65,13 @@ interface MessageMetadata {
     end_index: number;
   }>;
 
+  // Emoji reactions - map of emoji -> array of user reactions
+  reactions?: Record<string, Array<{
+    user_id: number;
+    user_name?: string;
+    reacted_at: string;
+  }>>;
+
   // Other metadata
   [key: string]: any;
 }
@@ -117,6 +124,12 @@ interface MediaMetadataRequest {
   mime_type: string;
 }
 
+interface ReactMessageRequest {
+  message_id: bigint;
+  conversation_id: number;
+  emoji: string;
+  action: 'add' | 'remove';
+}
 
 export { CHAT_TYPE_CONSTS, MESSAGE_TYPE_CONSTS, MESSAGE_STATUS_CONSTS, CHAT_ROLE_CONST, MESSAGE_OPERATION_CONSTS };
 export type {
@@ -133,5 +146,6 @@ export type {
   ReplyMessageRequest,
   ForwardMessageRequest,
   DeleteMessageRequest,
-  MediaMetadataRequest
+  MediaMetadataRequest,
+  ReactMessageRequest
 };

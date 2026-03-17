@@ -21,7 +21,7 @@ const message_model = pgTable("messages", {
   forwarded_to: bigint({ mode: 'number' }).array()
 });
 
-const message_status_model = pgTable("message_status", {
+const message_info_model = pgTable("message_status", {
   id: bigserial({ mode: "number" }).primaryKey(),
   message_id: bigint({ mode: "bigint" }).references(() => message_model.id, { onDelete: "cascade" }).notNull(),
   user_id: bigint({ mode: "number" }).references(() => user_model.id, { onDelete: "cascade" }).notNull(),
@@ -30,6 +30,7 @@ const message_status_model = pgTable("message_status", {
   read_at: timestamp({ withTimezone: true }),       // when user read it
   deleted_at: timestamp({ withTimezone: true }),    // when user deleted this message (delete for me)
   updated_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
+  reaction: text(),                                 // emoji the user reacted with (e.g. "👍"), null if no reaction
 },
   (table) => [uniqueIndex("unique_user_message").on(table.message_id, table.user_id),]
 );
@@ -46,8 +47,8 @@ type DBMessageType = InferSelectModel<typeof message_model>;
 type DBInsertMessageType = InferInsertModel<typeof message_model>;
 type DBUpdateMessageType = Partial<DBInsertMessageType>;
 
-type DBMessageStatusType = InferSelectModel<typeof message_status_model>;
-type DBInsertMessageStatusType = InferInsertModel<typeof message_status_model>;
+type DBMessageStatusType = InferSelectModel<typeof message_info_model>;
+type DBInsertMessageStatusType = InferInsertModel<typeof message_info_model>;
 type DBUpdateMessageStatusType = Partial<DBInsertMessageStatusType>;
 
 type DBMissedMessageType = InferSelectModel<typeof missed_ws_messages_model>;
@@ -55,7 +56,7 @@ type DBInsertMissedMessageType = InferInsertModel<typeof missed_ws_messages_mode
 
 export {
   message_model,
-  message_status_model,
+  message_info_model,
   missed_ws_messages_model
 };
 export type {

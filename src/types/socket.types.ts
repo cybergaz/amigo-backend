@@ -49,6 +49,7 @@ type WSMessage = {
   | DeleteMessagePayload
   | MessagePinPayload
   | MessageForwardPayload
+  | MessageReactPayload
   | CallPayload
   | MiscPayload
   | ConversationActionPayload
@@ -144,6 +145,17 @@ type DeleteMessagePayload = {
   conv_id: number;
   sender_id: number;
   message_ids: bigint[];
+};
+
+type MessageReactPayload = {
+  message_id: bigint;
+  conv_id: number;
+  sender_id: number;
+  sender_name?: string;
+  emoji: string;
+  action: 'add' | 'remove';
+  // Updated full reactions map after this action
+  reactions: Record<string, Array<{ user_id: number; user_name?: string; reacted_at: string; }>>;
 };
 
 type NewConversationPayload = {
@@ -249,6 +261,7 @@ const WS_MESSAGE_EVENTS_CONST = [
   'message:pin',
   'message:forward',
   'message:delete',
+  'message:react',
   'message:sync',  // Sync missed messages on reconnection
   'message:delivered',  // Delivery receipt from FCM messages
   'call:init',
@@ -279,6 +292,7 @@ const VITAL_WS_EVENTS_CONST = [
   'message:pin',
   'message:forward',
   'message:delete',
+  'message:react',
   'message:new',
   'message:ack',
   'message:delivered',
@@ -322,6 +336,7 @@ export type {
   MembersType,
   MessagePinPayload,
   MessageForwardPayload,
+  MessageReactPayload,
   CallPayload,
   ConnectionStatusType,
   ConversationActionPayload,

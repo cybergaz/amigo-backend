@@ -2,7 +2,7 @@ import db from "@/config/db";
 import { conversation_model, conversation_member_model } from "@/models/chat.model";
 import {
   message_model,
-  message_status_model,
+  message_info_model,
   DBMessageType,
   DBUpdateMessageStatusType,
   DBInsertMessageStatusType,
@@ -19,13 +19,14 @@ import {
   ForwardMessageRequest,
   DeleteMessageRequest,
   MediaMetadataRequest,
+  ReactMessageRequest,
   MessageType
 } from "@/types/chat.types";
 import { ResultType } from "@/types/core.types";
-import { ChatMessageAckPayload, ChatMessagePayload, MessagePinPayload, SyncMessagesPayload } from "@/types/socket.types";
+import { ChatMessageAckPayload, ChatMessagePayload, MessagePinPayload, MessageReactPayload, SyncMessagesPayload } from "@/types/socket.types";
 import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 import Snowflake from "@/utils/snowflake.utils";
-import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { log_current_cache_state, remove_pending_message } from "./cache-management/polling.cache";
 
 // Helper function to verify user membership in conversation
@@ -813,7 +814,7 @@ const insert_message_status = async (msg_status: Pick<DBInsertMessageStatusType,
 
     // Upsert message status
     const [inserted_status] = await db
-      .insert(message_status_model)
+      .insert(message_info_model)
       .values({
         user_id: msg_status.user_id,
         message_id: msg_status.message_id,
@@ -863,42 +864,42 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
     if (msg_status.delivered_at && !msg_status.read_at) {
 
       updated_status = (await db
-        .update(message_status_model)
+        .update(message_info_model)
         .set({
           delivered_at: msg_status.delivered_at,
           updated_at: new Date()
         }).where(
           and(
-            eq(message_status_model.message_id, msg_status.message_id),
-            eq(message_status_model.user_id, msg_status.user_id)
+            eq(message_info_model.message_id, msg_status.message_id),
+            eq(message_info_model.user_id, msg_status.user_id)
           )
         ).returning())[0];
     }
     else if (!msg_status.delivered_at && msg_status.read_at) {
       updated_status = (await db
-        .update(message_status_model)
+        .update(message_info_model)
         .set({
           read_at: msg_status.delivered_at,
           updated_at: new Date()
         }).where(
           and(
-            eq(message_status_model.message_id, msg_status.message_id),
-            eq(message_status_model.user_id, msg_status.user_id)
+            eq(message_info_model.message_id, msg_status.message_id),
+            eq(message_info_model.user_id, msg_status.user_id)
           )
         ).returning())[0];
     }
     else {
       // Upsert message status
       updated_status = (await db
-        .update(message_status_model)
+        .update(message_info_model)
         .set({
           delivered_at: msg_status.delivered_at,
           read_at: msg_status.read_at,
           updated_at: new Date()
         }).where(
           and(
-            eq(message_status_model.message_id, msg_status.message_id),
-            eq(message_status_model.user_id, msg_status.user_id)
+            eq(message_info_model.message_id, msg_status.message_id),
+            eq(message_info_model.user_id, msg_status.user_id)
           )
         ).returning())[0];
     }
@@ -963,7 +964,7 @@ const batch_insert_message_status = async (
     // Batch insert all records in a single query
     // This is exponentially faster than individual inserts
     const inserted_statuses = await db
-      .insert(message_status_model)
+      .insert(message_info_model)
       .values(records)
       .returning();
 
@@ -1026,18 +1027,18 @@ const batch_update_message_status = async (
 
     // Build WHERE conditions
     const whereConditions = [
-      eq(message_status_model.user_id, user_id),
-      inArray(message_status_model.message_id, message_ids)
+      eq(message_info_model.user_id, user_id),
+      inArray(message_info_model.message_id, message_ids)
     ];
 
     // Optionally filter by conversation ID for more specific updates
     if (conv_id !== undefined) {
-      whereConditions.push(eq(message_status_model.conv_id, conv_id));
+      whereConditions.push(eq(message_info_model.conv_id, conv_id));
     }
 
     // Update all message statuses in a single query
     const updated_statuses = await db
-      .update(message_status_model)
+      .update(message_info_model)
       .set(updateData)
       .where(and(...whereConditions))
       .returning();
@@ -1250,16 +1251,16 @@ const verify_message_ids = async (
 
       const statusRows = await db
         .select({
-          message_id: message_status_model.message_id,
-          user_id: message_status_model.user_id,
-          delivered_at: message_status_model.delivered_at,
-          read_at: message_status_model.read_at,
+          message_id: message_info_model.message_id,
+          user_id: message_info_model.user_id,
+          delivered_at: message_info_model.delivered_at,
+          read_at: message_info_model.read_at,
         })
-        .from(message_status_model)
+        .from(message_info_model)
         .where(
           and(
-            inArray(message_status_model.message_id, rows.map((r) => r.id)),
-            eq(message_status_model.conv_id, conversation_id),
+            inArray(message_info_model.message_id, rows.map((r) => r.id)),
+            eq(message_info_model.conv_id, conversation_id),
           )
         );
 
@@ -1275,6 +1276,97 @@ const verify_message_ids = async (
   } catch (e) {
     console.error("verify_message_ids error", e);
     return { success: false, code: 500, message: "ERROR: verify_message_ids" };
+  }
+};
+
+// React/unreact to a message - stores per-user reaction in message_status table
+const react_to_message = async (request: ReactMessageRequest, user_id: number, user_name?: string) => {
+  try {
+    // Verify the message exists
+    const [message] = await db
+      .select({ id: message_model.id, conversation_id: message_model.conversation_id })
+      .from(message_model)
+      .where(
+        and(
+          eq(message_model.id, request.message_id),
+          eq(message_model.conversation_id, request.conversation_id),
+          eq(message_model.deleted, false)
+        )
+      )
+      .limit(1);
+
+    if (!message) {
+      return { success: false, code: 404, message: "Message not found" };
+    }
+
+    // Upsert the user's reaction into message_status
+    const newReaction = request.action === 'add' ? request.emoji : null;
+    await db
+      .insert(message_info_model)
+      .values({
+        message_id: request.message_id,
+        user_id: BigInt(user_id),
+        conv_id: BigInt(request.conversation_id),
+        reaction: newReaction,
+        updated_at: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: [message_info_model.message_id, message_info_model.user_id],
+        set: {
+          reaction: newReaction,
+          updated_at: new Date(),
+        },
+      });
+
+    // Build full reactions map from all message_status rows for broadcast
+    const allReactionStatuses = await db
+      .select({
+        user_id: message_info_model.user_id,
+        reaction: message_info_model.reaction,
+        updated_at: message_info_model.updated_at,
+      })
+      .from(message_info_model)
+      .where(
+        and(
+          eq(message_info_model.message_id, request.message_id),
+          isNotNull(message_info_model.reaction)
+        )
+      );
+
+    const reactions: Record<string, Array<{ user_id: number; user_name?: string; reacted_at: string; }>> = {};
+    for (const s of allReactionStatuses) {
+      if (!s.reaction) continue;
+      if (!reactions[s.reaction]) reactions[s.reaction] = [];
+      reactions[s.reaction].push({
+        user_id: Number(s.user_id),
+        reacted_at: s.updated_at?.toISOString() ?? new Date().toISOString(),
+      });
+    }
+
+    const reactPayload: MessageReactPayload = {
+      message_id: request.message_id,
+      conv_id: request.conversation_id,
+      sender_id: user_id,
+      sender_name: user_name,
+      emoji: request.emoji,
+      action: request.action,
+      reactions,
+    };
+
+    await broadcast_message({
+      to: "conversation",
+      conv_id: request.conversation_id,
+      message: {
+        type: "message:react",
+        payload: reactPayload,
+        ws_timestamp: new Date(),
+      },
+    });
+
+    return { success: true, code: 200, message: "Reaction updated", data: { reactions } };
+  } catch (error) {
+    console.error("react_to_message error", error);
+    return { success: false, code: 500, message: "ERROR: react_to_message" };
   }
 };
 
@@ -1296,4 +1388,5 @@ export {
   mark_message_delivered,
   mark_messages_delivered_batch,
   verify_message_ids,
+  react_to_message,
 };

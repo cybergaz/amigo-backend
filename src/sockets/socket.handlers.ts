@@ -5,7 +5,7 @@ import { socket_connections, handlePongResponse, polling_connections } from "./s
 import { store_pending_message_for_users, is_allowed_event, store_pending_message } from "@/services/cache-management/polling.cache";
 import db from "@/config/db";
 import { conversation_member_model } from "@/models/chat.model";
-import { message_model, message_status_model } from "@/models/message.model";
+import { message_model, message_info_model } from "@/models/message.model";
 import { and, desc, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_connection_status, handle_conv_join_leave, handle_message_forward, handle_message_new } from "./socket.service";
 import { pin_message, unpin_message, mark_message_delivered } from "@/services/message.services";
@@ -210,27 +210,27 @@ const handle_join_conversation = async ({
 
     // Capture unread messages BEFORE marking them read, so we can push real read receipts to senders
     const unread_messages = await db
-      .select({ message_id: message_status_model.message_id, sender_id: message_model.sender_id })
-      .from(message_status_model)
-      .innerJoin(message_model, eq(message_status_model.message_id, message_model.id))
+      .select({ message_id: message_info_model.message_id, sender_id: message_model.sender_id })
+      .from(message_info_model)
+      .innerJoin(message_model, eq(message_info_model.message_id, message_model.id))
       .where(
         and(
-          eq(message_status_model.conv_id, conv_id),
-          eq(message_status_model.user_id, user_id),
-          isNull(message_status_model.read_at),
+          eq(message_info_model.conv_id, conv_id),
+          eq(message_info_model.user_id, user_id),
+          isNull(message_info_model.read_at),
           ne(message_model.sender_id, user_id),
         )
       );
 
     // update message_status to set read_at for all messages in this conversation for this user
     await db
-      .update(message_status_model)
+      .update(message_info_model)
       .set({ read_at: new Date() })
       .where(
         and(
-          eq(message_status_model.conv_id, conv_id),
-          eq(message_status_model.user_id, user_id),
-          isNull(message_status_model.read_at),
+          eq(message_info_model.conv_id, conv_id),
+          eq(message_info_model.user_id, user_id),
+          isNull(message_info_model.read_at),
         )
       );
 
