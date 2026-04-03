@@ -138,7 +138,7 @@ const app = new Elysia({ prefix: "/api" })
   .listen(SERVER_PORT);
 
 console.log(
-  `🦊 Elysia is running at port ${app.server?.port} (PID: ${process.pid})`
+  `🦊 Elysia is running at port ${app.server?.url} (PID: ${process.pid})`
 );
 
 // Graceful shutdown

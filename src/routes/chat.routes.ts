@@ -1,6 +1,6 @@
 import { Elysia, t } from "elysia";
 import { app_middleware } from "@/middleware";
-import { get_chat_list, get_conversation_history, get_message_statuses, soft_delete_chat, soft_delete_message } from "@/services/chat.services";
+import { get_chat_list, get_conversation_history, get_message_statuses, get_messages_around, soft_delete_chat, soft_delete_message } from "@/services/chat.services";
 import { dm_delete_status } from "@/services/chat-dm.service";
 
 const chat_routes = new Elysia({ prefix: "/chat" })
@@ -36,7 +36,9 @@ const chat_routes = new Elysia({ prefix: "/chat" })
       params.conversation_id,
       store.id,
       query.page,
-      query.limit
+      query.limit,
+      query.before_message_id ? BigInt(query.before_message_id) : undefined,
+      query.after_message_id  ? BigInt(query.after_message_id)  : undefined,
     );
 
     set.status = history_result.code;
@@ -46,8 +48,31 @@ const chat_routes = new Elysia({ prefix: "/chat" })
       conversation_id: t.Number()
     }),
     query: t.Object({
-      page: t.Optional(t.Number({ minimum: 1, default: 1 })),
-      limit: t.Optional(t.Number({ minimum: 1, maximum: 500, default: 20 }))
+      page:              t.Optional(t.Number({ minimum: 1, default: 1 })),
+      limit:             t.Optional(t.Number({ minimum: 1, maximum: 500, default: 20 })),
+      before_message_id: t.Optional(t.String()),
+      after_message_id:  t.Optional(t.String()),
+    })
+  })
+
+  .get("/get-messages-around/:conversation_id/:message_id", async ({ set, store, params, query }) => {
+    const result = await get_messages_around(
+      params.conversation_id,
+      BigInt(params.message_id),
+      store.id,
+      query.before,
+      query.after
+    );
+    set.status = result.code;
+    return result;
+  }, {
+    params: t.Object({
+      conversation_id: t.Number(),
+      message_id: t.String()
+    }),
+    query: t.Object({
+      before: t.Optional(t.Number({ minimum: 0, maximum: 100, default: 32 })),
+      after: t.Optional(t.Number({ minimum: 0, maximum: 100, default: 32 })),
     })
   })
 

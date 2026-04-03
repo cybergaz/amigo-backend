@@ -11,7 +11,7 @@ import {
   ConversationMetadata,
 } from "@/types/chat.types";
 import { create_unique_id } from "@/utils/general.utils";
-import { and, arrayContains, asc, desc, eq, gt, inArray, isNotNull, isNull, ne, not, or, sql } from "drizzle-orm";
+import { and, arrayContains, asc, desc, eq, gt, lt, inArray, isNotNull, isNull, ne, not, or, sql } from "drizzle-orm";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { ConversationActionPayload, DeleteMessagePayload, MembersType, SyncMessagesPayload, WSMessage } from "@/types/socket.types";
 import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
@@ -702,7 +702,9 @@ const get_conversation_history = async (
   conversation_id: number,
   user_id: number,
   page: number = 1,
-  limit: number = 100
+  limit: number = 100,
+  before_message_id?: bigint,
+  after_message_id?: bigint,
 ) => {
   try {
     // First, verify user is a member of this conversation
@@ -772,6 +774,82 @@ const get_conversation_history = async (
       );
 
     const deletedMessageIds = userDeletedMessages.map(d => d.message_id);
+
+    // ── cursor-based mode (jump pagination) ──────────────────────────────────
+    if (before_message_id || after_message_id) {
+      const [anchor] = await db
+        .select({ created_at: message_model.created_at })
+        .from(message_model)
+        .where(eq(message_model.id, (before_message_id ?? after_message_id)!));
+
+      if (!anchor) {
+        return { success: false, code: 404, message: "Anchor message not found" };
+      }
+
+      const cursorMessages = await db
+        .select({
+          id: message_model.id,
+          conversation_id: message_model.conversation_id,
+          sender_id: message_model.sender_id,
+          type: message_model.type,
+          body: message_model.body,
+          attachments: message_model.attachments,
+          metadata: message_model.metadata,
+          sent_at: message_model.sent_at,
+          created_at: message_model.created_at,
+          status: message_model.status,
+          deleted: message_model.deleted,
+          forwarded_from: message_model.forwarded_from,
+          forwarded_count: message_model.forwarded_to,
+          sender_name: user_model.name,
+          sender_profile_pic: user_model.profile_pic,
+        })
+        .from(message_model)
+        .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+        .where(
+          and(
+            eq(message_model.conversation_id, conversation_id),
+            eq(message_model.deleted, false),
+            deletedMessageIds.length > 0
+              ? not(inArray(message_model.id, deletedMessageIds))
+              : undefined,
+            user_details.joining_date
+              ? gt(message_model.created_at, user_details.joining_date)
+              : undefined,
+            before_message_id
+              ? lt(message_model.created_at, anchor.created_at)
+              : gt(message_model.created_at, anchor.created_at),
+          )
+        )
+        .orderBy(
+          before_message_id
+            ? desc(message_model.created_at)
+            : asc(message_model.created_at)
+        )
+        .limit(limit);
+
+      const hasMore = cursorMessages.length === limit;
+
+      if (before_message_id) cursorMessages.reverse();
+
+      return {
+        success: true,
+        code: 200,
+        data: {
+          messages: cursorMessages,
+          members,
+          pagination: {
+            currentPage: 1,
+            totalPages: 1,
+            totalCount: cursorMessages.length,
+            limit,
+            hasNextPage: hasMore,
+            hasPreviousPage: false,
+          },
+        },
+      };
+    }
+    // ── end cursor branch ─────────────────────────────────────────────────────
 
     // Get messages with sender information, excluding messages deleted for this user
     const messages = await db
@@ -1266,6 +1344,194 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
 //   }
 // }
 
+const get_messages_around = async (
+  conversation_id: number,
+  message_id: bigint,
+  user_id: number,
+  before: number = 32,
+  after: number = 32
+) => {
+  try {
+    // 1. Verify user is a member of this conversation
+    const members = await db
+      .select({
+        user_id: conversation_member_model.user_id,
+        name: user_model.name,
+        profile_pic: user_model.profile_pic,
+        group_role: conversation_member_model.role,
+        joining_date: conversation_member_model.joined_at,
+      })
+      .from(conversation_member_model)
+      .leftJoin(
+        user_model,
+        eq(user_model.id, conversation_member_model.user_id)
+      )
+      .where(
+        and(
+          eq(conversation_member_model.conversation_id, conversation_id),
+          eq(conversation_member_model.deleted, false)
+        )
+      );
+
+    if (!members.find(m => m.user_id === user_id)) {
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
+
+    // 2. Get the target message
+    const [targetMessage] = await db
+      .select({
+        id: message_model.id,
+        created_at: message_model.created_at,
+      })
+      .from(message_model)
+      .where(
+        and(
+          eq(message_model.id, message_id),
+          eq(message_model.deleted, false)
+        )
+      )
+      .limit(1);
+
+    if (!targetMessage) {
+      return {
+        success: false,
+        code: 404,
+        message: "Message not found",
+      };
+    }
+
+    // 3. Get message IDs deleted by this user (delete for me)
+    const userDeletedMessages = await db
+      .select({ message_id: message_info_model.message_id })
+      .from(message_info_model)
+      .where(
+        and(
+          eq(message_info_model.user_id, user_id),
+          eq(message_info_model.conv_id, conversation_id),
+          isNotNull(message_info_model.deleted_at)
+        )
+      );
+    const deletedMessageIds = userDeletedMessages.map(d => d.message_id);
+
+    const deleteFilter = deletedMessageIds.length > 0
+      ? not(inArray(message_model.id, deletedMessageIds))
+      : undefined;
+
+    // 4. Fetch `before` messages with created_at < target
+    const olderMessages = await db
+      .select({
+        id: message_model.id,
+        conversation_id: message_model.conversation_id,
+        sender_id: message_model.sender_id,
+        type: message_model.type,
+        body: message_model.body,
+        attachments: message_model.attachments,
+        metadata: message_model.metadata,
+        sent_at: message_model.sent_at,
+        created_at: message_model.created_at,
+        status: message_model.status,
+        deleted: message_model.deleted,
+        forwarded_from: message_model.forwarded_from,
+        forwarded_count: message_model.forwarded_to,
+        sender_name: user_model.name,
+        sender_profile_pic: user_model.profile_pic,
+      })
+      .from(message_model)
+      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+      .where(
+        and(
+          eq(message_model.conversation_id, conversation_id),
+          eq(message_model.deleted, false),
+          lt(message_model.created_at, targetMessage.created_at),
+          deleteFilter,
+        )
+      )
+      .orderBy(desc(message_model.created_at))
+      .limit(before);
+
+    // 5. Fetch `after` messages with created_at > target
+    const newerMessages = await db
+      .select({
+        id: message_model.id,
+        conversation_id: message_model.conversation_id,
+        sender_id: message_model.sender_id,
+        type: message_model.type,
+        body: message_model.body,
+        attachments: message_model.attachments,
+        metadata: message_model.metadata,
+        sent_at: message_model.sent_at,
+        created_at: message_model.created_at,
+        status: message_model.status,
+        deleted: message_model.deleted,
+        forwarded_from: message_model.forwarded_from,
+        forwarded_count: message_model.forwarded_to,
+        sender_name: user_model.name,
+        sender_profile_pic: user_model.profile_pic,
+      })
+      .from(message_model)
+      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+      .where(
+        and(
+          eq(message_model.conversation_id, conversation_id),
+          eq(message_model.deleted, false),
+          gt(message_model.created_at, targetMessage.created_at),
+          deleteFilter,
+        )
+      )
+      .orderBy(asc(message_model.created_at))
+      .limit(after);
+
+    // 6. Fetch the target message itself
+    const [target] = await db
+      .select({
+        id: message_model.id,
+        conversation_id: message_model.conversation_id,
+        sender_id: message_model.sender_id,
+        type: message_model.type,
+        body: message_model.body,
+        attachments: message_model.attachments,
+        metadata: message_model.metadata,
+        sent_at: message_model.sent_at,
+        created_at: message_model.created_at,
+        status: message_model.status,
+        deleted: message_model.deleted,
+        forwarded_from: message_model.forwarded_from,
+        forwarded_count: message_model.forwarded_to,
+        sender_name: user_model.name,
+        sender_profile_pic: user_model.profile_pic,
+      })
+      .from(message_model)
+      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+      .where(eq(message_model.id, message_id))
+      .limit(1);
+
+    // 7. Combine: older (reversed to chronological) + target + newer
+    const messages = [...olderMessages.reverse(), target, ...newerMessages];
+
+    return {
+      success: true,
+      code: 200,
+      data: {
+        messages,
+        members,
+        hasOlder: olderMessages.length === before,
+        hasNewer: newerMessages.length === after,
+      },
+    };
+  } catch (error) {
+    console.error("get_messages_around error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : get_messages_around",
+    };
+  }
+};
+
 export {
   get_chat_list,
   update_conversation,
@@ -1278,5 +1544,5 @@ export {
   get_message_statuses,
   getConversationDetailsForUser,
   broadcast_conversation_action,
-  // sync_missed_messages
+  get_messages_around,
 };
