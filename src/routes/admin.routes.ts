@@ -4,7 +4,7 @@ import { get_all_users_paginated, update_user_role, update_user_call_access, get
 import { get_communities, get_community_groups } from "@/services/community.services";
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
-import { conversation_model } from "@/models/chat.model";
+import { chat_model } from "@/models/chat.model";
 import { create_unique_id } from "@/utils/general.utils";
 import { REQUEST_STATUS_CONST, RoleType } from "@/types/user.types";
 import { eq, sql } from "drizzle-orm";
@@ -20,7 +20,6 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     const newAdmin = await db
       .insert(user_model)
       .values({
-        id: create_unique_id(),
         name: "Super Admin",
         email: "admin@gmail.com",
         role: "admin" as RoleType,
@@ -45,7 +44,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   })
 
   // Middleware to protect all routes below
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers, allowed: ["admin", "sub_admin"] });
@@ -150,7 +149,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
         };
       }
 
-      const { id, permissions } = body as { id: number; permissions: string[]; };
+      const { id, permissions } = body as { id: string; permissions: string[]; };
 
       if (!id || !permissions || !Array.isArray(permissions)) {
         set.status = 400;
@@ -177,7 +176,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }
   }, {
     body: t.Object({
-      id: t.Number(),
+      id: t.String(),
       permissions: t.Array(t.String())
     })
   })
@@ -195,7 +194,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
         };
       }
 
-      const { id, active } = body as { id: number; active: boolean; };
+      const { id, active } = body as { id: string; active: boolean; };
 
       if (!id || typeof active !== 'boolean') {
         set.status = 400;
@@ -233,7 +232,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }
   }, {
     body: t.Object({
-      id: t.Number(),
+      id: t.String(),
       active: t.Boolean()
     })
   })
@@ -296,7 +295,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
 
   .put("/update-user-role", async ({ body, set, store }) => {
     try {
-      const { id, role } = body as { id: number; role: string; };
+      const { id, role } = body as { id: string; role: string; };
 
       if (!id || !role) {
         set.status = 400;
@@ -325,7 +324,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
 
   .put("/update-user-call-access", async ({ body, set, store }) => {
     try {
-      const { id, call_access } = body as { id: number; call_access: boolean; };
+      const { id, call_access } = body as { id: string; call_access: boolean; };
 
       if (!id || typeof call_access !== 'boolean') {
         set.status = 400;
@@ -404,7 +403,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }
   }, {
     params: t.Object({
-      id: t.Number()
+      id: t.String()
     })
   })
 
@@ -416,9 +415,9 @@ const admin_routes = new Elysia({ prefix: "/admin" })
             SELECT
               (SELECT COUNT(*) FROM ${user_model} WHERE role = 'user')::int AS users_count,
               (SELECT COUNT(*) FROM ${user_model} WHERE role = 'admin' OR role = 'sub_admin')::int AS admin_count,
-              (SELECT COUNT(*) FROM ${conversation_model} WHERE type = 'group')::int AS group_count,
-              (SELECT COUNT(*) FROM ${conversation_model} WHERE type = 'dm')::int AS dm_count,
-              (SELECT COUNT(*) FROM ${conversation_model} WHERE type = 'community_group')::int AS comm_group_count,
+              (SELECT COUNT(*) FROM ${chat_model} WHERE type = 'group')::int AS group_count,
+              (SELECT COUNT(*) FROM ${chat_model} WHERE type = 'dm')::int AS dm_count,
+              (SELECT COUNT(*) FROM ${chat_model} WHERE type = 'community_group')::int AS comm_group_count,
               (SELECT COUNT(*) FROM ${community_model})::int AS comm_count
           `);
 
@@ -463,10 +462,10 @@ const admin_routes = new Elysia({ prefix: "/admin" })
         // Filter by deleted status
         if (showDeleted) {
           // Show ONLY deleted groups
-          filteredData = filteredData.filter((group: any) => group.deleted);
+          filteredData = filteredData.filter((group: any) => group.deleted_at != null);
         } else {
           // Show ONLY non-deleted groups
-          filteredData = filteredData.filter((group: any) => !group.deleted);
+          filteredData = filteredData.filter((group: any) => group.deleted_at == null);
         }
 
         // Apply search filter if search query exists
@@ -602,7 +601,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     return result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     })
   })
 
@@ -627,8 +626,8 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }
   }, {
     body: t.Object({
-      conversation_id: t.Number(),
-      user_ids: t.Array(t.Number()),
+      conversation_id: t.String(),
+      user_ids: t.Array(t.String()),
       role: t.Optional(t.Union([t.Literal("admin"), t.Literal("member")]))
     })
   })
@@ -650,8 +649,8 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }
   }, {
     body: t.Object({
-      conversation_id: t.Number(),
-      user_id: t.Number()
+      conversation_id: t.String(),
+      user_id: t.String()
     })
   })
 
@@ -679,7 +678,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     }),
     query: t.Object({
       page: t.Optional(t.Number({ minimum: 1, default: 1 })),
@@ -721,7 +720,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }
   }, {
     params: t.Object({
-      community_id: t.Number()
+      community_id: t.String()
     })
   })
 
@@ -753,7 +752,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }
   }, {
     params: t.Object({
-      message_id: t.BigInt()
+      message_id: t.String()
     })
   })
 
@@ -763,7 +762,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     return delete_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     })
   })
 
@@ -773,7 +772,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     return revive_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     })
   })
 
@@ -784,8 +783,8 @@ const admin_routes = new Elysia({ prefix: "/admin" })
 
   }, {
     body: t.Object({
-      conversation_id: t.Number(),
-      member_id: t.Number()
+      conversation_id: t.String(),
+      member_id: t.String()
     })
   })
 
@@ -817,7 +816,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   }, {
     body: t.Object({
       phone: t.String(),
-      user_id: t.Number(),
+      user_id: t.String(),
     })
   });
 

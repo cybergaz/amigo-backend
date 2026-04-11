@@ -9,51 +9,51 @@ const FlexDate = () => t.Union([t.Date(), t.String(), t.Number()]);
 
 // OnlineStatusPayload schema
 const ConnectionStatusPayloadSchema = t.Object({
-  sender_id: t.Number(),
+  sender_id: t.String(),
   status: t.Enum(Object.fromEntries(CONNECTION_STATUS_CONST.map(x => [x, x]))),
 });
 
 // JoinLeavePayload schema
 const JoinLeavePayloadSchema = t.Object({
-  conv_id: t.Number(),
+  conv_id: t.String(),
   conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
-  user_id: t.Number(),
+  user_id: t.String(),
   user_name: t.Optional(t.String()),
 });
 
 // ChatMessagePayload schema
 const ChatMessagePayloadSchema = t.Object({
-  id: t.String(), // Accept as string, convert to bigint after validation
-  sender_id: t.Number(),
+  id: t.String(),
+  sender_id: t.String(),
   sender_name: t.Optional(t.String()),
-  conv_id: t.Number(),
+  conv_id: t.String(),
   conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
   msg_type: t.Enum(Object.fromEntries(MESSAGE_TYPE_CONSTS.map(x => [x, x]))),
   body: t.Optional(t.String()),
   attachments: t.Optional(t.Any()),
-  metadata: t.Optional(t.Any()),
-  reply_to_message_id: t.Optional(t.String()), // Accept as string, convert to bigint after validation
+  replied_to: t.Optional(t.String()),
   sent_at: FlexDate(),
 });
 
 // ChatMessageAckPayload schema
 const ChatMessageAckPayloadSchema = t.Object({
-  id: t.String(), // Accept as string, convert to bigint after validation
-  conv_id: t.Number(),
-  sender_id: t.Number(),
+  id: t.String(),
+  conv_id: t.String(),
+  sender_id: t.String(),
   delivered_at: FlexDate(),
-  delivered_to: t.Optional(t.Array(t.Number())),
-  read_by: t.Optional(t.Array(t.Number())),
-  offline_users: t.Optional(t.Array(t.Number())),
+  delivered_to: t.Optional(t.Array(t.String())),
+  read_by: t.Optional(t.Array(t.String())),
+  delivered_count: t.Optional(t.Number()),
+  read_count: t.Optional(t.Number()),
   is_failed: t.Optional(t.Boolean()),
   error_code: t.Optional(t.Number()),
-  new_id: t.Optional(t.String()),  // Accept as string, convert to bigint after validation
+  new_id: t.Optional(t.String()),
 });
 
 // TypingPayload schema
 const TypingPayloadSchema = t.Object({
-  conv_id: t.Number(),
-  sender_id: t.Number(),
+  conv_id: t.String(),
+  sender_id: t.String(),
   sender_name: t.Optional(t.String()),
   sender_pfp: t.Optional(t.String()),
   is_typing: t.Boolean(),
@@ -61,14 +61,14 @@ const TypingPayloadSchema = t.Object({
 
 // DeleteMessagePayload schema
 const DeleteMessagePayloadSchema = t.Object({
-  conv_id: t.Number(),
-  sender_id: t.Number(),
-  message_ids: t.Array(t.String()), // Accept as string array, convert to bigint array after validation
+  conv_id: t.String(),
+  sender_id: t.String(),
+  message_ids: t.Array(t.String()),
 });
 
 // MembersType schema
 const MembersTypeSchema = t.Object({
-  user_id: t.Number(),
+  user_id: t.String(),
   user_name: t.String(),
   user_pfp: t.Optional(t.String()),
   role: t.Enum(Object.fromEntries(CHAT_ROLE_CONST.map(x => [x, x]))),
@@ -77,10 +77,10 @@ const MembersTypeSchema = t.Object({
 
 // NewConversationPayload schema
 const NewConversationPayloadSchema = t.Object({
-  conv_id: t.Number(),
+  conv_id: t.String(),
   conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
   title: t.Optional(t.String()),
-  creater_id: t.Number(),
+  creater_id: t.String(),
   creater_name: t.String(),
   creater_phone: t.String(),
   creater_pfp: t.Optional(t.String()),
@@ -98,11 +98,11 @@ const MiscPayloadSchema = t.Object({
 
 // CallPayload schema
 const CallPayloadSchema = t.Object({
-  call_id: t.Optional(t.Number()),
-  caller_id: t.Number(),
+  call_id: t.Optional(t.String()),
+  caller_id: t.String(),
   caller_name: t.Optional(t.String()),
   caller_pfp: t.Optional(t.String()),
-  callee_id: t.Number(),
+  callee_id: t.String(),
   callee_name: t.Optional(t.String()),
   callee_pfp: t.Optional(t.String()),
   callType: t.Optional(t.Enum({ audio: "audio", video: "video", })),
@@ -113,10 +113,10 @@ const CallPayloadSchema = t.Object({
 
 // MessagePinPayload schema
 const MessagePinPayloadSchema = t.Object({
-  conv_id: t.Number(),
-  message_id: t.String(), // Accept as string, convert to bigint after validation
+  conv_id: t.String(),
+  message_id: t.String(),
   message_type: t.Enum(Object.fromEntries(MESSAGE_TYPE_CONSTS.map(x => [x, x]))),
-  sender_id: t.Number(),
+  sender_id: t.String(),
   sender_name: t.Optional(t.String()),
   sender_pfp: t.Optional(t.String()),
   pin: t.Boolean(),
@@ -140,17 +140,17 @@ const MessagePinPayloadSchema = t.Object({
 
 // MessageForwardPayload schema
 const MessageForwardPayloadSchema = t.Object({
-  source_conv_id: t.Number(),
-  forwarder_id: t.Number(),
+  source_conv_id: t.String(),
+  forwarder_id: t.String(),
   forwarder_name: t.Optional(t.String()),
-  forwarded_message_ids: t.Array(t.String()), // Accept as string array, convert to bigint array after validation
-  target_conv_ids: t.Array(t.Number()),
+  forwarded_message_ids: t.Array(t.String()),
+  target_conv_ids: t.Array(t.String()),
 });
 
 // ConversationActionPayload schema
 const ConversationActionPayloadSchema = t.Object({
-  event_id: t.Number(),
-  conv_id: t.Number(),
+  event_id: t.String(),
+  conv_id: t.String(),
   conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
   action: t.Enum({
     member_added: "member_added",
@@ -159,7 +159,7 @@ const ConversationActionPayloadSchema = t.Object({
     member_demoted: "member_demoted",
   }),
   members: t.Array(MembersTypeSchema),
-  actor_id: t.Optional(t.Number()),
+  actor_id: t.Optional(t.String()),
   actor_name: t.Optional(t.String()),
   actor_pfp: t.Optional(t.String()),
   message: t.String(),
@@ -168,10 +168,10 @@ const ConversationActionPayloadSchema = t.Object({
 
 // MessageDeliveredPayload schema - for delivery receipts from FCM messages
 const MessageDeliveredPayloadSchema = t.Object({
-  message_id: t.String(), // Accept as string, convert to bigint after validation
-  conv_id: t.Number(),
-  sender_id: t.Number(),
-  recipient_id: t.Number(),
+  message_id: t.String(),
+  conv_id: t.String(),
+  sender_id: t.String(),
+  recipient_id: t.String(),
   delivered_at: FlexDate(),
 });
 

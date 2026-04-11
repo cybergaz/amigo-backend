@@ -18,8 +18,8 @@ type MessageOperationType = typeof MESSAGE_OPERATION_CONSTS[number];
 interface ConversationMetadata {
   // Pin functionality - only one message can be pinned per conversation
   pinned_message?: {
-    message_id: bigint;
-    user_id: number;
+    message_id: string;
+    user_id: string;
     pinned_at: string;
   };
 
@@ -31,24 +31,24 @@ interface ConversationMetadata {
 interface MessageMetadata {
   // Reply functionality
   reply_to?: {
-    message_id: bigint;
-    sender_id: number;
+    message_id: string;
+    sender_id: string;
     body?: string; // Preview of original message
     created_at: string;
   };
 
   // Star functionality - array of users who starred
   starred_by?: Array<{
-    user_id: number;
+    user_id: string;
     starred_at: string;
   }>;
 
   // Forward functionality - track original message info
   forwarded_from?: {
-    original_message_id: bigint;
-    original_conversation_id: number;
-    original_sender_id: number;
-    forwarded_by: number;
+    original_message_id: string;
+    original_conversation_id: string;
+    original_sender_id: string;
+    forwarded_by: string;
     forwarded_at: string;
   };
 
@@ -60,14 +60,14 @@ interface MessageMetadata {
 
   // Mentions
   mentions?: Array<{
-    user_id: number;
+    user_id: string;
     start_index: number;
     end_index: number;
   }>;
 
   // Emoji reactions - map of emoji -> array of user reactions
   reactions?: Record<string, Array<{
-    user_id: number;
+    user_id: string;
     user_name?: string;
     reacted_at: string;
   }>>;
@@ -78,44 +78,43 @@ interface MessageMetadata {
 
 // Request types for bulk operations
 interface BulkMessageOperation {
-  message_ids: bigint[];
+  message_ids: string[];
   operation: MessageOperationType;
-  conversation_id: number;
+  conversation_id: string;
 }
 
 interface PinMessageRequest {
-  message_id: bigint;
-  conv_id: number;
-  user_id: number;
+  message_id: string;
+  conv_id: string;
+  user_id: string;
 }
 
 interface StarMessageRequest {
-  message_ids: bigint[];
-  conversation_id: number;
+  message_ids: string[];
+  conversation_id: string;
 }
 
 interface ReplyMessageRequest {
-  message_id: bigint;
-  reply_to_message_id: bigint;
-  conversation_id: number;
+  message_id: string;
+  reply_to_message_id: string;
+  conversation_id: string;
   body: string;
   attachments?: any[];
 }
 
 interface ForwardMessageRequest {
-  message_ids: bigint[];
-  source_conversation_id: number;
-  target_conversation_ids: number[];
+  message_ids: string[];
+  source_conversation_id: string;
+  target_conversation_ids: string[];
 }
 
 interface DeleteMessageRequest {
-  message_ids: bigint[];
-  conversation_id: number;
-  // delete_for_everyone?: boolean; // true = delete for all, false = delete for me only
+  message_ids: string[];
+  conversation_id: string;
 }
 
 interface MediaMetadataRequest {
-  conversation_id: number;
+  conversation_id: string;
   url: string;
   key: string;
   category: string; // e.g. "images", "docs"
@@ -125,8 +124,8 @@ interface MediaMetadataRequest {
 }
 
 interface ReactMessageRequest {
-  message_id: bigint;
-  conversation_id: number;
+  message_id: string;
+  conversation_id: string;
   emoji: string;
   action: 'add' | 'remove';
 }

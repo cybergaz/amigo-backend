@@ -5,8 +5,9 @@ import { update_user_connection_status } from "@/services/user.services";
 import { socket_connections } from "./socket.server";
 import { batch_insert_message_status, forward_messages, store_message_with_retry } from "@/services/message.services";
 import { get_conversation_members } from "@/services/cache-management/socket.cache";
+import { update_chat_meta, batch_increment_unread } from "@/services/cache-management/chat-meta.cache";
 import db from "@/config/db";
-import { conversation_member_model } from "@/models/chat.model";
+import { chat_member_model } from "@/models/chat.model";
 import { message_model } from "@/models/message.model";
 import { and, eq, sql } from "drizzle-orm";
 import { update_conversation } from "@/services/chat.services";
@@ -15,7 +16,6 @@ import { queue_message_fcm } from "@/services/fcm-batch.service";
 import { ChatType } from "@/types/chat.types";
 import { CALL_TIMEOUT_MS, CallService, active_calls, register_missed_call_notifier } from "@/services/call.service";
 import { call_model } from "@/models/call.model";
-import { convertBigIntToString } from "@/utils/serialization.utils";
 
 const handle_connection_status = async (payload: ConnectionStatusPayload): Promise<ResultType> => {
   try {
@@ -173,7 +173,6 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       }),  // update message ID if it was changed during retry
       delivered_to: sent_result.online,
       read_by: sent_result.active_in_conv,
-      offline_users: sent_result.offline,
     };
 
     // send ack to sender along with message delivery status
@@ -188,97 +187,82 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       },
     });
 
-    // Create message statuses for all conversation members (except sender)
+    // ── Fire-and-forget: Redis caches, DB status inserts, FCM ───────────
+    // These run after the sender ACK is sent — latency-insensitive work.
     if (store_msg_result.data) {
       const conv_members = await get_conversation_members(payload.conv_id);
-      const message_statuses: Array<{ user_id: number; message_id: bigint; conv_id: number; delivered_at: Date | null; read_at: Date | null; }> = [];
+      const now = new Date();
 
+      // 1. Update Redis chat_meta (last message display data)
+      update_chat_meta(payload.conv_id, {
+        id: store_msg_result.data.id,
+        body: payload.body ?? "",
+        type: payload.msg_type,
+        sender_id: payload.sender_id,
+        sender_name: payload.sender_name ?? "",
+        sent_at: now.toISOString(),
+      });
+
+      // 2. Increment unread for offline + online-but-not-active members via Redis pipeline
+      const unread_user_ids = [...sent_result.offline, ...sent_result.online]
+        .filter(id => id !== payload.sender_id);
+      if (unread_user_ids.length > 0) {
+        batch_increment_unread(unread_user_ids, payload.conv_id);
+      }
+
+      // 3. Batch insert message_info rows for delivery tracking
+      const message_statuses: Array<{ user_id: string; message_id: string; chat_id: string; delivered_at: Date | null; read_at: Date | null; }> = [];
       for (const member_id of conv_members) {
         if (member_id !== payload.sender_id) {
-
-          // const is_member_online = socket_connections.has(member_id);
-          // const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === member_id;
-
           message_statuses.push({
             user_id: member_id,
             message_id: store_msg_result.data.id,
-            conv_id: payload.conv_id,
-            delivered_at: sent_result.online.includes(member_id) ? new Date() : null,
-            read_at: sent_result.active_in_conv.includes(member_id) ? new Date() : null,
+            chat_id: payload.conv_id,
+            delivered_at: sent_result.online.includes(member_id) ? now : null,
+            read_at: sent_result.active_in_conv.includes(member_id) ? now : null,
           });
         }
       }
-
-      // Batch insert message statuses for all recipients
       if (message_statuses.length > 0) {
-        await batch_insert_message_status(message_statuses);
+        batch_insert_message_status(message_statuses);
       }
 
-      // Special handling for DMs: update message status in messages table
-      if (payload.conv_type === "dm") {
-        const copy_conv_member = [...conv_members];
-
-        const reciepient_id = Array.from(copy_conv_member)[0] == payload.sender_id
-          ? Array.from(copy_conv_member)[1]   // for DMs only
-          : Array.from(copy_conv_member)[0];
-        if (reciepient_id) {
-          // update message status in messages table (for DMs)
-          await db.update(message_model).set({
-            status: sent_result.active_in_conv.includes(reciepient_id)
-              ? "read"
-              : sent_result.online.includes(reciepient_id)
-                ? "delivered"
-                : "sent"
-          }).where(
-            and(
-              eq(message_model.id, store_msg_result.data.id),
-              eq(message_model.conversation_id, payload.conv_id)
-            )
-          );
-        }
-      }
-
+      // 4. Update chat_member delivery/read cursors
       const offline_and_inactive_users = new Set([...sent_result.offline, ...sent_result.online]);
       for (const user_id of offline_and_inactive_users) {
-        // update conversation member model
-        await db.update(conversation_member_model)
+        db.update(chat_member_model)
           .set({
-            unread_count: sql`${conversation_member_model.unread_count} + 1`,
-            last_delivered_message_id: sent_result.online.includes(user_id) || sent_result.active_in_conv.includes(user_id)
+            last_delivered_msg_id: sent_result.online.includes(user_id) || sent_result.active_in_conv.includes(user_id)
               ? store_msg_result.data.id
-              : sql`${conversation_member_model.last_delivered_message_id}`,
-            last_read_message_id: sent_result.active_in_conv.includes(user_id)
+              : sql`${chat_member_model.last_delivered_msg_id}`,
+            last_read_msg_id: sent_result.active_in_conv.includes(user_id)
               ? store_msg_result.data.id
-              : sql`${conversation_member_model.last_read_message_id}`,
+              : sql`${chat_member_model.last_read_msg_id}`,
           })
           .where(
             and(
-              eq(conversation_member_model.conversation_id, payload.conv_id),
-              eq(conversation_member_model.user_id, user_id)
+              eq(chat_member_model.chat_id, payload.conv_id),
+              eq(chat_member_model.user_id, user_id)
             )
           );
       }
     }
 
-    // update conversaion's last_message metadata and last_updated_at
-    const res = await update_conversation({
+    // 5. Update conversation's last_msg_id and last_msg_at (fire-and-forget)
+    update_conversation({
       id: payload.conv_id,
-      metadata: { last_message: store_msg_result?.data },
-      last_message_at: new Date()
+      last_msg_id: store_msg_result.data?.id,
+      last_msg_at: new Date()
     });
 
-    // send fcm notification to offline users
-    // Convert bigint IDs to strings before sending to FCM (JSON.stringify cannot serialize BigInt)
+    // 6. Queue FCM for offline users
     const fcm_ws_message: WSMessage = {
       type: "message:new",
       payload: updated_message_payload,
       ws_timestamp: new Date()
     };
-    const serialized_fcm_message = convertBigIntToString(fcm_ws_message);
-
-    // Queue each offline user's message into the batch (5s window / 4 msgs / 4KB)
     for (const user_id of sent_result.offline) {
-      await queue_message_fcm(user_id, serialized_fcm_message);
+      queue_message_fcm(user_id, fcm_ws_message);
     }
 
     return {
@@ -310,7 +294,7 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
 
     if (forward_res.success && forward_res.data) {
       // Collect all message status records for batch insert
-      const all_message_statuses: Array<{ user_id: number; message_id: bigint; conv_id: number; delivered_at: Date | null; read_at: Date | null; }> = [];
+      const all_message_statuses: Array<{ user_id: string; message_id: string; chat_id: string; delivered_at: Date | null; read_at: Date | null; }> = [];
 
       // loop on all target conversations (use for...of to properly await)
       for (const [conv_id, all_msgs_for_conv] of forward_res.data.entries()) {
@@ -322,14 +306,13 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
         for (const msg of all_msgs_for_conv) {
           const new_chat_msg_payload: ChatMessagePayload = {
             id: msg.id,
-            sender_id: msg.sender_id,
+            sender_id: msg.sender_id ?? payload.forwarder_id,
             sender_name: payload.forwarder_name || username ? String(username) : undefined,
             conv_id: conv_id,
             conv_type: msg.conv_type as ChatType,
             msg_type: msg.type,
             body: msg.body || undefined,
             attachments: msg.attachments,
-            metadata: msg.metadata,
             sent_at: msg.sent_at ? msg.sent_at : new Date(),
           };
 
@@ -350,12 +333,12 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
             if (member_id !== payload.forwarder_id) {
 
               const is_member_online = socket_connections.has(member_id);
-              const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === member_id;
+              const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === conv_id;
 
               all_message_statuses.push({
                 user_id: member_id,
                 message_id: msg.id,
-                conv_id: conv_id,
+                chat_id: conv_id,
                 delivered_at: is_member_online ? new Date() : null,
                 read_at: is_member_in_conv ? new Date() : null,
               });
@@ -371,17 +354,16 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
           if (dateA !== dateB) {
             return dateA - dateB;
           } else {
-            return Number(a.id) - Number(b.id);
+            return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
           }
         });
 
-        // update the message of conversation
+        // update the conversation's last message
+        const last_msg = all_msgs_for_conv[all_msgs_for_conv.length - 1];
         await update_conversation({
           id: conv_id,
-          metadata: {
-            last_message: all_msgs_for_conv[all_msgs_for_conv.length - 1]
-          },
-          last_message_at: new Date()
+          last_msg_id: last_msg.id,
+          last_msg_at: new Date()
         });
 
       }
@@ -412,19 +394,19 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
   }
 };
 
-const handle_call_init = async (payload: CallPayload, user_id: number, user_name?: string, user_pfp?: string): Promise<ResultType> => {
+const handle_call_init = async (payload: CallPayload, user_id: string, user_name?: string, user_pfp?: string): Promise<ResultType> => {
   try {
     // For call initiation, we typically just need to validate the payload and then the offer/answer/ice messages will be forwarded as is
 
     const result = await CallService.initiate_call(
-      payload.caller_id || Number(user_id),
+      payload.caller_id || user_id,
       payload.callee_id
     );
 
     // acknowledgment payload
     const call_init_payload: CallPayload = {
       call_id: result.data?.call_id,
-      caller_id: payload.caller_id || Number(user_id),
+      caller_id: payload.caller_id || user_id,
       caller_name: payload.caller_name || user_name,
       caller_pfp: payload.caller_pfp || undefined,
       callee_id: payload.callee_id,
@@ -453,7 +435,7 @@ const handle_call_init = async (payload: CallPayload, user_id: number, user_name
       // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
       await broadcast_message({
         to: "users",
-        user_ids: [payload.caller_id || Number(user_id)],
+        user_ids: [payload.caller_id || user_id],
         message: {
           type: "call:init:ack",
           payload: call_init_payload,
@@ -494,7 +476,7 @@ const handle_call_init = async (payload: CallPayload, user_id: number, user_name
       // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
       await broadcast_message({
         to: "users",
-        user_ids: [payload.caller_id || Number(user_id)],
+        user_ids: [payload.caller_id || user_id],
         message: {
           type: "call:error",
           payload: {
@@ -528,7 +510,7 @@ const handle_call_init = async (payload: CallPayload, user_id: number, user_name
   }
 };
 
-const handle_call_signaling = async (payload: CallPayload, event_type: WSMessageEventsType, user_id: number): Promise<ResultType> => {
+const handle_call_signaling = async (payload: CallPayload, event_type: WSMessageEventsType, user_id: string): Promise<ResultType> => {
 
   try {
     if (!payload.call_id && !payload.data) {
@@ -549,7 +531,7 @@ const handle_call_signaling = async (payload: CallPayload, event_type: WSMessage
     };
 
     // Determine the recipient based on message type and sender
-    let recipient_id: number;
+    let recipient_id: string;
     if (event_type === 'call:offer') {
       // Offer goes from caller to callee
       recipient_id = payload.callee_id;
@@ -590,7 +572,7 @@ const handle_call_signaling = async (payload: CallPayload, event_type: WSMessage
   }
 };
 
-const handle_call_accept = async (payload: CallPayload, user_id: number): Promise<ResultType> => {
+const handle_call_accept = async (payload: CallPayload, user_id: string): Promise<ResultType> => {
   try {
     if (!payload.call_id) {
       console.error("call_id missing in call:accept payload");
@@ -684,7 +666,7 @@ const handle_call_accept = async (payload: CallPayload, user_id: number): Promis
 const handle_call_termination = async (
   payload: CallPayload,
   ws_event_type: WSMessageEventsType,
-  user_id: number,
+  user_id: string,
   // reason: CallEndReasonsType
 ): Promise<ResultType> => {
   try {
@@ -824,12 +806,12 @@ register_missed_call_notifier(async (callee_id, call_id, caller_id) => {
   });
 });
 
-const handle_call_hold = async (payload: CallPayload, user_id: number): Promise<ResultType> => {
+const handle_call_hold = async (payload: CallPayload, user_id: string): Promise<ResultType> => {
   try {
     if (!payload.call_id) {
       return { success: false, code: 400, message: "call_id missing in call:hold payload" };
     }
-    const active_call = active_calls.get(Number(payload.call_id));
+    const active_call = active_calls.get(payload.call_id);
     if (!active_call) {
       return { success: false, code: 404, message: "Active call not found for call:hold" };
     }

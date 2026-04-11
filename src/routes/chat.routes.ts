@@ -4,7 +4,7 @@ import { get_chat_list, get_conversation_history, get_message_statuses, get_mess
 import { dm_delete_status } from "@/services/chat-dm.service";
 
 const chat_routes = new Elysia({ prefix: "/chat" })
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
@@ -35,20 +35,18 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     const history_result = await get_conversation_history(
       params.conversation_id,
       store.id,
-      query.page,
       query.limit,
-      query.before_message_id ? BigInt(query.before_message_id) : undefined,
-      query.after_message_id  ? BigInt(query.after_message_id)  : undefined,
+      query.before_message_id,
+      query.after_message_id,
     );
 
     set.status = history_result.code;
     return history_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     }),
     query: t.Object({
-      page:              t.Optional(t.Number({ minimum: 1, default: 1 })),
       limit:             t.Optional(t.Number({ minimum: 1, maximum: 500, default: 20 })),
       before_message_id: t.Optional(t.String()),
       after_message_id:  t.Optional(t.String()),
@@ -58,7 +56,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   .get("/get-messages-around/:conversation_id/:message_id", async ({ set, store, params, query }) => {
     const result = await get_messages_around(
       params.conversation_id,
-      BigInt(params.message_id),
+      params.message_id,
       store.id,
       query.before,
       query.after
@@ -67,7 +65,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     return result;
   }, {
     params: t.Object({
-      conversation_id: t.Number(),
+      conversation_id: t.String(),
       message_id: t.String()
     }),
     query: t.Object({
@@ -87,7 +85,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     return statuses_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     }),
     query: t.Object({
       page: t.Optional(t.Number({ minimum: 1, default: 1 })),
@@ -101,7 +99,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     return delete_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     })
   })
 
@@ -111,7 +109,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     return delete_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     })
   });
 

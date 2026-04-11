@@ -8,8 +8,8 @@ import { update_user_details } from "@/services/user.services";
 import { start_cleanup_cron, stop_cleanup_cron } from "@/services/cache-management/polling.cache";
 
 // Connection maps for different transport types
-const socket_connections = new Map<number, UserConnection>(); // user_id -> UserConnection (WebSocket)
-const polling_connections = new Map<number, PollingConnection>(); // user_id -> UserConnection (WebSocket)
+const socket_connections = new Map<string, UserConnection>(); // user_id -> UserConnection (WebSocket)
+const polling_connections = new Map<string, PollingConnection>(); // user_id -> PollingConnection
 
 // configuration
 // Heartbeat: client pings every 12s, server checks every 15s, 2 missed = ~24-27s detection
@@ -135,9 +135,7 @@ const web_socket_server = new Elysia({
         // update the online status of user in the DB
         const user_res = await update_user_details(user_id,
           {
-            online_status: true,
-            connection_status: "foreground",
-            last_seen: new Date()
+            last_seen: new Date(),
           });
 
         // insert user_name into WebSocket data using type-safe helper
@@ -207,9 +205,9 @@ const web_socket_server = new Elysia({
 
       // heavy lifting is done in the handler
       await socket_message_handler({
-        user_id: Number(get_ws_data(ws, "user_id")),
-        user_name: String(get_ws_data(ws, "user_name")),
-        user_pfp: String(get_ws_data(ws, "user_pfp"))
+        user_id: get_ws_data(ws, "user_id") as string,
+        user_name: get_ws_data(ws, "user_name") as string,
+        user_pfp: get_ws_data(ws, "user_pfp") as string,
       }, message as WSMessage);
     },
     // idleTimeout: 60, // x seconds of inactivity before closing the connection
@@ -223,7 +221,7 @@ const web_socket_server = new Elysia({
     // },
 
     close: async (ws) => {
-      const user_id = Number(get_ws_data(ws, "user_id"));
+      const user_id = get_ws_data(ws, "user_id") as string;
       if (user_id) {
         socket_connections.delete(user_id);
 
@@ -255,7 +253,7 @@ const web_socket_server = new Elysia({
           });
 
           // update the online status of user in the DB
-          await update_user_details(user_id, { online_status: false, last_seen: new Date() });
+          await update_user_details(user_id, { last_seen: new Date() });
 
           // const stats = getConnectionStats();
           // console.log(`[CONNECTION-DISCONNECT] ${JSON.stringify({
@@ -342,7 +340,7 @@ function startHeartbeat() {
           console.error(`[WS-HEARTBEAT] Error notifying about stale connection for user ${user_id}:`, e);
         }
 
-        await update_user_details(user_id, { online_status: false, last_seen: new Date() });
+        await update_user_details(user_id, { last_seen: new Date() });
         console.log(`[WS-HEARTBEAT] Cleaned up stale connection for user ${user_id}. Total connections: ${socket_connections.size}`);
       }
     });
@@ -362,7 +360,7 @@ function stopHeartbeat() {
 }
 
 // Handle pong response from client - reset missed ping counter
-function handlePongResponse(user_id: number) {
+function handlePongResponse(user_id: string) {
   const connection = socket_connections.get(user_id);
   if (connection) {
     connection.last_pong_received = new Date();
@@ -410,7 +408,7 @@ function getConnectionStats() {
 // Log detailed connection error with context
 function logConnectionError(
   context: string,
-  user_id: number | undefined,
+  user_id: string | undefined,
   client_ip: string | undefined,
   error: any,
   additional_info?: Record<string, any>
@@ -432,7 +430,7 @@ function logConnectionError(
 // Log successful connection with diagnostics
 function logConnectionSuccess(
   transport: 'ws' | 'polling',
-  user_id: number,
+  user_id: string,
   client_ip: string,
   additional_info?: Record<string, any>
 ) {

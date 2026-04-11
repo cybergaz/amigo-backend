@@ -1,85 +1,79 @@
 import db from "@/config/db";
-import {
-  conversation_model,
-  conversation_member_model,
-} from "@/models/chat.model";
+import { chat_model, chat_member_model } from "@/models/chat.model";
 import { user_model } from "@/models/user.model";
-import { create_dm_key, create_unique_id } from "@/utils/general.utils";
-import { and, eq, } from "drizzle-orm";
+import { create_unique_id } from "@/utils/general.utils";
+import { and, eq, exists, isNull } from "drizzle-orm";
 import { redis } from "@/config/redis";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { NewConversationPayload } from "@/types/socket.types";
 import { socket_connections } from "@/sockets/socket.server";
 
-const create_dm = async (sender_id: number, receiver_id: number) => {
+const create_dm = async (sender_id: string, receiver_id: string) => {
   try {
-    const dm_key = create_dm_key(sender_id, receiver_id)
-
+    // Find existing DM between these two users via EXISTS subqueries (dm_key column removed)
     const existingChat = await db
-      .select({ conversation_id: conversation_model.id })
-      .from(conversation_model)
+      .select({ id: chat_model.id })
+      .from(chat_model)
       .where(
         and(
-          eq(conversation_model.type, "dm"),
-          eq(conversation_model.dm_key, dm_key)
+          eq(chat_model.type, "dm"),
+          isNull(chat_model.deleted_at),
+          exists(
+            db.select().from(chat_member_model).where(
+              and(
+                eq(chat_member_model.chat_id, chat_model.id),
+                eq(chat_member_model.user_id, sender_id),
+                isNull(chat_member_model.removed_at)
+              )
+            )
+          ),
+          exists(
+            db.select().from(chat_member_model).where(
+              and(
+                eq(chat_member_model.chat_id, chat_model.id),
+                eq(chat_member_model.user_id, receiver_id),
+                isNull(chat_member_model.removed_at)
+              )
+            )
+          )
         )
-      );
+      )
+      .limit(1);
 
     if (existingChat.length > 0) {
       return {
         success: true,
         code: 200,
         data: {
-          id: existingChat[0].conversation_id,
+          id: existingChat[0].id,
           existing: true
         },
       };
     }
 
     const [chat] = await db
-      .insert(conversation_model)
+      .insert(chat_model)
       .values({
         id: create_unique_id(),
         creater_id: sender_id,
         type: "dm",
-        dm_key: dm_key,
       })
       .returning();
 
-    // Insert both members in conversation_member_model
-    await db.insert(conversation_member_model).values([
+    // Insert both members
+    await db.insert(chat_member_model).values([
       {
-        conversation_id: chat.id,
+        chat_id: chat.id,
         user_id: sender_id,
       },
       {
-        conversation_id: chat.id,
+        chat_id: chat.id,
         user_id: receiver_id,
       },
     ]);
 
-    // // -----------------------------------------------------------------------------------
-    // // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
-    // // -----------------------------------------------------------------------------------
-    // await db.insert(message_model).values({
-    //   conversation_id: chat.id,
-    //   sender_id: sender_id,
-    //   type: "system",
-    //   body: "chat initiated",
-    // });
-    // // await db.insert(message_model).values({
-    // //   conversation_id: chat.id,
-    // //   sender_id: sender_id,
-    // //   type: "system",
-    // //   body: "chat initiated 2",
-    // // });
-    // // -----------------------------------------------------------------------------------
-    // // TEMPORARY HACK FOR THAT FIRST MESSAGE DISSAPPEAR ISSUE
-    // // -----------------------------------------------------------------------------------
-
     // Send notification to receiver about new DM
     try {
-      // Get sender info for notification
       const [sender] = await db
         .select({ name: user_model.name, phone: user_model.phone, profile_pic: user_model.profile_pic })
         .from(user_model)
@@ -89,19 +83,17 @@ const create_dm = async (sender_id: number, receiver_id: number) => {
       if (sender) {
         // update redis entries
         const redis_key = `conv:${chat.id}:members`;
-        const new_members_id = [receiver_id, sender_id].map(id => id.toString());
-        await redis.sadd(redis_key, ...new_members_id);
+        await redis.sadd(redis_key, receiver_id, sender_id);
 
         // Invalidate conversation lru cache in other services
-        await redis.publish("conv:invalidate", chat.id.toString());
+        await redis.publish("conv:invalidate", chat.id);
 
         // mark the creater as active in conversation in socket connection if online
-        const conn = socket_connections.get(sender_id)
+        const conn = socket_connections.get(sender_id);
         if (conn && conn.ws.readyState === 1) {
           conn.active_conv_id = chat.id;
         }
 
-        // Prepare payload and broadcast to online users about new conversation
         const new_conversation_payload: NewConversationPayload = {
           conv_id: chat.id,
           conv_type: "dm",
@@ -110,7 +102,7 @@ const create_dm = async (sender_id: number, receiver_id: number) => {
           creater_phone: sender.phone || "",
           creater_pfp: sender.profile_pic || undefined,
           joined_at: new Date(),
-        }
+        };
 
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         await broadcast_message({
@@ -121,11 +113,10 @@ const create_dm = async (sender_id: number, receiver_id: number) => {
             payload: new_conversation_payload,
             ws_timestamp: new Date()
           },
-        })
+        });
       }
     } catch (error) {
       console.error('Error sending conversation_added notification for DM:', error);
-      // Don't fail the request if notification fails
     }
 
     return {
@@ -144,15 +135,15 @@ const create_dm = async (sender_id: number, receiver_id: number) => {
   }
 };
 
-const dm_delete_status = async (conversation_id: number, user_id: number, status: boolean) => {
+const dm_delete_status = async (conversation_id: string, user_id: string, status: boolean) => {
   try {
     const [conversation] = await db
-      .update(conversation_member_model)
-      .set({ deleted: status })
+      .update(chat_member_model)
+      .set({ removed_at: status ? new Date() : null })
       .where(
         and(
-          eq(conversation_member_model.conversation_id, conversation_id),
-          eq(conversation_member_model.user_id, user_id)
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, user_id)
         )
       )
       .returning();
@@ -163,7 +154,7 @@ const dm_delete_status = async (conversation_id: number, user_id: number, status
         code: 404,
         message: "Conversation not found",
         data: { conversation_id, deleted: false },
-      }
+      };
     }
 
     return {
@@ -185,4 +176,4 @@ const dm_delete_status = async (conversation_id: number, user_id: number, status
 export {
   create_dm,
   dm_delete_status,
-}
+};

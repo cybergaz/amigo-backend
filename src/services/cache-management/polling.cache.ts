@@ -5,7 +5,6 @@ import db from "@/config/db";
 import { missed_ws_messages_model } from "@/models/message.model";
 import { VITAL_WS_EVENTS_CONST, VitalWSMessage, VitalWSMessageEventsType, WSMessage, WSMessageEventsType } from "@/types/socket.types";
 import { eq, and, lt, asc, gt } from "drizzle-orm";
-import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 import Snowflake from "@/utils/snowflake.utils";
 
 // ============================================================================
@@ -34,11 +33,19 @@ const MAX_MESSAGES_PER_USER = 500;            // cap per-user queue in Redis/LRU
 
 // --- Tier 1: LRU in-memory cache ---
 // user_id → Map<message_id, CachedPollMessage> for O(1) dedup by message_id
-const polling_lru = new LRUCache<number, Map<string, CachedPollMessage>>(5000, LRU_TTL_MS);
+const polling_lru = new LRUCache<string, Map<string, CachedPollMessage>>(5000, LRU_TTL_MS);
+
+// --- Delayed DB write timers ---
+// Key: "user_id:message_id" → timer handle. If remove_pending_message is called
+// before the timer fires, clearTimeout() cancels the DB write entirely.
+// This means truly online users (who ACK within 10s) never touch the DB.
+const DB_WRITE_DELAY_MS = 10_000; // 10 seconds
+const pending_db_timers = new Map<string, ReturnType<typeof setTimeout>>();
+const db_timer_key = (user_id: string, message_id: string) => `${user_id}:${message_id}`;
 
 // --- Helper: Redis key for a user's pending poll messages ---
 // NOTE: Using _v2 suffix to avoid WRONGTYPE conflicts with old Set-typed keys
-const redis_poll_key = (user_id: number) => `poll:user:${user_id}:messages_v2`;
+const redis_poll_key = (user_id: string) => `poll:user:${user_id}:messages_v2`;
 
 // --- Guard: check if event type is allowed for polling cache ---
 const is_allowed_event = (event_type: WSMessageEventsType): event_type is VitalWSMessageEventsType => {
@@ -50,7 +57,7 @@ const is_allowed_event = (event_type: WSMessageEventsType): event_type is VitalW
 // Writes to ALL three tiers simultaneously (fan-out).
 // ============================================================================
 async function store_pending_message(
-  user_id: number,
+  user_id: string,
   ws_message: VitalWSMessage,
 ): Promise<void> {
   if (!is_allowed_event(ws_message.type)) {
@@ -60,8 +67,6 @@ async function store_pending_message(
   const pending_message_id = Snowflake.correlationId(user_id, ws_message.type, (ws_message.payload as any).id || (ws_message.payload as any).message_id);
   const now = Date.now();
 
-  // Convert BigInt IDs to strings in the message payload for safe serialization/storage
-  const serialized_ws_message = convertBigIntToString(ws_message);
   const entry: CachedPollMessage = {
     message_id: pending_message_id,
     ws_message,
@@ -79,37 +84,34 @@ async function store_pending_message(
   }
   polling_lru.set(user_id, existing, LRU_TTL_MS);
 
-  // --- Tier 2 + 3: Redis & DB in parallel (fire-and-forget, errors logged) ---
-  const redis_promise = (async () => {
-    try {
-      const key = redis_poll_key(user_id);
-      // HSET: field=message_id, value=JSON — deduplicates by message_id automatically
-      await redis.hset(key, pending_message_id, JSON.stringify({
-        ...entry,
-        ws_message: serialized_ws_message,
-      }));
-      // Trim to cap (remove oldest by created_at)
-      const hash_len = await redis.hlen(key);
-      if (hash_len > MAX_MESSAGES_PER_USER) {
-        const all = await redis.hgetall(key);
-        const sorted = Object.entries(all).sort((a, b) => {
-          const pa = JSON.parse(a[1]) as CachedPollMessage;
-          const pb = JSON.parse(b[1]) as CachedPollMessage;
-          return pa.created_at - pb.created_at;
-        });
-        const to_delete = sorted.slice(0, hash_len - MAX_MESSAGES_PER_USER).map(([id]) => id);
-        if (to_delete.length > 0) {
-          await redis.hdel(key, ...to_delete);
-        }
+  // --- Tier 2: Redis (immediate) ---
+  try {
+    const key = redis_poll_key(user_id);
+    await redis.hset(key, pending_message_id, JSON.stringify(entry));
+    // Trim to cap (remove oldest by created_at)
+    const hash_len = await redis.hlen(key);
+    if (hash_len > MAX_MESSAGES_PER_USER) {
+      const all = await redis.hgetall(key);
+      const sorted = Object.entries(all).sort((a, b) => {
+        const pa = JSON.parse(a[1]) as CachedPollMessage;
+        const pb = JSON.parse(b[1]) as CachedPollMessage;
+        return pa.created_at - pb.created_at;
+      });
+      const to_delete = sorted.slice(0, hash_len - MAX_MESSAGES_PER_USER).map(([id]) => id);
+      if (to_delete.length > 0) {
+        await redis.hdel(key, ...to_delete);
       }
-      // Set/refresh TTL
-      await redis.expire(key, REDIS_TTL_SECONDS);
-    } catch (err) {
-      console.error(`[POLL-CACHE] Redis write error for user ${user_id}:`, err);
     }
-  })();
+    await redis.expire(key, REDIS_TTL_SECONDS);
+  } catch (err) {
+    console.error(`[POLL-CACHE] Redis write error for user ${user_id}:`, err);
+  }
 
-  const db_promise = (async () => {
+  // --- Tier 3: DB (delayed — skip if user comes online within 10s) ---
+  const tk = db_timer_key(user_id, pending_message_id);
+  if (pending_db_timers.has(tk)) clearTimeout(pending_db_timers.get(tk)!);
+  const timer = setTimeout(async () => {
+    pending_db_timers.delete(tk);
     try {
       await db
         .insert(missed_ws_messages_model)
@@ -117,27 +119,26 @@ async function store_pending_message(
           id: pending_message_id,
           user_id,
           event_type: ws_message.type,
-          ws_message: serialized_ws_message,
+          ws_message,
         })
         .onConflictDoUpdate({
           target: missed_ws_messages_model.id,
           set: {
             user_id,
             event_type: ws_message.type,
-            ws_message: serialized_ws_message,
+            ws_message,
           }
         });
     } catch (err) {
       console.error(`[POLL-CACHE] DB write error for user ${user_id}:`, err);
     }
-  })();
-
-  await Promise.allSettled([redis_promise, db_promise]);
+  }, DB_WRITE_DELAY_MS);
+  pending_db_timers.set(tk, timer);
 }
 
 // Store for multiple users at once (batch convenience)
 async function store_pending_message_for_users(
-  user_ids: number[],
+  user_ids: string[],
   ws_message: VitalWSMessage,
 ): Promise<void> {
   if (!is_allowed_event(ws_message.type)) return;
@@ -155,7 +156,7 @@ async function store_pending_message_for_users(
 // After reading, messages are cleared from all tiers.
 // ============================================================================
 async function fetch_pending_messages(
-  user_id: number,
+  user_id: string,
   after_message_id?: string,
 ): Promise<CachedPollMessage[]> {
 
@@ -175,11 +176,8 @@ async function fetch_pending_messages(
       if (raw_hash && Object.keys(raw_hash).length > 0) {
         for (const [msg_id, str] of Object.entries(raw_hash)) {
           try {
-            const parsed = JSON.parse(str);
-            messages.set(msg_id, {
-              ...parsed,
-              ws_message: convertStringToBigInt(parsed.ws_message) as VitalWSMessage,
-            });
+            const parsed = JSON.parse(str) as CachedPollMessage;
+            messages.set(msg_id, parsed);
           } catch (err) {
             console.error(`[POLL-CACHE] Error parsing Redis message for user ${user_id}:`, err);
           }
@@ -202,7 +200,7 @@ async function fetch_pending_messages(
         for (const row of db_messages) {
           messages.set(row.id, {
             message_id: row.id,
-            ws_message: convertStringToBigInt(row.ws_message) as VitalWSMessage,
+            ws_message: row.ws_message as VitalWSMessage,
             created_at: new Date(row.created_at).getTime(),
           });
         }
@@ -213,12 +211,9 @@ async function fetch_pending_messages(
   }
 
   // Remove from all 3 tiers upon fetching success (await all removals)
-  // console.log(`[POLL-CACHE] removing ${messages.size} pending messages for user ${user_id} from all tiers...`);
   await Promise.allSettled(
     Array.from(messages.keys()).map(msg_id => remove_pending_message(user_id, msg_id))
   );
-  // console.log(`[POLL-CACHE] removed ${messages.size} pending messages for user ${user_id} from all tiers`);
-  // log_current_cache_state(user_id);
 
   // Filter by after_message_id if provided (cursor-based pagination)
   let result = Array.from(messages.values()).sort((a, b) => a.created_at - b.created_at);
@@ -233,7 +228,14 @@ async function fetch_pending_messages(
 }
 
 // Remove pending message from 3 tiers after successful delivery
-async function remove_pending_message(user_id: number, message_id: string): Promise<void> {
+async function remove_pending_message(user_id: string, message_id: string): Promise<void> {
+  // Cancel delayed DB write if it hasn't fired yet
+  const tk = db_timer_key(user_id, message_id);
+  const timer = pending_db_timers.get(tk);
+  if (timer) {
+    clearTimeout(timer);
+    pending_db_timers.delete(tk);
+  }
 
   // Remove from LRU
   try {
@@ -317,7 +319,7 @@ function stop_cleanup_cron() {
   }
 }
 
-function log_current_cache_state(user_id: number) {
+function log_current_cache_state(user_id: string) {
   const lru_map = polling_lru.get(user_id);
   console.log(`[POLL-CACHE] Current LRU cache for user ${user_id}:`, lru_map?.size ?? 0);
 

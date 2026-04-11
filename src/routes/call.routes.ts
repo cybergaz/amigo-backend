@@ -12,7 +12,7 @@ const call_routes = new Elysia({ prefix: "/call" })
   // ---- Unprotected routes (accessible from background handlers without auth) ----
 
   .get("/status/:call_id", async ({ set, params }) => {
-    const [call_info] = await db.select().from(call_model).where(eq(call_model.id, Number(params.call_id))).limit(1);
+    const [call_info] = await db.select().from(call_model).where(eq(call_model.id, params.call_id)).limit(1);
 
     if (!call_info) {
       set.status = 404;
@@ -33,7 +33,7 @@ const call_routes = new Elysia({ prefix: "/call" })
 
   .post("/accept/:call_id", async ({ set, params }) => {
     try {
-      const callId = Number(params.call_id);
+      const callId = params.call_id;
       const [call_info] = await db.select().from(call_model).where(eq(call_model.id, callId)).limit(1);
 
       if (!call_info) {
@@ -85,7 +85,7 @@ const call_routes = new Elysia({ prefix: "/call" })
 
   .post("/decline/:call_id", async ({ set, params }) => {
     try {
-      const callId = Number(params.call_id);
+      const callId = params.call_id;
 
       // Get call info from database
       const [call_info] = await db.select().from(call_model).where(eq(call_model.id, callId)).limit(1);
@@ -157,7 +157,7 @@ const call_routes = new Elysia({ prefix: "/call" })
 
   // ---- Protected routes (require authentication) ----
 
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });

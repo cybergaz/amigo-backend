@@ -1,19 +1,18 @@
-import { pgTable, bigserial, bigint, timestamp, varchar, integer } from "drizzle-orm/pg-core";
+import { pgTable, bigserial, bigint, timestamp, varchar, integer, uuid } from "drizzle-orm/pg-core";
 import { InferInsertModel, InferSelectModel } from "drizzle-orm";
 import { user_model } from "./user.model";
 import { CALL_END_REASONS_CONSTS, CALL_STATUS_CONSTS } from "@/types/call.types";
 
 export const call_model = pgTable("calls", {
-  id: bigserial({ mode: "number" }).primaryKey(),
-  caller_id: bigint({ mode: "number" }).references(() => user_model.id, { onDelete: 'cascade' }).notNull(),
-  callee_id: bigint({ mode: "number" }).references(() => user_model.id, { onDelete: 'cascade' }).notNull(),
-  started_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
-  answered_at: timestamp({ withTimezone: true }),
-  ended_at: timestamp({ withTimezone: true }),
+  id: uuid().primaryKey().defaultRandom(),
+  caller_id: uuid().references(() => user_model.id, { onDelete: 'cascade' }).notNull(),
+  callee_id: uuid().references(() => user_model.id, { onDelete: 'cascade' }).notNull(),
   duration_seconds: integer().default(0),
   status: varchar({ enum: CALL_STATUS_CONSTS }).notNull(),
   reason: varchar({ enum: CALL_END_REASONS_CONSTS }),
-  created_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
+  started_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
+  answered_at: timestamp({ withTimezone: true }),
+  ended_at: timestamp({ withTimezone: true }),
 });
 
 export type CallType = InferSelectModel<typeof call_model>;

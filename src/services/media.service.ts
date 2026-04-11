@@ -10,7 +10,7 @@ import {
 } from "@/services/s3.service";
 
 export const upload_media_file = async (
-  userId: number,
+  userId: string,
   file: File,
   category?: S3Folder
 ) => {
@@ -113,14 +113,14 @@ export const delete_media_file = async (key: string) => {
 };
 
 // Specific upload functions for different media types
-export const upload_image = (userId: number, file: File) =>
+export const upload_image = (userId: string, file: File) =>
   upload_media_file(userId, file, S3_FOLDERS.IMAGES);
 
-export const upload_audio = (userId: number, file: File) =>
+export const upload_audio = (userId: string, file: File) =>
   upload_media_file(userId, file, S3_FOLDERS.AUDIOS);
 
-export const upload_video = (userId: number, file: File) =>
+export const upload_video = (userId: string, file: File) =>
   upload_media_file(userId, file, S3_FOLDERS.VIDEOS);
 
-export const upload_document = (userId: number, file: File) =>
+export const upload_document = (userId: string, file: File) =>
   upload_media_file(userId, file, S3_FOLDERS.DOCS);

@@ -1,10 +1,9 @@
 import { ElysiaWS } from "elysia/dist/ws";
-import { ChatRoleType, ChatType, MessageStatusType, MessageType } from "./chat.types";
-
+import { ChatRoleType, ChatType, MessageType } from "./chat.types";
 
 // WebSocket data interface for type safety
 interface WebSocketData {
-  user_id?: number;
+  user_id?: string;
   user_name?: string;
   user_pfp?: string;
 }
@@ -16,13 +15,10 @@ type TransportType = 'ws' | 'polling';
 interface UserConnection {
   ws: ElysiaWS;
   connection_status: ConnectionStatusType;
-  active_conv_id?: number;
-  // transport_type: TransportType;
+  active_conv_id?: string;
   last_ping_sent?: Date;
   last_pong_received?: Date;
   missed_pings: number;
-  // last_poll?: Date;
-  // last_poll_message_id?: bigint;
   connected_at: Date;
   client_ip?: string;
 }
@@ -30,9 +26,9 @@ interface UserConnection {
 interface PollingConnection {
   // transport_type: TransportType;
   connection_status: ConnectionStatusType;
-  active_conv_id?: number;
+  active_conv_id?: string;
   last_poll?: Date;
-  last_poll_message_id?: bigint;
+  last_poll_message_id?: string;
   connected_at: Date;
   client_ip?: string;
 }
@@ -77,92 +73,90 @@ const CONNECTION_STATUS_CONST = ['foreground', 'background', 'disconnected', 'st
 type ConnectionStatusType = typeof CONNECTION_STATUS_CONST[number];
 
 type ConnectionStatusPayload = {
-  sender_id: number;
+  sender_id: string;
   status: ConnectionStatusType;
 };
 
 type JoinLeavePayload = {
-  conv_id: number;
+  conv_id: string;
   conv_type: ChatType;
-  user_id: number;
+  user_id: string;
   user_name?: string;
 };
 
 type ChatMessagePayload = {
-  id: bigint;
-  sender_id: number;
+  id: string;
+  sender_id: string;
   sender_name?: string;
-  conv_id: number;
+  conv_id: string;
   conv_type: ChatType;
   msg_type: MessageType;
   body?: string;
   attachments?: any;
-  metadata?: any;
-  reply_to_message_id?: bigint;
+  replied_to?: string;
   sent_at: Date;
 };
 
 type ChatMessageAckPayload = {
-  id: bigint;
-  conv_id: number;
-  sender_id: number;
+  id: string;
+  conv_id: string;
+  sender_id: string;
   delivered_at: Date;
-  delivered_to?: number[];
-  read_by?: number[];
-  offline_users?: number[];
+  delivered_to?: string[];   // optimistic state for DMs (1-element max)
+  read_by?: string[];        // optimistic state for DMs (1-element max)
+  delivered_count?: number;  // optimistic count for groups
+  read_count?: number;       // optimistic count for groups
   is_failed?: boolean;
   error_code?: number;
-  new_id?: bigint;  // In case of message ID change due to retry or edit
+  new_id?: string;  // In case of message ID change due to retry or edit
 };
 
 type TypingPayload = {
-  conv_id: number;
-  sender_id: number;
+  conv_id: string;
+  sender_id: string;
   sender_name?: string;
   sender_pfp?: string;
   is_typing: boolean;
 };
 
 type MessagePinPayload = {
-  conv_id: number;
-  message_id: bigint;
+  conv_id: string;
+  message_id: string;
   message_type: MessageType;
-  sender_id: number;
+  sender_id: string;
   sender_name?: string;
   sender_pfp?: string;
   pin: boolean;
 };
 
 type MessageForwardPayload = {
-  source_conv_id: number;
-  forwarder_id: number;
+  source_conv_id: string;
+  forwarder_id: string;
   forwarder_name?: string;
-  forwarded_message_ids: bigint[];
-  target_conv_ids: number[];
+  forwarded_message_ids: string[];
+  target_conv_ids: string[];
 };
 
 type DeleteMessagePayload = {
-  conv_id: number;
-  sender_id: number;
-  message_ids: bigint[];
+  conv_id: string;
+  sender_id: string;
+  message_ids: string[];
 };
 
 type MessageReactPayload = {
-  message_id: bigint;
-  conv_id: number;
-  sender_id: number;
+  message_id: string;
+  conv_id: string;
+  sender_id: string;
   sender_name?: string;
   emoji: string;
   action: 'add' | 'remove';
-  // Updated full reactions map after this action
-  reactions: Record<string, Array<{ user_id: number; user_name?: string; reacted_at: string; }>>;
 };
 
 type NewConversationPayload = {
-  conv_id: number;
+  conv_id: string;
   conv_type: ChatType;
   title?: string;
-  creater_id: number;
+  creater_id: string;
   creater_name: string;
   creater_phone: string;
   creater_pfp?: string;
@@ -171,7 +165,7 @@ type NewConversationPayload = {
 };
 
 type MembersType = {
-  user_id: number;
+  user_id: string;
   user_name: string;
   user_pfp?: string;
   role: ChatRoleType;
@@ -179,11 +173,11 @@ type MembersType = {
 };
 
 type CallPayload = {
-  call_id?: number;
-  caller_id: number;
+  call_id?: string;
+  caller_id: string;
   caller_name?: string;
   caller_pfp?: string;
-  callee_id: number;
+  callee_id: string;
   callee_name?: string;
   callee_pfp?: string;
   callType?: 'audio' | 'video';
@@ -206,12 +200,12 @@ type ConversationActionType =
   | 'member_demoted';
 
 type ConversationActionPayload = {
-  event_id: number;
-  conv_id: number;
+  event_id: string;
+  conv_id: string;
   conv_type: ChatType;
   action: ConversationActionType;
   members: MembersType[];
-  actor_id?: number;
+  actor_id?: string;
   actor_name?: string;
   actor_pfp?: string;
   message: string;
@@ -242,10 +236,10 @@ type SyncMessagesPayload = {
 
 // Delivery receipt payload - sent by recipient when message is delivered via FCM
 type MessageDeliveredPayload = {
-  message_id: bigint;
-  conv_id: number;
-  sender_id: number;
-  recipient_id: number;
+  message_id: string;
+  conv_id: string;
+  sender_id: string;
+  recipient_id: string;
   delivered_at: Date;
 };
 

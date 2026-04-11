@@ -1,6 +1,6 @@
 import db from "@/config/db";
 import { redis } from "@/config/redis";
-import { conversation_member_model } from "@/models/chat.model";
+import { chat_member_model } from "@/models/chat.model";
 import { UpdateUserType, user_model } from "@/models/user.model";
 import { RoleType } from "@/types/user.types";
 import {
@@ -11,9 +11,9 @@ import {
   parse_phone,
 } from "@/utils/general.utils";
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
-import { eq, and, inArray, ne, sql, or, ilike } from "drizzle-orm";
-import { ConnectionStatusType } from "@/types/socket.types";
+import { eq, and, inArray, isNull, ne, sql, or, ilike } from "drizzle-orm";
 import { store_fcm_token } from "@/services/cache-management/fcm-token.cache";
+import { polling_connections, socket_connections } from "@/sockets/socket.server";
 
 type CreateUserParams = {
   name: string;
@@ -87,7 +87,7 @@ const create_user = async ({
   }
 };
 
-const find_user_by_id = async (id: number) => {
+const find_user_by_id = async (id: string) => {
   try {
     const existing_user = (
       await db.select().from(user_model).where(eq(user_model.id, id)).limit(1)
@@ -130,7 +130,7 @@ const find_user_by_phone = async (phone: string) => {
   }
 };
 
-const get_user_details = async (id: number) => {
+const get_user_details = async (id: string) => {
   try {
     if (!id) {
       return {
@@ -152,7 +152,7 @@ const get_user_details = async (id: number) => {
         created_at: user_model.created_at,
         last_seen: user_model.last_seen,
         call_access: user_model.call_access,
-        online_status: user_model.online_status,
+        // online_status: user_model.online_status,
         location: user_model.location,
         ip_address: user_model.ip_address,
       })
@@ -176,7 +176,7 @@ const get_user_details = async (id: number) => {
   }
 };
 
-const update_user_details = async (id: number, body: UpdateUserType) => {
+const update_user_details = async (id: string, body: UpdateUserType) => {
   try {
     // If fcm_token is being updated, update the cache first
     if (body.fcm_token !== undefined) {
@@ -214,7 +214,7 @@ const update_user_details = async (id: number, body: UpdateUserType) => {
   }
 };
 
-const batch_update_users_details = async (ids: number[], body: UpdateUserType) => {
+const batch_update_users_details = async (ids: string[], body: UpdateUserType) => {
   try {
     const users_details = await db
       .update(user_model)
@@ -274,7 +274,7 @@ const get_all_users = async () => {
   }
 };
 
-const get_available_users = async (self_id: number, phone_numbers: string[]) => {
+const get_available_users = async (self_id: string, phone_numbers: string[]) => {
   // console.log("phone_numbers ->", phone_numbers)
 
   const [self] = await db
@@ -381,7 +381,6 @@ const get_all_users_paginated = async (page: number = 1, limit: number = 10, sea
         created_at: user_model.created_at,
         last_seen: user_model.last_seen,
         call_access: user_model.call_access,
-        online_status: user_model.online_status,
         location: user_model.location,
         ip_address: user_model.ip_address,
         app_version: user_model.app_version,
@@ -423,7 +422,7 @@ const get_all_users_paginated = async (page: number = 1, limit: number = 10, sea
   }
 };
 
-const update_user_role = async (id: number, role: RoleType) => {
+const update_user_role = async (id: string, role: RoleType) => {
   try {
     await db
       .update(user_model)
@@ -446,30 +445,13 @@ const update_user_role = async (id: number, role: RoleType) => {
   }
 };
 
-const update_user_connection_status = async (id: number, status: ConnectionStatusType) => {
-  try {
-    await db
-      .update(user_model)
-      .set({ connection_status: status })
-      .where(eq(user_model.id, id));
+// const update_user_connection_status = async (_id: string, _status: string) => {
+//   // online_status and connection_status columns removed from user model
+//   // Connection status is now tracked only in-memory via socket_connections map
+//   return { success: true, code: 200, message: "No-op: connection status tracked in-memory only" };
+// };
 
-    return {
-      success: true,
-      code: 200,
-      message: "User role updated successfully",
-      data: { id, status },
-    };
-  } catch (error) {
-    return {
-      success: false,
-      code: 500,
-      message: "Failed to update user role",
-      data: null,
-    };
-  }
-};
-
-const update_user_call_access = async (id: number, call_access: boolean) => {
+const update_user_call_access = async (id: string, call_access: boolean) => {
   try {
     await db
       .update(user_model)
@@ -492,7 +474,7 @@ const update_user_call_access = async (id: number, call_access: boolean) => {
   }
 };
 
-const update_profile_image = async (id: number, file: File) => {
+const update_profile_image = async (id: string, file: File) => {
   try {
     if (!id) {
       return {
@@ -583,12 +565,6 @@ const get_dashboard_stats = async () => {
       .select({ count: sql<number>`count(*)` })
       .from(user_model);
 
-    // Get online users count
-    const onlineUsersResult = await db
-      .select({ count: sql<number>`count(*)` })
-      .from(user_model)
-      .where(eq(user_model.online_status, true));
-
     // Get sub admins count
     const subAdminsResult = await db
       .select({ count: sql<number>`count(*)` })
@@ -607,7 +583,7 @@ const get_dashboard_stats = async () => {
       message: "Dashboard statistics fetched successfully",
       data: {
         totalUsers: Number(totalUsersResult[0].count),
-        onlineUsers: Number(onlineUsersResult[0].count),
+        onlineUsers: socket_connections.size + polling_connections.size,
         subAdmins: Number(subAdminsResult[0].count),
         callAccess: Number(callAccessResult[0].count),
       },
@@ -633,7 +609,6 @@ const get_all_admins = async () => {
         role: user_model.role,
         permissions: user_model.permissions,
         created_at: user_model.created_at,
-        online_status: user_model.online_status,
       })
       .from(user_model)
       .where(or(eq(user_model.role, "admin"), eq(user_model.role, "sub_admin")));
@@ -721,7 +696,7 @@ const create_admin_user = async (email: string, password: string, permissions: s
   }
 };
 
-const update_admin_permissions = async (id: number, permissions: string[]) => {
+const update_admin_permissions = async (id: string, permissions: string[]) => {
   try {
     // Check if user exists and is an admin
     const user = await db
@@ -778,71 +753,19 @@ const update_admin_permissions = async (id: number, permissions: string[]) => {
   }
 };
 
-const update_admin_status = async (id: number, active: boolean) => {
-  try {
-    // Check if user exists and is an admin
-    const user = await db
-      .select()
-      .from(user_model)
-      .where(eq(user_model.id, id))
-      .limit(1);
-
-    if (user.length === 0) {
-      return {
-        success: false,
-        code: 404,
-        message: "User not found",
-        data: null,
-      };
-    }
-
-    if (user[0].role !== "sub_admin") {
-      return {
-        success: false,
-        code: 400,
-        message: "Can only update status for sub-admins",
-        data: null,
-      };
-    }
-
-    // Update status by updating online_status field (using it as active/inactive status)
-    const updatedAdmin = await db
-      .update(user_model)
-      .set({ online_status: active })
-      .where(eq(user_model.id, id))
-      .returning({
-        id: user_model.id,
-        name: user_model.name,
-        email: user_model.email,
-        role: user_model.role,
-        online_status: user_model.online_status,
-      });
-
-    return {
-      success: true,
-      code: 200,
-      message: `Admin ${active ? 'activated' : 'deactivated'} successfully`,
-      data: updatedAdmin[0],
-    };
-  } catch (error: any) {
-    console.error("Error updating admin status:", error);
-    return {
-      success: false,
-      code: 500,
-      message: "Failed to update admin status",
-      data: null,
-    };
-  }
+const update_admin_status = async (_id: string, _active: boolean) => {
+  // online_status column removed from user model
+  // Admin active/inactive status needs a dedicated column if required
+  return { success: true, code: 200, message: "No-op: online_status column removed", data: null };
 };
 
-const get_user_permissions = async (id: number) => {
+const get_user_permissions = async (id: string) => {
   try {
     const user = await db
       .select({
         id: user_model.id,
         role: user_model.role,
         permissions: user_model.permissions,
-        online_status: user_model.online_status,
       })
       .from(user_model)
       .where(eq(user_model.id, id))
@@ -880,7 +803,6 @@ const get_user_permissions = async (id: number) => {
         data: {
           role: userData.role,
           permissions: userData.permissions || [],
-          active: userData.online_status,
         },
       };
     }
@@ -902,7 +824,7 @@ const get_user_permissions = async (id: number) => {
   }
 };
 
-const delete_user_permanently = async (user_id: number) => {
+const delete_user_permanently = async (user_id: string) => {
   try {
     // Check if user exists
     const existingUser = await db
@@ -944,23 +866,23 @@ const delete_user_permanently = async (user_id: number) => {
     // Remove user from redis conversation member sets to avoid stale cache
     try {
       const conversations = await db
-        .select({ conversation_id: conversation_member_model.conversation_id })
-        .from(conversation_member_model)
+        .select({ chat_id: chat_member_model.chat_id })
+        .from(chat_member_model)
         .where(
           and(
-            eq(conversation_member_model.user_id, user_id),
-            eq(conversation_member_model.deleted, false),
+            eq(chat_member_model.user_id, user_id),
+            isNull(chat_member_model.removed_at),
           ),
         );
 
       const convIds = Array.from(
-        new Set(conversations.map((row) => row.conversation_id)),
+        new Set(conversations.map((row) => row.chat_id)),
       );
 
       for (const convId of convIds) {
         const redisKey = `conv:${convId}:members`;
-        await redis.srem(redisKey, user_id.toString());
-        await redis.publish("conv:invalidate", convId.toString());
+        await redis.srem(redisKey, user_id);
+        await redis.publish("conv:invalidate", convId);
       }
     } catch (error) {
       console.error("Error removing user from redis conversations:", error);
@@ -998,7 +920,7 @@ const delete_user_permanently = async (user_id: number) => {
   }
 };
 
-const admin_update_user_phone_number = async (user_id: number, new_phone: string) => {
+const admin_update_user_phone_number = async (user_id: string, new_phone: string) => {
   // const parsed_new_phone = parse_phone(new_phone)
   try {
     const [existingUser] = await db
@@ -1053,7 +975,6 @@ const admin_update_user_phone_number = async (user_id: number, new_phone: string
         created_at: user_model.created_at,
         last_seen: user_model.last_seen,
         call_access: user_model.call_access,
-        online_status: user_model.online_status,
         location: user_model.location,
         ip_address: user_model.ip_address,
       });
@@ -1087,7 +1008,7 @@ export {
   get_available_users,
   get_all_users_paginated,
   update_user_role,
-  update_user_connection_status,
+  // update_user_connection_status,
   update_user_call_access,
   update_profile_image,
   get_dashboard_stats,

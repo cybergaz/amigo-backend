@@ -3,13 +3,13 @@ import { ElysiaWS } from "elysia/dist/ws";
 import { get_conversation_members, get_user_conversations } from "@/services/cache-management/socket.cache";
 import { socket_connections, handlePongResponse, polling_connections } from "./socket.server";
 import { store_pending_message_for_users, is_allowed_event, store_pending_message } from "@/services/cache-management/polling.cache";
+import { reset_unread } from "@/services/cache-management/chat-meta.cache";
 import db from "@/config/db";
-import { conversation_member_model } from "@/models/chat.model";
+import { chat_member_model } from "@/models/chat.model";
 import { message_model, message_info_model } from "@/models/message.model";
 import { and, desc, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_connection_status, handle_conv_join_leave, handle_message_forward, handle_message_new } from "./socket.service";
 import { pin_message, unpin_message, mark_message_delivered } from "@/services/message.services";
-import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 
 // Generate unique message ID for polling
 let polling_message_counter = 0;
@@ -26,7 +26,7 @@ const get_ws_data = (ws: ElysiaWS, key: keyof WebSocketData) => {
   return (ws.data as WebSocketData)[key];
 };
 
-const is_user_online = (user_id: number): boolean => {
+const is_user_online = (user_id: string): boolean => {
   // Check WebSocket connections
   const ws_connection = socket_connections.get(user_id);
   if (ws_connection && ws_connection.ws.readyState === 1) {
@@ -37,14 +37,14 @@ const is_user_online = (user_id: number): boolean => {
 
 type BroadcastData = {
   to: "conversation" | "users",
-  conv_id?: number,
-  user_ids?: number[],
+  conv_id?: string,
+  user_ids?: string[],
   message: WSMessage,
-  exclude_user_ids?: number[];
+  exclude_user_ids?: string[];
 };
 
 const broadcast_message = async (data: BroadcastData) => {
-  let members: number[] = [];
+  let members: string[] = [];
   if (data.to === "conversation" && data.conv_id) {
     // Get conversation members (LRU -> Redis -> DB)
     members = Array.from(await get_conversation_members(data.conv_id));
@@ -56,10 +56,10 @@ const broadcast_message = async (data: BroadcastData) => {
     recipients_list = data.user_ids;
   }
 
-  const active_in_conv: Set<number> = new Set<number>();
-  const online_users_id: Set<number> = new Set<number>();
-  const offline_users_id: Set<number> = new Set<number>();
-  const polling_users_id: Set<number> = new Set<number>();
+  const active_in_conv: Set<string> = new Set<string>();
+  const online_users_id: Set<string> = new Set<string>();
+  const offline_users_id: Set<string> = new Set<string>();
+  const polling_users_id: Set<string> = new Set<string>();
 
   // console.log("all ws connections:", socket_connections)
 
@@ -84,10 +84,7 @@ const broadcast_message = async (data: BroadcastData) => {
 
       // Send message immediately via WebSocket
       try {
-        // Convert bigint IDs to strings before sending (JSON.stringify cannot serialize BigInt)
-        const messageToSend = convertBigIntToString(data.message);
-
-        ws_connection.ws.send(messageToSend, true);
+        ws_connection.ws.send(data.message, true);
       } catch (error) {
         console.error(`[WS] Error sending to user ${user_id}:`, error);
       }
@@ -137,12 +134,12 @@ const broadcast_message = async (data: BroadcastData) => {
 };
 
 // Get all connected users (optimized with parallel fetching)
-const get_connected_users = async (user_id: number): Promise<Set<number>> => {
+const get_connected_users = async (user_id: string): Promise<Set<string>> => {
   // Get user's conversations (cached)
   const conversations = await get_user_conversations(user_id);
 
   if (conversations.size === 0) {
-    return new Set<number>();
+    return new Set<string>();
   }
 
   // Fetch members from all conversations in parallel
@@ -153,7 +150,7 @@ const get_connected_users = async (user_id: number): Promise<Set<number>> => {
   const all_members = await Promise.all(memberPromises);
 
   // Combine and deduplicate
-  const connected_users = new Set<number>();
+  const connected_users = new Set<string>();
   all_members.forEach(members => {
     members.forEach(member_id => {
       if (member_id !== user_id) {
@@ -168,21 +165,22 @@ const get_connected_users = async (user_id: number): Promise<Set<number>> => {
 const handle_join_conversation = async ({
   conv_id,
   user_id,
-  // is_active_in_conv
 }: {
-  conv_id: number,
-  user_id: number,
+  conv_id: string,
+  user_id: string,
   // is_active_in_conv: boolean
 }) => {
   try {
+    // Reset unread count in Redis (fire-and-forget)
+    reset_unread(user_id, conv_id);
 
-    // Get the latest message in this conversation to update last_read_message_id
+    // Get the latest message in this conversation to update last_read_msg_id
     const [latest_message] = await db
       .select({ id: message_model.id })
       .from(message_model)
       .where(
         and(
-          eq(message_model.conversation_id, conv_id),
+          eq(message_model.chat_id, conv_id),
         )
       )
       .orderBy(desc(message_model.sent_at))
@@ -193,16 +191,14 @@ const handle_join_conversation = async ({
       // This prevents resetting read receipts when user comes back to the same conversation
       // if (!is_active_in_conv) {
       await db
-        .update(conversation_member_model)
+        .update(chat_member_model)
         .set({
-          last_read_message_id: latest_message.id,
-          // Clear unread count when user becomes active in conversation
-          unread_count: 0
+          last_read_msg_id: latest_message.id,
         })
         .where(
           and(
-            eq(conversation_member_model.conversation_id, conv_id),
-            eq(conversation_member_model.user_id, user_id)
+            eq(chat_member_model.chat_id, conv_id),
+            eq(chat_member_model.user_id, user_id)
           )
         );
       // }
@@ -215,7 +211,7 @@ const handle_join_conversation = async ({
       .innerJoin(message_model, eq(message_info_model.message_id, message_model.id))
       .where(
         and(
-          eq(message_info_model.conv_id, conv_id),
+          eq(message_info_model.chat_id, conv_id),
           eq(message_info_model.user_id, user_id),
           isNull(message_info_model.read_at),
           ne(message_model.sender_id, user_id),
@@ -228,32 +224,23 @@ const handle_join_conversation = async ({
       .set({ read_at: new Date() })
       .where(
         and(
-          eq(message_info_model.conv_id, conv_id),
+          eq(message_info_model.chat_id, conv_id),
           eq(message_info_model.user_id, user_id),
           isNull(message_info_model.read_at),
         )
       );
 
-    // special handling for DMs: updating message table for sent status
-    await db
-      .update(message_model)
-      .set({ status: "read" })
-      .where(
-        and(
-          eq(message_model.conversation_id, conv_id),
-          ne(message_model.sender_id, user_id),
-          ne(message_model.status, "read"),
-        )
-      );
+    // DM status tracking is now handled via message_info_model (read_at/delivered_at)
+    // No per-message `status` column exists anymore.
 
     // Push real read receipts to senders so they can correct optimistic pre-fills
     // Group messages by sender and push message:ack with read_by=[user_id] to each unique sender
     if (unread_messages.length > 0) {
       const now = new Date();
       // Group latest message ID per sender (client marks all earlier messages read on single ack)
-      const latest_per_sender = new Map<number, bigint>();
+      const latest_per_sender = new Map<string, string>();
       for (const row of unread_messages) {
-        latest_per_sender.set(row.sender_id, row.message_id);
+        if (row.sender_id) latest_per_sender.set(row.sender_id, row.message_id);
       }
 
       for (const [sender_id, message_id] of latest_per_sender) {
@@ -264,7 +251,6 @@ const handle_join_conversation = async ({
           delivered_at: now,
           read_by: [user_id],
           delivered_to: [],
-          offline_users: [],
         };
         await broadcast_message({
           to: "users",
@@ -285,11 +271,11 @@ const handle_join_conversation = async ({
 };
 
 const socket_message_handler = async (user_details: {
-  user_id?: number,
+  user_id?: string,
   user_name?: string;
   user_pfp?: string;
 }, message: WSMessage) => {
-  const user_id = user_details.user_id || 0; // Default to 0 if user_id is missing, but ideally should not happen due to authentication middleware
+  const user_id = user_details.user_id || "";
   const user_name = user_details.user_name || "Unknown User";
   const user_pfp = user_details.user_pfp || "";
 
@@ -297,7 +283,7 @@ const socket_message_handler = async (user_details: {
     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     await broadcast_message({
       to: "users",
-      user_ids: [Number(user_id)],
+      user_ids: [user_id],
       message: {
         type: "socket:error",
         payload: {
@@ -317,12 +303,7 @@ const socket_message_handler = async (user_details: {
       console.error(`[WS] Message payload missing for type ${message.type}`);
     }
 
-    // Convert string IDs to bigint after validation (before processing)
-    if (message.payload) {
-      message.payload = convertStringToBigInt(message.payload);
-    }
-
-    // Handle incoming messages 
+    // Handle incoming messages
     switch (message.type) {
 
       // ----------------------------------------------------
@@ -334,7 +315,7 @@ const socket_message_handler = async (user_details: {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
               to: "users",
-              user_ids: [Number(user_id)],
+              user_ids: [user_id],
               message: {
                 type: "socket:error",
                 payload: {
@@ -359,7 +340,7 @@ const socket_message_handler = async (user_details: {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
               to: "users",
-              user_ids: [Number(user_id)],
+              user_ids: [user_id],
               message: {
                 type: "socket:error",
                 payload: {
@@ -391,7 +372,7 @@ const socket_message_handler = async (user_details: {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
               to: "users",
-              user_ids: [Number(user_id)],
+              user_ids: [user_id],
               message: {
                 type: "socket:error",
                 payload: {
@@ -469,7 +450,7 @@ const socket_message_handler = async (user_details: {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
               to: "users",
-              user_ids: [Number(user_id)],
+              user_ids: [user_id],
               message: {
                 type: "socket:error",
                 payload: {
@@ -519,7 +500,7 @@ const socket_message_handler = async (user_details: {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
               to: "users",
-              user_ids: [Number(user_id)],
+              user_ids: [user_id],
               message: {
                 type: "socket:error",
                 payload: {
@@ -546,7 +527,7 @@ const socket_message_handler = async (user_details: {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
               to: "users",
-              user_ids: [Number(user_id)],
+              user_ids: [user_id],
               message: {
                 type: "socket:error",
                 payload: {
@@ -570,7 +551,7 @@ const socket_message_handler = async (user_details: {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
               to: "users",
-              user_ids: [Number(user_id)],
+              user_ids: [user_id],
               message: {
                 type: "socket:error",
                 payload: {
@@ -593,7 +574,7 @@ const socket_message_handler = async (user_details: {
           if (!result.success) {
             await broadcast_message({
               to: "users",
-              user_ids: [Number(user_id)],
+              user_ids: [user_id],
               message: {
                 type: "socket:error",
                 payload: { code: result.code || 500, message: result.message || "Error handling call:hold", error: result.error },
@@ -613,7 +594,7 @@ const socket_message_handler = async (user_details: {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
               to: "users",
-              user_ids: [Number(user_id)],
+              user_ids: [user_id],
               message: {
                 type: "socket:error",
                 payload: {
@@ -636,7 +617,7 @@ const socket_message_handler = async (user_details: {
           // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
           await broadcast_message({
             to: "users",
-            user_ids: [Number(user_id)],
+            user_ids: [user_id],
             message: {
               type: "socket:health_check",
               payload: {
@@ -657,7 +638,7 @@ const socket_message_handler = async (user_details: {
           // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
           await broadcast_message({
             to: "users",
-            user_ids: [Number(user_id)],
+            user_ids: [user_id],
             message: {
               type: "socket:pong",
               ws_timestamp: new Date()
@@ -682,7 +663,7 @@ const socket_message_handler = async (user_details: {
           // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
           await broadcast_message({
             to: "users",
-            user_ids: [Number(user_id)],
+            user_ids: [user_id],
             message: {
               type: "socket:error",
               payload: {
@@ -701,7 +682,7 @@ const socket_message_handler = async (user_details: {
     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     await broadcast_message({
       to: "users",
-      user_ids: [Number(user_id)],
+      user_ids: [user_id],
       message: {
         type: "socket:error",
         payload: {

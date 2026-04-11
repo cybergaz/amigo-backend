@@ -35,6 +35,7 @@ export const FILE_TYPE_MAPPINGS = {
   "audio/aac": S3_FOLDERS.AUDIOS,
   "audio/x-m4a": S3_FOLDERS.AUDIOS,
   "audio/flac": S3_FOLDERS.AUDIOS,
+  "audio/opus": S3_FOLDERS.AUDIOS,
 
   // Video files
   "video/mp4": S3_FOLDERS.VIDEOS,
@@ -83,7 +84,7 @@ export const upload_file_to_s3 = async (
   file: File,
   key: string,
   folder?: S3Folder
-): Promise<{ success: boolean; url?: string; error?: string; key?: string }> => {
+): Promise<{ success: boolean; url?: string; error?: string; key?: string; }> => {
   try {
     // Validate file type
     if (!is_valid_file_type(file.type)) {
@@ -138,7 +139,7 @@ export const upload_file_to_s3 = async (
 export const upload_image_to_s3 = async (
   file: File,
   key: string
-): Promise<{ success: boolean; url?: string; error?: string }> => {
+): Promise<{ success: boolean; url?: string; error?: string; }> => {
   const result = await upload_file_to_s3(file, key, S3_FOLDERS.PROFILE_IMAGES);
   return {
     success: result.success,
@@ -147,7 +148,7 @@ export const upload_image_to_s3 = async (
   };
 };
 
-export const delete_image_from_s3 = async (key: string): Promise<{ success: boolean; error?: string }> => {
+export const delete_image_from_s3 = async (key: string): Promise<{ success: boolean; error?: string; }> => {
   try {
     const deleteParams = {
       Bucket: BUCKET_NAME,
@@ -170,7 +171,7 @@ export const delete_image_from_s3 = async (key: string): Promise<{ success: bool
 export const get_presigned_url = async (
   key: string,
   expiresIn: number = 3600
-): Promise<{ success: boolean; url?: string; error?: string }> => {
+): Promise<{ success: boolean; url?: string; error?: string; }> => {
   try {
     const command = new GetObjectCommand({
       Bucket: BUCKET_NAME,
@@ -194,7 +195,7 @@ export const get_presigned_url = async (
 
 // Generate unique file key based on user ID and file type
 export const generate_file_key = (
-  userId: number,
+  userId: string,
   fileName: string,
   fileType?: S3Folder
 ): string => {
@@ -210,7 +211,7 @@ export const generate_file_key = (
 };
 
 // Backward compatibility for profile images
-export const generate_profile_image_key = (userId: number, fileName: string): string => {
+export const generate_profile_image_key = (userId: string, fileName: string): string => {
   return generate_file_key(userId, fileName, S3_FOLDERS.PROFILE_IMAGES);
 };
 

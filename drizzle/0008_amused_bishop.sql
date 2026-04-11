@@ -1,1 +1,0 @@
-ALTER TABLE "messages" RENAME COLUMN "edited_at" TO "sent_at";

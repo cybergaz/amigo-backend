@@ -1,15 +1,15 @@
-import { pgTable, bigint, varchar, timestamp, boolean, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, bigint, varchar, timestamp, boolean, jsonb, uuid } from "drizzle-orm/pg-core";
 import { user_model } from "./user.model";
 import { InferInsertModel, InferSelectModel } from "drizzle-orm";
 
 export const community_model = pgTable("communities", {
-  id: bigint({ mode: 'number' }).primaryKey(),
+  id: uuid().primaryKey().defaultRandom(),
   name: varchar({ length: 255 }).notNull(),
-  group_ids: bigint({ mode: 'number' }).array(),
+  group_ids: uuid().array(),
   metadata: jsonb(), // For additional community settings
   created_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
   updated_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
-  deleted: boolean().default(false).notNull(),
+  deleted_at: timestamp({ withTimezone: true }),
 });
 
 // export const community_member_model = pgTable("community_members", {

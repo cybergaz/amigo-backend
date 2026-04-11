@@ -20,7 +20,7 @@ interface CommunityGroupMetadata {
   active_days?: number[];
   
   // Community-specific settings
-  community_id?: number;
+  community_id?: string;
   
   // Other group-level metadata
   [key: string]: any;
@@ -30,8 +30,8 @@ interface CommunityGroupMetadata {
 interface ExtendedConversationMetadata {
   // Existing pinned message functionality
   pinned_message?: {
-    message_id: number;
-    user_id: number;
+    message_id: string;
+    user_id: string;
     pinned_at: string;
   };
 
@@ -56,16 +56,16 @@ interface UpdateCommunityRequest {
 }
 
 interface CreateCommunityGroupRequest {
-  community_id: number;
+  community_id: string;
   title: string;
   active_time_slots: TimeSlot[];
   timezone?: string;
   active_days?: number[];
-  member_ids?: number[];
+  member_ids?: string[];
 }
 
 interface UpdateCommunityGroupRequest {
-  conversation_id: number;
+  conversation_id: string;
   title?: string;
   active_time_slots?: TimeSlot[];
   timezone?: string;
@@ -73,38 +73,38 @@ interface UpdateCommunityGroupRequest {
 }
 
 interface AddCommunityMemberRequest {
-  community_id: number;
-  user_ids: number[];
+  community_id: string;
+  user_ids: string[];
   role?: CommunityRoleType;
 }
 
 interface RemoveCommunityMemberRequest {
-  community_id: number;
-  user_ids: number[];
+  community_id: string;
+  user_ids: string[];
 }
 
 interface UpdateCommunityMemberRoleRequest {
-  community_id: number;
-  user_id: number;
+  community_id: string;
+  user_id: string;
   role: CommunityRoleType;
 }
 
 interface AddCommunityGroupRequest {
-  community_id: number;
-  group_ids: number[];
+  community_id: string;
+  group_ids: string[];
 }
 
 interface RemoveCommunityGroupRequest {
-  community_id: number;
-  group_ids: number[];
+  community_id: string;
+  group_ids: string[];
 }
 
 // Response types
 interface CommunityWithMembers {
-  id: number;
+  id: string;
   name: string;
   description?: string;
-  super_admin_id: number;
+  super_admin_id: string;
   metadata?: any;
   created_at: string;
   updated_at: string;
@@ -113,9 +113,9 @@ interface CommunityWithMembers {
 }
 
 interface CommunityGroupWithDetails {
-  id: number;
+  id: string;
   title: string;
-  community_id: number;
+  community_id: string;
   active_time_slots: TimeSlot[];
   timezone?: string;
   active_days?: number[];

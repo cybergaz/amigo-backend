@@ -14,7 +14,7 @@ export const authenticate_jwt = (token: string) => {
       success: true,
       code: 200,
       message: "Valid Token",
-      data: decoded as { id: number; role: RoleType },
+      data: decoded as { id: string; role: RoleType },
     };
   } catch (err) {
     return {
@@ -64,13 +64,12 @@ export const app_middleware = ({ cookie, headers, allowed }: ElysiaMiddlewareTyp
   };
 }
 
-export const check_permission = async (userId: number, requiredPermission: string) => {
+export const check_permission = async (userId: string, requiredPermission: string) => {
   try {
     const user = await db
       .select({
         role: user_model.role,
         permissions: user_model.permissions,
-        online_status: user_model.online_status,
       })
       .from(user_model)
       .where(eq(user_model.id, userId))
@@ -92,15 +91,6 @@ export const check_permission = async (userId: number, requiredPermission: strin
         success: true,
         code: 200,
         message: "Permission granted",
-      };
-    }
-
-    // Check if sub-admin is active
-    if (userData.role === "sub_admin" && !userData.online_status) {
-      return {
-        success: false,
-        code: 403,
-        message: "Account is inactive",
       };
     }
 

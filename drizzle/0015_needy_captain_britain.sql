@@ -1,1 +1,0 @@
-ALTER TABLE "missed_ws_messages" ALTER COLUMN "id" SET DATA TYPE varchar(100);

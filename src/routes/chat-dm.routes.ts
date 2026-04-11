@@ -3,7 +3,7 @@ import { app_middleware } from "@/middleware";
 import { create_dm, dm_delete_status } from "@/services/chat-dm.service";
 
 export const chat_dm_routes = new Elysia({ prefix: "/chat/dm" })
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
@@ -22,7 +22,7 @@ export const chat_dm_routes = new Elysia({ prefix: "/chat/dm" })
     return chat_result;
   }, {
     params: t.Object({
-      reciver_id: t.Number()
+      reciver_id: t.String()
     })
   })
 
@@ -32,6 +32,6 @@ export const chat_dm_routes = new Elysia({ prefix: "/chat/dm" })
     return delete_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     })
   });

@@ -1,9 +1,9 @@
 // Call signaling message types
 interface CallSignalingMessage {
   type: 'call:init' | 'call:offer' | 'call:answer' | 'call:ice' | 'call:accept' | 'call:terminate' | 'call:ringing';
-  callId: number;
-  from: number;
-  to: number;
+  callId: string;
+  from: string;
+  to: string;
   payload?: any;
   timestamp?: string;
 }

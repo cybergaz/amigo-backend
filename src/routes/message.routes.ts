@@ -4,7 +4,7 @@ import { delete_message_for_me, soft_delete_message } from "@/services/chat.serv
 import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, mark_messages_delivered_batch, react_to_message, reply_to_message, star_messages, verify_message_ids } from "@/services/message.services";
 
 export const message_routes = new Elysia({ prefix: "/message" })
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
@@ -20,7 +20,7 @@ export const message_routes = new Elysia({ prefix: "/message" })
   .post("/delivered", async ({ set, store, body }) => {
     // console.log("delivered ack through api -> ", body);
     const delivery_result = await mark_message_delivered(
-      BigInt(body.message_id),
+      body.message_id,
       body.conversation_id,
       store.id
     );
@@ -29,7 +29,7 @@ export const message_routes = new Elysia({ prefix: "/message" })
   }, {
     body: t.Object({
       message_id: t.String(),
-      conversation_id: t.Number()
+      conversation_id: t.String()
     })
   })
 
@@ -41,7 +41,7 @@ export const message_routes = new Elysia({ prefix: "/message" })
     body: t.Object({
       messages: t.Array(t.Object({
         message_id: t.String(),
-        conversation_id: t.Number()
+        conversation_id: t.String()
       }))
     })
   })
@@ -68,8 +68,8 @@ export const message_routes = new Elysia({ prefix: "/message" })
     return star_result;
   }, {
     body: t.Object({
-      message_ids: t.Array(t.BigInt()),
-      conversation_id: t.Number()
+      message_ids: t.Array(t.String()),
+      conversation_id: t.String()
     })
   })
 
@@ -79,9 +79,9 @@ export const message_routes = new Elysia({ prefix: "/message" })
     return reply_result;
   }, {
     body: t.Object({
-      message_id: t.BigInt(),
-      reply_to_message_id: t.BigInt(),
-      conversation_id: t.Number(),
+      message_id: t.String(),
+      reply_to_message_id: t.String(),
+      conversation_id: t.String(),
       body: t.String(),
       attachments: t.Optional(t.Array(t.Any()))
     })
@@ -93,9 +93,9 @@ export const message_routes = new Elysia({ prefix: "/message" })
     return forward_result;
   }, {
     body: t.Object({
-      message_ids: t.Array(t.BigInt()),
-      source_conversation_id: t.Number(),
-      target_conversation_ids: t.Array(t.Number())
+      message_ids: t.Array(t.String()),
+      source_conversation_id: t.String(),
+      target_conversation_ids: t.Array(t.String())
     })
   })
 
@@ -105,8 +105,8 @@ export const message_routes = new Elysia({ prefix: "/message" })
     return delete_result;
   }, {
     body: t.Object({
-      message_ids: t.Array(t.BigInt()),
-      conversation_id: t.Number(),
+      message_ids: t.Array(t.String()),
+      conversation_id: t.String(),
       delete_for_everyone: t.Optional(t.Boolean())
     })
   })
@@ -117,7 +117,7 @@ export const message_routes = new Elysia({ prefix: "/message" })
     return pinned_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     })
   })
 
@@ -127,7 +127,7 @@ export const message_routes = new Elysia({ prefix: "/message" })
     return starred_result;
   }, {
     query: t.Object({
-      conversation_id: t.Optional(t.Number())
+      conversation_id: t.Optional(t.String())
     })
   })
 
@@ -141,8 +141,8 @@ export const message_routes = new Elysia({ prefix: "/message" })
     return delete_result;
   }, {
     body: t.Object({
-      message_ids: t.Array(t.BigInt()),
-      conversation_id: t.Number()
+      message_ids: t.Array(t.String()),
+      conversation_id: t.String()
     })
   })
 
@@ -164,7 +164,7 @@ export const message_routes = new Elysia({ prefix: "/message" })
 
   .post("/react", async ({ set, store, body }) => {
     const react_result = await react_to_message(
-      { message_id: BigInt(body.message_id), conversation_id: body.conversation_id, emoji: body.emoji, action: body.action },
+      { message_id: body.message_id, conversation_id: body.conversation_id, emoji: body.emoji, action: body.action },
       store.id,
       body.sender_name
     );
@@ -173,7 +173,7 @@ export const message_routes = new Elysia({ prefix: "/message" })
   }, {
     body: t.Object({
       message_id: t.String(),
-      conversation_id: t.Number(),
+      conversation_id: t.String(),
       emoji: t.String(),
       action: t.Union([t.Literal('add'), t.Literal('remove')]),
       sender_name: t.Optional(t.String()),
@@ -181,14 +181,13 @@ export const message_routes = new Elysia({ prefix: "/message" })
   })
 
   .post("/verify-ids", async ({ set, store, body }) => {
-    const ids = body.message_ids.map((id: string) => BigInt(id));
-    const result = await verify_message_ids(ids, body.conversation_id, store.id);
+    const result = await verify_message_ids(body.message_ids, body.conversation_id, store.id);
     set.status = result.code;
     return result;
   }, {
     body: t.Object({
       message_ids: t.Array(t.String()),
-      conversation_id: t.Number(),
+      conversation_id: t.String(),
     }),
   });
 

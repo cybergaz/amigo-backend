@@ -6,7 +6,7 @@ import { ROLE_CONST } from "@/types/user.types";
 import FCMService from "@/services/fcm.service";
 
 const user_routes = new Elysia({ prefix: "/user" })
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });

@@ -1,9 +1,5 @@
 import { Elysia, t } from "elysia";
 import { app_middleware } from "@/middleware";
-import db from "@/config/db";
-import { conversation_model } from "@/models/chat.model";
-import { user_model } from "@/models/user.model";
-import { and, eq, desc } from "drizzle-orm";
 import {
   create_community,
   get_communities,
@@ -23,7 +19,7 @@ import {
 } from "@/services/community.services";
 
 const community_routes = new Elysia({ prefix: "/community" })
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
@@ -67,7 +63,7 @@ const community_routes = new Elysia({ prefix: "/community" })
     return community_result;
   }, {
     params: t.Object({
-      community_id: t.Number()
+      community_id: t.String()
     })
   })
 
@@ -77,7 +73,7 @@ const community_routes = new Elysia({ prefix: "/community" })
     return update_result;
   }, {
     params: t.Object({
-      community_id: t.Number()
+      community_id: t.String()
     }),
     body: t.Object({
       name: t.Optional(t.String({ minLength: 1, maxLength: 255 })),
@@ -92,7 +88,7 @@ const community_routes = new Elysia({ prefix: "/community" })
     return delete_result;
   }, {
     params: t.Object({
-      community_id: t.Number()
+      community_id: t.String()
     })
   })
 
@@ -107,10 +103,10 @@ const community_routes = new Elysia({ prefix: "/community" })
     return add_result;
   }, {
     params: t.Object({
-      community_id: t.Number()
+      community_id: t.String()
     }),
     body: t.Object({
-      group_ids: t.Array(t.Number())
+      group_ids: t.Array(t.String())
     })
   })
 
@@ -124,10 +120,10 @@ const community_routes = new Elysia({ prefix: "/community" })
     return remove_result;
   }, {
     params: t.Object({
-      community_id: t.Number()
+      community_id: t.String()
     }),
     body: t.Object({
-      group_ids: t.Array(t.Number())
+      group_ids: t.Array(t.String())
     })
   })
 
@@ -141,7 +137,7 @@ const community_routes = new Elysia({ prefix: "/community" })
     return group_result;
   }, {
     params: t.Object({
-      community_id: t.Number()
+      community_id: t.String()
     }),
     body: t.Object({
       title: t.String({ minLength: 1, maxLength: 255 }),
@@ -151,7 +147,7 @@ const community_routes = new Elysia({ prefix: "/community" })
       })),
       timezone: t.Optional(t.String()),
       active_days: t.Optional(t.Array(t.Number({ minimum: 0, maximum: 6 }))), // 0 = Sunday, 6 = Saturday
-      member_ids: t.Optional(t.Array(t.Number()))
+      member_ids: t.Optional(t.Array(t.String()))
     })
   })
 
@@ -164,7 +160,7 @@ const community_routes = new Elysia({ prefix: "/community" })
     return update_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     }),
     body: t.Object({
       title: t.Optional(t.String({ minLength: 1, maxLength: 255 })),
@@ -183,7 +179,7 @@ const community_routes = new Elysia({ prefix: "/community" })
     return groups_result;
   }, {
     params: t.Object({
-      community_id: t.Number()
+      community_id: t.String()
     })
   })
 
@@ -193,7 +189,7 @@ const community_routes = new Elysia({ prefix: "/community" })
     return delete_result;
   }, {
     params: t.Object({
-      conversation_id: t.Number()
+      conversation_id: t.String()
     })
   })
 
@@ -226,8 +222,8 @@ const community_routes = new Elysia({ prefix: "/community" })
     return result;
   }, {
     body: t.Object({
-      group_id: t.Number(),
-      community_ids: t.Array(t.Number())
+      group_id: t.String(),
+      community_ids: t.Array(t.String())
     })
   });
 

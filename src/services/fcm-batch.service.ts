@@ -11,13 +11,13 @@ interface UserBatch {
   timer: ReturnType<typeof setTimeout>;
 }
 
-const batches = new Map<number, UserBatch>();
+const batches = new Map<string, UserBatch>();
 
 function ws_messages_byte_size(messages: WSMessage[]): number {
   return Buffer.byteLength(JSON.stringify(messages), 'utf8');
 }
 
-async function flush(user_id: number): Promise<void> {
+async function flush(user_id: string): Promise<void> {
   const batch = batches.get(user_id);
   if (!batch) return;
 
@@ -40,7 +40,7 @@ async function flush(user_id: number): Promise<void> {
  * or the accumulated ws_messages JSON would exceed MAX_WS_MESSAGES_BYTES.
  * In the size-overflow case the overflowing message starts the next batch.
  */
-export async function queue_message_fcm(user_id: number, ws_message: WSMessage): Promise<void> {
+export async function queue_message_fcm(user_id: string, ws_message: WSMessage): Promise<void> {
   let batch = batches.get(user_id);
 
   if (!batch) {

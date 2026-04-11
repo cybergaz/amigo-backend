@@ -7,23 +7,23 @@ import { eq, and, desc, or, sql } from 'drizzle-orm';
 
 // Active calls management
 interface ActiveCall {
-  id: number;
-  caller_id: number;
-  callee_id: number;
+  id: string;
+  caller_id: string;
+  callee_id: string;
   status: CallStatusType;
   started_at: Date;
   answered_at?: Date;
   timeout_timer?: NodeJS.Timeout;
 }
 
-const active_calls = new Map<number, ActiveCall>();
-const user_calls = new Map<number, number>(); // user_id -> call_id
+const active_calls = new Map<string, ActiveCall>();
+const user_calls = new Map<string, string>(); // user_id -> call_id
 export const CALL_TIMEOUT_MS = 60 * 1000; // 60 seconds
 
 export class CallService {
 
   // Initialize a new call
-  static async initiate_call(caller_id: number, callee_id: number): Promise<ResultType<{ call_id: number; caller_name: string; }>> {
+  static async initiate_call(caller_id: string, callee_id: string): Promise<ResultType<{ call_id: string; caller_name: string; }>> {
     try {
       // Check if either user is already in a call
       if (user_calls.has(caller_id) || user_calls.has(callee_id)) {
@@ -112,7 +112,7 @@ export class CallService {
   }
 
   // Accept a call
-  static async accept_call(call_id: number, user_id: number): Promise<ResultType> {
+  static async accept_call(call_id: string, user_id: string): Promise<ResultType> {
     try {
       const active_call = active_calls.get(call_id);
       if (!active_call) {
@@ -166,7 +166,7 @@ export class CallService {
     }
   }
 
-  static async terminate_call(call_id: number, user_id: number, reason: CallEndReasonsType):
+  static async terminate_call(call_id: string, user_id: string, reason: CallEndReasonsType):
     Promise<ResultType<{
       status: CallStatusType;
       reason: CallEndReasonsType;
@@ -258,7 +258,7 @@ export class CallService {
   }
 
   // Handle call timeout (missed call)
-  static async timeout_call(call_id: number) {
+  static async timeout_call(call_id: string) {
     try {
       const active_call = active_calls.get(call_id);
       if (!active_call) return;
@@ -292,7 +292,7 @@ export class CallService {
   }
 
   // Clean up call data
-  static cleanup_call(call_id: number) {
+  static cleanup_call(call_id: string) {
     const active_call = active_calls.get(call_id);
     if (active_call) {
       user_calls.delete(active_call.caller_id);
@@ -306,13 +306,13 @@ export class CallService {
   }
 
   // Get active call for user
-  static get_user_active_call(user_id: number): ActiveCall | null {
+  static get_user_active_call(user_id: string): ActiveCall | null {
     const call_id = user_calls.get(user_id);
     return call_id ? active_calls.get(call_id) || null : null;
   }
 
   // Get call info by call ID, try from active calls first, then database
-  static async get_call_info(call_id: number): Promise<ResultType<ActiveCall>> {
+  static async get_call_info(call_id: string): Promise<ResultType<ActiveCall>> {
     try {
       // Check active calls first
       const active_call = active_calls.get(call_id);
@@ -366,7 +366,7 @@ export class CallService {
   }
 
   // Get call history for user
-  static async get_call_history(user_id: number, limit: number = 100): Promise<ResultType> {
+  static async get_call_history(user_id: string, limit: number = 100): Promise<ResultType> {
     try {
       // const caller = alias(user_model, 'caller');
       // const callee = alias(user_model, 'callee');
@@ -412,7 +412,7 @@ export class CallService {
             eq(call_model.callee_id, user_id)
           )
         )
-        .orderBy(desc(call_model.created_at))
+        .orderBy(desc(call_model.started_at))
         .limit(limit);
 
       if (calls.length === 0) {
@@ -445,7 +445,7 @@ export class CallService {
 export { active_calls, user_calls };
 
 // Missed-call notification callback (registered by socket.service to avoid circular imports)
-type MissedCallNotifier = (callee_id: number, call_id: number, caller_id: number) => Promise<void>;
+type MissedCallNotifier = (callee_id: string, call_id: string, caller_id: string) => Promise<void>;
 let _missedCallNotifier: MissedCallNotifier | undefined;
 
 export function register_missed_call_notifier(fn: MissedCallNotifier) {

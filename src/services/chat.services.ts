@@ -1,7 +1,7 @@
 import db from "@/config/db";
 import {
-  conversation_model,
-  conversation_member_model,
+  chat_model,
+  chat_member_model,
   DBUpdateConversationType,
 } from "@/models/chat.model";
 import { message_model, message_info_model } from "@/models/message.model";
@@ -14,10 +14,10 @@ import { create_unique_id } from "@/utils/general.utils";
 import { and, arrayContains, asc, desc, eq, gt, lt, inArray, isNotNull, isNull, ne, not, or, sql } from "drizzle-orm";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { ConversationActionPayload, DeleteMessagePayload, MembersType, SyncMessagesPayload, WSMessage } from "@/types/socket.types";
-import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
 import FCMService from "./fcm.service";
 import { queue_message_fcm } from "./fcm-batch.service";
 import { get_conversation_members } from "./cache-management/socket.cache";
+import { get_chat_metas, get_all_unread } from "./cache-management/chat-meta.cache";
 
 const build_conversation_action_message = (
   action: ConversationActionPayload["action"],
@@ -41,11 +41,11 @@ const build_conversation_action_message = (
 };
 
 const broadcast_conversation_action = async (data: {
-  conv_id: number;
+  conv_id: string;
   conv_type: ChatType;
   action: ConversationActionPayload["action"];
   members: MembersType[];
-  actor_id?: number;
+  actor_id?: string;
   actor_name?: string;
   actor_pfp?: string;
 }) => {
@@ -77,170 +77,98 @@ const broadcast_conversation_action = async (data: {
 };
 
 
-const get_chat_list = async (user_id: number, type: string) => {
+const get_chat_list = async (user_id: string, type: string) => {
   try {
-    const conversationIdsRes = await db
-      .select({ conversationId: conversation_member_model.conversation_id })
-      .from(conversation_member_model)
-      .where(eq(conversation_member_model.user_id, user_id));
-
-    const conversationIds = conversationIdsRes.map((c) => c.conversationId);
+    // ── Single query: my memberships → chats, with DM peer via self-join ──
+    // For DMs we self-join chat_members to get the other user in the same query.
+    // For groups the peer columns come back null — no N+1.
+    const dm_peer = db.$with("dm_peer").as(
+      db.select({
+        chat_id: chat_member_model.chat_id,
+        user_id: chat_member_model.user_id,
+      })
+        .from(chat_member_model)
+        .where(
+          and(
+            ne(chat_member_model.user_id, user_id),
+            isNull(chat_member_model.removed_at),
+          )
+        )
+    );
 
     const chats = await db
+      .with(dm_peer)
       .select({
-        conversationId: conversation_model.id,
-        type: conversation_model.type,
-        title: conversation_model.title,
-        metadata: conversation_model.metadata,
-        lastMessageAt: conversation_model.last_message_at,
-        createrId: conversation_model.creater_id,
+        conversationId: chat_model.id,
+        type: chat_model.type,
+        title: chat_model.title,
+        lastMsgId: chat_model.last_msg_id,
+        lastMsgAt: chat_model.last_msg_at,
+        createrId: chat_model.creater_id,
 
-        role: conversation_member_model.role,
-        unreadCount: conversation_member_model.unread_count,
-        joinedAt: conversation_member_model.joined_at,
+        role: chat_member_model.role,
+        joinedAt: chat_member_model.joined_at,
 
-        // from user_model - for DMs, this will be the other user
+        // DM peer info (null for groups)
         userId: user_model.id,
         userName: user_model.name,
         userPhone: user_model.phone,
         userProfilePic: user_model.profile_pic,
-        onlineStatus: user_model.online_status,
         lastSeen: user_model.last_seen,
       })
-      .from(conversation_member_model)
-      .innerJoin(
-        conversation_model,
-        eq(conversation_model.id, conversation_member_model.conversation_id)
-      )
-      .leftJoin(
-        user_model,
-        and(
-          eq(user_model.id, conversation_member_model.user_id),
-          ne(user_model.id, user_id) // Only join with other users for DMs
-        )
-      )
+      .from(chat_member_model)
+      .innerJoin(chat_model, eq(chat_model.id, chat_member_model.chat_id))
+      .leftJoin(dm_peer, eq(dm_peer.chat_id, chat_model.id))
+      .leftJoin(user_model, eq(user_model.id, dm_peer.user_id))
       .where(
         and(
-          inArray(conversation_model.id, conversationIds),
-          eq(conversation_member_model.user_id, user_id), // Get user's own membership record
-          type !== "all" ?
-            type === "group"
-              ? eq(conversation_model.type, "group")
+          eq(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at),
+          isNull(chat_model.deleted_at),
+          type !== "all"
+            ? type === "group"
+              ? eq(chat_model.type, "group")
               : type === "community_group"
-                ? eq(conversation_model.type, "community_group")
-                : type === "deleted_dm"
-                  ? and(eq(conversation_model.type, "dm"), eq(conversation_member_model.deleted, true))
-                  : and(eq(conversation_model.type, "dm"), eq(conversation_member_model.deleted, false))
-            : eq(conversation_model.deleted, false),
-          eq(conversation_model.deleted, false),
+                ? eq(chat_model.type, "community_group")
+                : eq(chat_model.type, "dm")
+            : undefined,
         )
       )
-      .orderBy(
-        desc(conversation_model.last_message_at),
-        // desc(conversation_member_model.joined_at),
-      );
+      .orderBy(desc(chat_model.last_msg_at));
 
-    // For groups and community groups, we don't need the other user info
-    // For DMs, we need to get the other user's info separately
-    const processedChats = await Promise.all(
-      chats.map(async (chat) => {
-        let final_chat_item: any;
-        if (chat.type === "dm" && !chat.userId) {
-          // Get the other user for DM
-          const [otherUser] = await db
-            .select({
-              userId: user_model.id,
-              userName: user_model.name,
-              userPhone: user_model.phone,
-              userProfilePic: user_model.profile_pic,
-              onlineStatus: user_model.online_status,
-              lastSeen: user_model.last_seen,
-            })
-            .from(conversation_member_model)
-            .innerJoin(user_model, eq(user_model.id, conversation_member_model.user_id))
-            .where(
-              and(
-                eq(conversation_member_model.conversation_id, chat.conversationId),
-                ne(conversation_member_model.user_id, user_id)
-              )
-            );
-
-          final_chat_item = {
-            ...chat,
-            userId: otherUser?.userId || null,
-            userName: otherUser?.userName || null,
-            userPhone: otherUser?.userPhone || null,
-            userProfilePic: otherUser?.userProfilePic || null,
-            onlineStatus: otherUser?.onlineStatus || false,
-            lastSeen: otherUser?.lastSeen || null,
-          };
-        }
-
-        // For groups and community groups, clear user info since it's not relevant
-        if (chat.type === "group" || chat.type === "community_group") {
-          const userMemberInfo = (await db
-            .select({
-              role: conversation_member_model.role,
-              joinedAt: conversation_member_model.joined_at,
-              unreadCount: conversation_member_model.unread_count
-            })
-            .from(conversation_member_model)
-            .where(and(
-              eq(conversation_member_model.conversation_id, chat.conversationId),
-              eq(conversation_member_model.user_id, user_id)
-            )))[0];
-
-          final_chat_item = {
-            ...chat,
-            userId: null,
-            userName: null,
-            userPhone: null,
-            onlineStatus: false,
-            lastSeen: null,
-            userProfilePic: null,
-            userRole: userMemberInfo?.role || null,
-            userJoinedAt: userMemberInfo?.joinedAt || null,
-            userUnreadCount: userMemberInfo?.unreadCount || 0,
-          };
-        }
-
-        if (chat.metadata !== null) {
-          const metadata = chat.metadata as any;
-
-          // if last_message exists in metadata, extract it if pinned message available append it as well
-          if (metadata.last_message != null) {
-            final_chat_item = {
-              ...final_chat_item,
-              lastMessageId: metadata.last_message.id,
-              lastMessageBody: metadata.last_message.body,
-              lastMessageType: metadata.last_message.type,
-            };
-          }
-
-          if (metadata.pinned_message != null) {
-            final_chat_item = {
-              ...final_chat_item,
-              pinnedMessageId: metadata.pinned_message.message_id,
-            };
-          }
-        }
-
-        return final_chat_item;
-      })
-    );
-
-    if (processedChats.length === 0) {
-      return {
-        success: false,
-        code: 404,
-        message: "No chats found",
-      };
+    if (chats.length === 0) {
+      return { success: false, code: 404, message: "No chats found" };
     }
+
+    // ── Enrich from Redis: last message + unread counts ──────────────────
+    const chat_ids = chats.map(c => c.conversationId);
+    const [chat_metas, unread_counts] = await Promise.all([
+      get_chat_metas(chat_ids),
+      get_all_unread(user_id),
+    ]);
+
+    const enriched = chats.map(chat => {
+      const meta = chat_metas.get(chat.conversationId);
+      const unread = unread_counts.get(chat.conversationId) ?? 0;
+
+      return {
+        ...chat,
+        // Clear DM peer fields for groups (they come back null anyway but be explicit)
+        userId: chat.type === "dm" ? chat.userId : null,
+        userName: chat.type === "dm" ? chat.userName : null,
+        userPhone: chat.type === "dm" ? chat.userPhone : null,
+        userProfilePic: chat.type === "dm" ? chat.userProfilePic : null,
+        lastSeen: chat.type === "dm" ? chat.lastSeen : null,
+        // Redis enrichment
+        lastMessage: meta ?? null,
+        unreadCount: unread,
+      };
+    });
 
     return {
       success: true,
       code: 200,
-      data: processedChats,
+      data: enriched,
     };
   } catch (error) {
     console.error("get_chat_list error:", error);
@@ -263,33 +191,10 @@ const update_conversation = async (conv_data: DBUpdateConversationType) => {
       };
     }
 
-    if (conv_data.metadata) {
-      // Update conversation's last_message_at and last_message in metadata
-      const [conversation] = await db
-        .select({ metadata: conversation_model.metadata })
-        .from(conversation_model)
-        .where(eq(conversation_model.id, conv_data.id))
-        .limit(1);
-
-      if (conversation) {
-        // Deserialize existing metadata to merge with new metadata
-        const deserializedMetadata = convertStringToBigInt(conversation.metadata);
-        const currentMetadata = (deserializedMetadata as ConversationMetadata) || {};
-
-        conv_data.metadata = {
-          ...currentMetadata,
-          ...conv_data.metadata
-        } as ConversationMetadata;
-        // Serialize metadata back to ensure BigInt values are converted to strings before saving
-        const serializedMetadata = convertBigIntToString(conv_data.metadata);
-        conv_data.metadata = serializedMetadata;
-      }
-    }
-
     const [updated_conversation] = await db
-      .update(conversation_model)
+      .update(chat_model)
       .set(conv_data)
-      .where(eq(conversation_model.id, conv_data.id));
+      .where(eq(chat_model.id, conv_data.id));
 
     return {
       success: true,
@@ -309,12 +214,12 @@ const update_conversation = async (conv_data: DBUpdateConversationType) => {
   }
 };
 
-const soft_delete_chat = async (conversation_id: number, user_id: number) => {
+const soft_delete_chat = async (conversation_id: string, user_id: string) => {
   try {
     const [conversation] = await db
-      .update(conversation_model)
-      .set({ deleted: true })
-      .where(eq(conversation_model.id, conversation_id))
+      .update(chat_model)
+      .set({ deleted_at: new Date() })
+      .where(eq(chat_model.id, conversation_id))
       .returning();
 
     if (!conversation) {
@@ -343,16 +248,16 @@ const soft_delete_chat = async (conversation_id: number, user_id: number) => {
   }
 };
 
-const revive_chat = async (conversation_id: number) => {
+const revive_chat = async (conversation_id: string) => {
   try {
     // Verify conversation exists
     const [conversation] = await db
       .select({
-        id: conversation_model.id,
-        deleted: conversation_model.deleted,
+        id: chat_model.id,
+        deleted_at: chat_model.deleted_at,
       })
-      .from(conversation_model)
-      .where(eq(conversation_model.id, conversation_id));
+      .from(chat_model)
+      .where(eq(chat_model.id, conversation_id));
 
     if (!conversation) {
       return {
@@ -363,7 +268,7 @@ const revive_chat = async (conversation_id: number) => {
       };
     }
 
-    if (!conversation.deleted) {
+    if (!conversation.deleted_at) {
       return {
         success: false,
         code: 400,
@@ -372,11 +277,11 @@ const revive_chat = async (conversation_id: number) => {
       };
     }
 
-    // Revive the conversation by setting deleted to false
+    // Revive the conversation by clearing deleted_at
     const result = await db
-      .update(conversation_model)
-      .set({ deleted: false })
-      .where(eq(conversation_model.id, conversation_id))
+      .update(chat_model)
+      .set({ deleted_at: null })
+      .where(eq(chat_model.id, conversation_id))
       .returning();
 
     if (result.length === 0) {
@@ -404,22 +309,18 @@ const revive_chat = async (conversation_id: number) => {
   }
 };
 
-const soft_delete_message = async (message_ids: string[], user_id: number, is_admin_or_staff?: boolean) => {
+const soft_delete_message = async (message_ids: string[], user_id: string, is_admin_or_staff?: boolean) => {
   try {
-    // console.log("soft_delete_message called with:", { message_ids, user_id, is_admin_or_staff });
-
-    const message_id_bigint = message_ids.map(id => BigInt(id));
-
-    // First, get the messages to retrieve conversation_id and check if they exist
+    // First, get the messages to retrieve chat_id and check if they exist
     const messagesToDelete = await db
       .select({
         id: message_model.id,
-        conversation_id: message_model.conversation_id,
+        chat_id: message_model.chat_id,
       })
       .from(message_model)
       .where(and(
-        inArray(message_model.id, message_id_bigint),
-        eq(message_model.deleted, false),
+        inArray(message_model.id, message_ids),
+        isNull(message_model.deleted_at),
         !is_admin_or_staff ? eq(message_model.sender_id, user_id) : undefined,
       ));
 
@@ -432,16 +333,16 @@ const soft_delete_message = async (message_ids: string[], user_id: number, is_ad
       };
     }
 
-    // Get unique conversation IDs (filter out null values)
-    const conversationIds = [...new Set(messagesToDelete.map(m => m.conversation_id).filter((id): id is number => id !== null))];
+    // Get unique chat IDs
+    const conversationIds = [...new Set(messagesToDelete.map(m => m.chat_id))];
 
-    // Delete the messages
+    // Soft delete the messages
     const deletedMessages = await db
       .update(message_model)
-      .set({ deleted: true })
+      .set({ deleted_at: new Date() })
       .where(and(
-        inArray(message_model.id, message_id_bigint),
-        eq(message_model.deleted, false),
+        inArray(message_model.id, message_ids),
+        isNull(message_model.deleted_at),
         !is_admin_or_staff ? eq(message_model.sender_id, user_id) : undefined,
       ))
       .returning();
@@ -457,7 +358,7 @@ const soft_delete_message = async (message_ids: string[], user_id: number, is_ad
 
     // Broadcast delete event to each conversation
     for (const conversationId of conversationIds) {
-      const messagesInConversation = messagesToDelete.filter(m => m.conversation_id === conversationId);
+      const messagesInConversation = messagesToDelete.filter(m => m.chat_id === conversationId);
 
       // Broadcast delete event
       const message_payload: DeleteMessagePayload = {
@@ -480,7 +381,7 @@ const soft_delete_message = async (message_ids: string[], user_id: number, is_ad
       const members = await get_conversation_members(conversationId);
       const delete_ws_message: WSMessage = {
         type: "message:delete",
-        payload: convertBigIntToString(message_payload),
+        payload: message_payload,
         ws_timestamp: new Date()
       };
       for (const user_id of Array.from(members)) {
@@ -490,49 +391,31 @@ const soft_delete_message = async (message_ids: string[], user_id: number, is_ad
       // Check if any deleted message was the last_message and update if needed
       const [conversation] = await db
         .select()
-        .from(conversation_model)
-        .where(eq(conversation_model.id, conversationId))
+        .from(chat_model)
+        .where(eq(chat_model.id, conversationId))
         .limit(1);
 
-      if (conversation && conversation.metadata) {
-        const metadata = conversation.metadata as any;
-        const lastMessage = metadata.last_message;
-
-        // Check if the deleted message was the last_message
-        if (lastMessage && messagesInConversation.some(m => m.id === lastMessage.id)) {
-          // Get the new last message (non-deleted)
-          const [newLastMessage] = await db
-            .select()
-            .from(message_model)
-            .where(
-              and(
-                eq(message_model.conversation_id, conversationId),
-                eq(message_model.deleted, false)
-              )
+      if (conversation && conversation.last_msg_id && messagesInConversation.some(m => m.id === conversation.last_msg_id)) {
+        // The deleted message was the last_message — find the new last message
+        const [newLastMessage] = await db
+          .select()
+          .from(message_model)
+          .where(
+            and(
+              eq(message_model.chat_id, conversationId),
+              isNull(message_model.deleted_at)
             )
-            .orderBy(desc(message_model.created_at))
-            .limit(1);
+          )
+          .orderBy(desc(message_model.created_at))
+          .limit(1);
 
-          // Update conversation metadata with new last_message or null if no messages left
-          await db
-            .update(conversation_model)
-            .set({
-              metadata: convertBigIntToString(newLastMessage ? {
-                last_message: {
-                  id: newLastMessage.id,
-                  conversation_id: newLastMessage.conversation_id,
-                  sender_id: newLastMessage.sender_id,
-                  type: newLastMessage.type,
-                  body: newLastMessage.body,
-                  attachments: newLastMessage.attachments,
-                  metadata: newLastMessage.metadata,
-                  created_at: newLastMessage.created_at.toISOString(),
-                }
-              } : { last_message: null }),
-              last_message_at: newLastMessage ? newLastMessage.created_at : conversation.last_message_at
-            })
-            .where(eq(conversation_model.id, conversationId));
-        }
+        await db
+          .update(chat_model)
+          .set({
+            last_msg_id: newLastMessage ? newLastMessage.id : null,
+            last_msg_at: newLastMessage ? newLastMessage.sent_at : conversation.last_msg_at
+          })
+          .where(eq(chat_model.id, conversationId));
       }
     }
 
@@ -554,21 +437,20 @@ const soft_delete_message = async (message_ids: string[], user_id: number, is_ad
 };
 
 const delete_message_for_me = async (
-  message_ids: bigint[],
-  user_id: number,
-  conversation_id: number
+  message_ids: string[],
+  user_id: string,
+  conversation_id: string
 ) => {
   try {
-    // const message_ids_bigint = message_ids.map(id => BigInt(id));
     // Verify user is a member of the conversation
     const membership = await db
       .select()
-      .from(conversation_member_model)
+      .from(chat_member_model)
       .where(
         and(
-          eq(conversation_member_model.conversation_id, conversation_id),
-          eq(conversation_member_model.user_id, user_id),
-          eq(conversation_member_model.deleted, false)
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at)
         )
       )
       .limit(1);
@@ -585,13 +467,13 @@ const delete_message_for_me = async (
     const messages = await db
       .select({
         id: message_model.id,
-        conversation_id: message_model.conversation_id,
+        conversation_id: message_model.chat_id,
       })
       .from(message_model)
       .where(
         and(
           inArray(message_model.id, message_ids),
-          eq(message_model.conversation_id, conversation_id)
+          eq(message_model.chat_id, conversation_id)
         )
       );
 
@@ -603,19 +485,17 @@ const delete_message_for_me = async (
       };
     }
 
-    // Update or insert message_status with deleted_at timestamp
-    // First, try to update existing records
+    // Update or insert message_info with deleted_at timestamp
     const updatedStatuses = await db
       .update(message_info_model)
       .set({
         deleted_at: new Date(),
-        updated_at: new Date(),
       })
       .where(
         and(
           inArray(message_info_model.message_id, message_ids),
           eq(message_info_model.user_id, user_id),
-          eq(message_info_model.conv_id, conversation_id)
+          eq(message_info_model.chat_id, conversation_id)
         )
       )
       .returning();
@@ -633,7 +513,7 @@ const delete_message_for_me = async (
           messagesToInsert.map(msg => ({
             message_id: msg.id,
             user_id: user_id,
-            conv_id: conversation_id,
+            chat_id: conversation_id,
             deleted_at: new Date(),
           }))
         )
@@ -644,7 +524,6 @@ const delete_message_for_me = async (
           ],
           set: {
             deleted_at: new Date(),
-            updated_at: new Date(),
           }
         });
     }
@@ -666,12 +545,11 @@ const delete_message_for_me = async (
   }
 };
 
-const hard_delete_message = async (message_id: bigint) => {
+const hard_delete_message = async (message_id: string) => {
   try {
-    // Check if user is super admin (this should be verified at route level)
     const result = await db
       .delete(message_model)
-      .where(eq(message_model.id, BigInt(message_id)))
+      .where(eq(message_model.id, message_id))
       .returning();
 
     if (result.length === 0) {
@@ -699,50 +577,31 @@ const hard_delete_message = async (message_id: bigint) => {
 };
 
 const get_conversation_history = async (
-  conversation_id: number,
-  user_id: number,
-  page: number = 1,
+  conversation_id: string,
+  user_id: string,
   limit: number = 100,
-  before_message_id?: bigint,
-  after_message_id?: bigint,
+  before_message_id?: string,
+  after_message_id?: string,
 ) => {
   try {
-    // First, verify user is a member of this conversation
-    const members = await db
+    // Verify membership with a lightweight single-row check
+    const [membership] = await db
       .select({
-        user_id: conversation_member_model.user_id,
-        name: user_model.name,
-        phone: user_model.phone,
-        user_role: user_model.role,
-        group_role: conversation_member_model.role,
-        profile_pic: user_model.profile_pic,
-        joining_date: conversation_member_model.joined_at,
-        last_read_message_id: conversation_member_model.last_read_message_id,
-        lasthistory_delivered_message_id: conversation_member_model.last_delivered_message_id,
-        is_online: user_model.online_status,
-        connection_status: user_model.connection_status,
+        joining_date: chat_member_model.joined_at,
+        last_read_msg_id: chat_member_model.last_read_msg_id,
+        last_delivered_msg_id: chat_member_model.last_delivered_msg_id,
       })
-      .from(conversation_member_model)
-      .leftJoin(
-        user_model,
-        eq(user_model.id, conversation_member_model.user_id)
-      )
+      .from(chat_member_model)
       .where(
         and(
-          eq(conversation_member_model.conversation_id, conversation_id),
-          eq(conversation_member_model.deleted, false)
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at),
         )
-      );
+      )
+      .limit(1);
 
-    if (members.length === 0) {
-      return {
-        success: false,
-        code: 404,
-        message: "Conversation not found",
-      };
-    }
-
-    if (!members.find(m => m.user_id === user_id)) {
+    if (!membership) {
       return {
         success: false,
         code: 403,
@@ -750,32 +609,8 @@ const get_conversation_history = async (
       };
     }
 
-    const user_details = members.find(m => m.user_id === user_id);
-    if (!user_details) {
-      return {
-        success: false,
-        code: 404,
-        message: "User not found",
-      };
-    }
-    // Calculate offset for pagination
-    const offset = (page - 1) * limit;
-
-    // Get message IDs deleted by this user (delete for me)
-    const userDeletedMessages = await db
-      .select({ message_id: message_info_model.message_id })
-      .from(message_info_model)
-      .where(
-        and(
-          eq(message_info_model.user_id, user_id),
-          eq(message_info_model.conv_id, conversation_id),
-          isNotNull(message_info_model.deleted_at)
-        )
-      );
-
-    const deletedMessageIds = userDeletedMessages.map(d => d.message_id);
-
-    // ── cursor-based mode (jump pagination) ──────────────────────────────────
+    // ── Cursor resolution ────────────────────────────────────────────────
+    let anchor_created_at: Date | null = null;
     if (before_message_id || after_message_id) {
       const [anchor] = await db
         .select({ created_at: message_model.created_at })
@@ -785,158 +620,77 @@ const get_conversation_history = async (
       if (!anchor) {
         return { success: false, code: 404, message: "Anchor message not found" };
       }
+      anchor_created_at = anchor.created_at;
+    }
 
-      const cursorMessages = await db
-        .select({
-          id: message_model.id,
-          conversation_id: message_model.conversation_id,
-          sender_id: message_model.sender_id,
-          type: message_model.type,
-          body: message_model.body,
-          attachments: message_model.attachments,
-          metadata: message_model.metadata,
-          sent_at: message_model.sent_at,
-          created_at: message_model.created_at,
-          status: message_model.status,
-          deleted: message_model.deleted,
-          forwarded_from: message_model.forwarded_from,
-          forwarded_count: message_model.forwarded_to,
-          sender_name: user_model.name,
-          sender_profile_pic: user_model.profile_pic,
-        })
-        .from(message_model)
-        .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+    // ── Single query: messages LEFT JOIN message_info for delete-for-me ──
+    // The LEFT JOIN replaces the separate "fetch deleted IDs" query + NOT IN filter.
+    const delete_for_me = db.$with("dfm").as(
+      db.select({ message_id: message_info_model.message_id })
+        .from(message_info_model)
         .where(
           and(
-            eq(message_model.conversation_id, conversation_id),
-            eq(message_model.deleted, false),
-            deletedMessageIds.length > 0
-              ? not(inArray(message_model.id, deletedMessageIds))
-              : undefined,
-            user_details.joining_date
-              ? gt(message_model.created_at, user_details.joining_date)
-              : undefined,
-            before_message_id
-              ? lt(message_model.created_at, anchor.created_at)
-              : gt(message_model.created_at, anchor.created_at),
+            eq(message_info_model.user_id, user_id),
+            eq(message_info_model.chat_id, conversation_id),
+            isNotNull(message_info_model.deleted_at),
           )
         )
-        .orderBy(
-          before_message_id
-            ? desc(message_model.created_at)
-            : asc(message_model.created_at)
-        )
-        .limit(limit);
+    );
 
-      const hasMore = cursorMessages.length === limit;
-
-      if (before_message_id) cursorMessages.reverse();
-
-      return {
-        success: true,
-        code: 200,
-        data: {
-          messages: cursorMessages,
-          members,
-          pagination: {
-            currentPage: 1,
-            totalPages: 1,
-            totalCount: cursorMessages.length,
-            limit,
-            hasNextPage: hasMore,
-            hasPreviousPage: false,
-          },
-        },
-      };
-    }
-    // ── end cursor branch ─────────────────────────────────────────────────────
-
-    // Get messages with sender information, excluding messages deleted for this user
     const messages = await db
+      .with(delete_for_me)
       .select({
         id: message_model.id,
-        conversation_id: message_model.conversation_id,
+        conversation_id: message_model.chat_id,
         sender_id: message_model.sender_id,
         type: message_model.type,
         body: message_model.body,
         attachments: message_model.attachments,
-        metadata: message_model.metadata,
+        replied_to: message_model.replied_to,
         sent_at: message_model.sent_at,
         created_at: message_model.created_at,
-        status: message_model.status,
-        deleted: message_model.deleted,
-        forwarded_from: message_model.forwarded_from,
-        forwarded_count: message_model.forwarded_to,
-
-        // Sender information
+        deleted_at: message_model.deleted_at,
         sender_name: user_model.name,
         sender_profile_pic: user_model.profile_pic,
       })
       .from(message_model)
-      .innerJoin(
-        user_model,
-        eq(user_model.id, message_model.sender_id)
-      )
+      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+      .leftJoin(delete_for_me, eq(delete_for_me.message_id, message_model.id))
       .where(
         and(
-          or(
-            eq(message_model.conversation_id, conversation_id),
-            arrayContains(message_model.forwarded_to, [conversation_id]),
-          ),
-          // Exclude messages deleted for everyone
-          eq(message_model.deleted, false),
-          // Exclude messages deleted for this specific user (delete for me)
-          deletedMessageIds.length > 0
-            ? not(inArray(message_model.id, deletedMessageIds))
+          eq(message_model.chat_id, conversation_id),
+          isNull(message_model.deleted_at),
+          isNull(delete_for_me.message_id), // exclude delete-for-me
+          membership.joining_date
+            ? gt(message_model.created_at, membership.joining_date)
             : undefined,
-          user_details.joining_date ? gt(message_model.created_at, user_details.joining_date) : undefined
+          // Cursor conditions
+          anchor_created_at && before_message_id
+            ? lt(message_model.created_at, anchor_created_at)
+            : undefined,
+          anchor_created_at && after_message_id
+            ? gt(message_model.created_at, anchor_created_at)
+            : undefined,
         )
       )
-      .orderBy(desc(message_model.created_at))
-      .limit(limit)
-      .offset(offset);
+      .orderBy(
+        before_message_id || !after_message_id
+          ? desc(message_model.created_at)
+          : asc(message_model.created_at)
+      )
+      .limit(limit);
 
-    // Get total count for pagination info (excluding messages deleted for this user)
-    const totalCountResult = await db
-      .select({ count: sql<number>`count(*)` })
-      .from(message_model)
-      .where(
-        and(
-          eq(message_model.conversation_id, conversation_id),
-          eq(message_model.deleted, false),
-          deletedMessageIds.length > 0
-            ? not(inArray(message_model.id, deletedMessageIds))
-            : undefined
-        )
-      );
+    const has_more = messages.length === limit;
 
-    const totalCount = totalCountResult[0]?.count || 0;
-    const totalPages = Math.ceil(totalCount / limit);
-    const hasNextPage = page < totalPages;
-    const hasPreviousPage = page > 1;
-
-    // convert bigint to string for network transfer
-    // messages.forEach((msg) => {
-    //   msg.id = msg.id.toString();
-    //   if (msg.forwarded_from) {
-    //     msg.forwarded_from = msg.forwarded_from.map((id: bigint) => id.toString());
-    //   }
-    // }
+    // Reverse if we fetched backwards (before cursor) or initial load (newest first → oldest first for display)
+    if (before_message_id || !after_message_id) messages.reverse();
 
     return {
       success: true,
       code: 200,
       data: {
-        messages: messages.reverse(), // Reverse to show oldest first
-        members,
-        pagination: {
-          currentPage: page,
-          totalPages,
-          totalCount,
-          limit,
-          hasNextPage,
-          hasPreviousPage,
-        },
+        messages,
+        has_more,
       },
     };
 
@@ -951,8 +705,8 @@ const get_conversation_history = async (
 };
 
 const get_message_statuses = async (
-  conversation_id: number,
-  user_id: number,
+  conversation_id: string,
+  user_id: string,
   page: number = 1,
   limit: number = 1000
 ) => {
@@ -960,14 +714,14 @@ const get_message_statuses = async (
     // First, verify user is a member of this conversation
     const [member] = await db
       .select({
-        user_id: conversation_member_model.user_id,
+        user_id: chat_member_model.user_id,
       })
-      .from(conversation_member_model)
+      .from(chat_member_model)
       .where(
         and(
-          eq(conversation_member_model.conversation_id, conversation_id),
-          eq(conversation_member_model.user_id, user_id),
-          eq(conversation_member_model.deleted, false)
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at)
         )
       )
       .limit(1);
@@ -990,10 +744,10 @@ const get_message_statuses = async (
       .from(message_info_model)
       .where(
         and(
-          eq(message_info_model.conv_id, conversation_id)
+          eq(message_info_model.chat_id, conversation_id)
         )
       )
-      .orderBy(desc(message_info_model.updated_at))
+      .orderBy(desc(message_info_model.delivered_at))
       .limit(limit)
       .offset(offset);
 
@@ -1001,7 +755,7 @@ const get_message_statuses = async (
     const totalCountResult = await db
       .select({ count: sql<number>`count(*)` })
       .from(message_info_model)
-      .where(eq(message_info_model.conv_id, conversation_id));
+      .where(eq(message_info_model.chat_id, conversation_id));
 
     const totalCount = totalCountResult[0]?.count || 0;
     const totalPages = Math.ceil(totalCount / limit);
@@ -1036,41 +790,38 @@ const get_message_statuses = async (
 
 // Helper function to get conversation details for a specific user
 // Returns data in the same format as get_chat_list for consistency
-const getConversationDetailsForUser = async (conversation_id: number, user_id: number) => {
+const getConversationDetailsForUser = async (conversation_id: string, user_id: string) => {
   try {
     const [chat] = await db
       .select({
-        conversationId: conversation_model.id,
-        type: conversation_model.type,
-        title: conversation_model.title,
-        metadata: conversation_model.metadata,
-        lastMessageAt: conversation_model.last_message_at,
-        role: conversation_member_model.role,
-        unreadCount: conversation_member_model.unread_count,
-        joinedAt: conversation_member_model.joined_at,
+        conversationId: chat_model.id,
+        type: chat_model.type,
+        title: chat_model.title,
+        lastMessageAt: chat_model.last_msg_at,
+        role: chat_member_model.role,
+        joinedAt: chat_member_model.joined_at,
         userId: user_model.id,
         userName: user_model.name,
         userPhone: user_model.phone,
-        onlineStatus: user_model.online_status,
         lastSeen: user_model.last_seen,
         userProfilePic: user_model.profile_pic,
       })
-      .from(conversation_member_model)
+      .from(chat_member_model)
       .innerJoin(
-        conversation_model,
-        eq(conversation_model.id, conversation_member_model.conversation_id)
+        chat_model,
+        eq(chat_model.id, chat_member_model.chat_id)
       )
       .leftJoin(
         user_model,
         and(
-          eq(user_model.id, conversation_member_model.user_id),
+          eq(user_model.id, chat_member_model.user_id),
           ne(user_model.id, user_id)
         )
       )
       .where(
         and(
-          eq(conversation_model.id, conversation_id),
-          eq(conversation_member_model.user_id, user_id)
+          eq(chat_model.id, conversation_id),
+          eq(chat_member_model.user_id, user_id)
         )
       )
       .limit(1);
@@ -1087,16 +838,15 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
           userId: user_model.id,
           userName: user_model.name,
           userPhone: user_model.phone,
-          onlineStatus: user_model.online_status,
           lastSeen: user_model.last_seen,
           userProfilePic: user_model.profile_pic,
         })
-        .from(conversation_member_model)
-        .innerJoin(user_model, eq(user_model.id, conversation_member_model.user_id))
+        .from(chat_member_model)
+        .innerJoin(user_model, eq(user_model.id, chat_member_model.user_id))
         .where(
           and(
-            eq(conversation_member_model.conversation_id, conversation_id),
-            ne(conversation_member_model.user_id, user_id)
+            eq(chat_member_model.chat_id, conversation_id),
+            ne(chat_member_model.user_id, user_id)
           )
         )
         .limit(1);
@@ -1106,7 +856,6 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
         userId: otherUser?.userId || null,
         userName: otherUser?.userName || null,
         userPhone: otherUser?.userPhone || null,
-        onlineStatus: otherUser?.onlineStatus || "offline",
         lastSeen: otherUser?.lastSeen || null,
         userProfilePic: otherUser?.userProfilePic || null,
       };
@@ -1121,20 +870,19 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
           userName: user_model.name,
           userPhone: user_model.phone,
           userProfilePic: user_model.profile_pic,
-          role: conversation_member_model.role,
-          joinedAt: conversation_member_model.joined_at,
+          role: chat_member_model.role,
+          joinedAt: chat_member_model.joined_at,
         })
-        .from(conversation_member_model)
-        .innerJoin(user_model, eq(user_model.id, conversation_member_model.user_id))
-        .where(eq(conversation_member_model.conversation_id, conversation_id))
-        .orderBy(asc(conversation_member_model.joined_at));
+        .from(chat_member_model)
+        .innerJoin(user_model, eq(user_model.id, chat_member_model.user_id))
+        .where(eq(chat_member_model.chat_id, conversation_id))
+        .orderBy(asc(chat_member_model.joined_at));
 
       final_chat_item = {
         ...chat,
         userId: null,
         userName: null,
         userPhone: null,
-        onlineStatus: "offline",
         lastSeen: null,
         userProfilePic: null,
         members: members.map(m => ({
@@ -1147,27 +895,6 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
       };
     }
 
-    if (chat.metadata !== null) {
-      const metadata = chat.metadata as any;
-
-      // if last_message exists in metadata, extract it if pinned message available append it as well
-      if (metadata.last_message != null) {
-        final_chat_item = {
-          ...final_chat_item,
-          lastMessageId: metadata.last_message.id,
-          lastMessageBody: metadata.last_message.body,
-          lastMessageType: metadata.last_message.type,
-        };
-      }
-
-      if (metadata.pinned_message != null) {
-        final_chat_item = {
-          ...final_chat_item,
-          pinnedMessageId: metadata.pinned_message.message_id,
-        };
-      }
-    }
-
     return final_chat_item;
   } catch (error) {
     console.error('Error getting conversation details:', error);
@@ -1175,179 +902,10 @@ const getConversationDetailsForUser = async (conversation_id: number, user_id: n
   }
 };
 
-// Fetch and send all undelivered messages to a user on reconnection.
-// async function sync_missed_messages(user_id: number) {
-//   try {
-//     // Get all conversations the user is a member of
-//     const userConversations = await db
-//       .select({
-//         conv_id: conversation_member_model.conversation_id,
-//         conv_type: conversation_model.type,
-//       })
-//       .from(conversation_member_model)
-//       .innerJoin(
-//         conversation_model,
-//         eq(conversation_model.id, conversation_member_model.conversation_id)
-//       )
-//       .where(
-//         and(
-//           eq(conversation_member_model.user_id, user_id),
-//           eq(conversation_member_model.deleted, false)
-//         )
-//       );
-//
-//     if (userConversations.length === 0) {
-//       console.log(`[SYNC] No conversations found for user ${user_id}`);
-//       return {
-//         success: true,
-//         code: 200,
-//         message: "No conversations found, no messages to sync",
-//         data: null,
-//       }
-//     }
-//
-//     const conversationIds = userConversations.map(c => c.conv_id);
-//     const convTypeMap = new Map(userConversations.map(c => [c.conv_id, c.conv_type]));
-//
-//     // Find all messages in user's conversations that haven't been delivered to this user
-//     // These are messages where message_status.delivered_at is NULL for this user
-//     const undeliveredStatuses = await db
-//       .select({
-//         message_id: message_info_model.message_id,
-//         conv_id: message_info_model.conv_id,
-//       })
-//       .from(message_info_model)
-//       .where(
-//         and(
-//           eq(message_info_model.user_id, user_id),
-//           inArray(message_info_model.conv_id, conversationIds),
-//           isNull(message_info_model.delivered_at)
-//         )
-//       )
-//       .limit(500); // Limit to prevent overwhelming the client
-//
-//     console.log("undeliveredStatuses -> ", undeliveredStatuses)
-//     if (undeliveredStatuses.length === 0) {
-//       console.log(`[SYNC] No missed messages for user ${user_id}`);
-//       return {
-//         success: true,
-//         code: 200,
-//         message: "No missed messages to sync",
-//         data: null,
-//       }
-//     }
-//
-//     const messageIds = undeliveredStatuses.map(s => s.message_id);
-//
-//     // Fetch the actual message data
-//     const missedMessages = await db
-//       .select({
-//         id: message_model.id,
-//         conversation_id: message_model.conversation_id,
-//         sender_id: message_model.sender_id,
-//         type: message_model.type,
-//         body: message_model.body,
-//         attachments: message_model.attachments,
-//         metadata: message_model.metadata,
-//         sent_at: message_model.sent_at,
-//         created_at: message_model.created_at,
-//         status: message_model.status,
-//         deleted: message_model.deleted,
-//         forwarded_from: message_model.forwarded_from,
-//         forwarded_count: message_model.forwarded_to,
-//
-//         // Sender information
-//         sender_name: user_model.name,
-//         sender_pfp: user_model.profile_pic,
-//       })
-//       .from(message_model)
-//       .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
-//       .where(
-//         and(
-//           inArray(message_model.id, messageIds),
-//           eq(message_model.deleted, false)
-//         )
-//       )
-//       .orderBy(desc(message_model.sent_at));
-//
-//     if (missedMessages.length === 0) {
-//       console.log(`[SYNC] No valid missed messages for user ${user_id}`);
-//       return {
-//         success: true,
-//         code: 200,
-//         message: "No valid missed messages to sync",
-//         data: null,
-//       }
-//     }
-//
-//     // Transform to SyncMessageItem format
-//     const syncMessages: ChatMessagePayload[] = missedMessages.map(msg => ({
-//       id: msg.id,
-//       sender_id: msg.sender_id,
-//       sender_name: msg.sender_name || undefined,
-//       conv_id: msg.conversation_id!,
-//       conv_type: (convTypeMap.get(msg.conversation_id!) || 'dm') as any,
-//       msg_type: msg.type as any,
-//       body: msg.body || undefined,
-//       attachments: msg.attachments,
-//       metadata: msg.metadata,
-//       sender_pfp: msg.sender_pfp || undefined,
-//       sent_at: msg.sent_at || new Date(),
-//       created_at: msg.created_at,
-//     }));
-//
-//     // Send sync message to user
-//     const syncPayload: SyncMessagesPayload = {
-//       messages: syncMessages.reverse(), // Send oldest first
-//       sync_timestamp: new Date(),
-//       total_count: syncMessages.length,
-//     };
-//
-//     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-//     const sent_status = await broadcast_message({
-//       to: "users",
-//       user_ids: [user_id],
-//       message: {
-//         type: 'message:sync',
-//         payload: syncPayload,
-//         ws_timestamp: new Date(),
-//       },
-//     });
-//
-//     console.log("broadcast_message status-> ", sent_status)
-//     // Mark these messages as delivered
-//     await db
-//       .update(message_info_model)
-//       .set({ delivered_at: new Date() })
-//       .where(
-//         and(
-//           eq(message_info_model.user_id, user_id),
-//           inArray(message_info_model.message_id, messageIds)
-//         )
-//       );
-//
-//     console.log(`[SYNC] Synced ${syncMessages.length} missed messages to user ${user_id}`);
-//     return {
-//       success: true,
-//       code: 200,
-//       message: `Synced ${syncMessages.length} missed messages`,
-//       data: syncMessages.reverse(), // Send oldest first
-//     }
-//
-//   } catch (error) {
-//     console.error(`[SYNC] Error syncing missed messages for user ${user_id}:`, error);
-//     return {
-//       success: false,
-//       code: 500,
-//       message: "ERROR: sync_missed_messages",
-//     };
-//   }
-// }
-
 const get_messages_around = async (
-  conversation_id: number,
-  message_id: bigint,
-  user_id: number,
+  conversation_id: string,
+  message_id: string,
+  user_id: string,
   before: number = 32,
   after: number = 32
 ) => {
@@ -1355,21 +913,21 @@ const get_messages_around = async (
     // 1. Verify user is a member of this conversation
     const members = await db
       .select({
-        user_id: conversation_member_model.user_id,
+        user_id: chat_member_model.user_id,
         name: user_model.name,
         profile_pic: user_model.profile_pic,
-        group_role: conversation_member_model.role,
-        joining_date: conversation_member_model.joined_at,
+        group_role: chat_member_model.role,
+        joining_date: chat_member_model.joined_at,
       })
-      .from(conversation_member_model)
+      .from(chat_member_model)
       .leftJoin(
         user_model,
-        eq(user_model.id, conversation_member_model.user_id)
+        eq(user_model.id, chat_member_model.user_id)
       )
       .where(
         and(
-          eq(conversation_member_model.conversation_id, conversation_id),
-          eq(conversation_member_model.deleted, false)
+          eq(chat_member_model.chat_id, conversation_id),
+          isNull(chat_member_model.removed_at)
         )
       );
 
@@ -1391,18 +949,20 @@ const get_messages_around = async (
       .where(
         and(
           eq(message_model.id, message_id),
-          eq(message_model.deleted, false)
+          isNull(message_model.deleted_at)
         )
       )
       .limit(1);
 
-    if (!targetMessage) {
+    if (!targetMessage || !targetMessage.created_at) {
       return {
         success: false,
         code: 404,
         message: "Message not found",
       };
     }
+
+    const target_created_at = targetMessage.created_at;
 
     // 3. Get message IDs deleted by this user (delete for me)
     const userDeletedMessages = await db
@@ -1411,7 +971,7 @@ const get_messages_around = async (
       .where(
         and(
           eq(message_info_model.user_id, user_id),
-          eq(message_info_model.conv_id, conversation_id),
+          eq(message_info_model.chat_id, conversation_id),
           isNotNull(message_info_model.deleted_at)
         )
       );
@@ -1425,18 +985,15 @@ const get_messages_around = async (
     const olderMessages = await db
       .select({
         id: message_model.id,
-        conversation_id: message_model.conversation_id,
+        conversation_id: message_model.chat_id,
         sender_id: message_model.sender_id,
         type: message_model.type,
         body: message_model.body,
         attachments: message_model.attachments,
-        metadata: message_model.metadata,
+        replied_to: message_model.replied_to,
         sent_at: message_model.sent_at,
         created_at: message_model.created_at,
-        status: message_model.status,
-        deleted: message_model.deleted,
-        forwarded_from: message_model.forwarded_from,
-        forwarded_count: message_model.forwarded_to,
+        deleted_at: message_model.deleted_at,
         sender_name: user_model.name,
         sender_profile_pic: user_model.profile_pic,
       })
@@ -1444,9 +1001,9 @@ const get_messages_around = async (
       .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
       .where(
         and(
-          eq(message_model.conversation_id, conversation_id),
-          eq(message_model.deleted, false),
-          lt(message_model.created_at, targetMessage.created_at),
+          eq(message_model.chat_id, conversation_id),
+          isNull(message_model.deleted_at),
+          lt(message_model.created_at, target_created_at),
           deleteFilter,
         )
       )
@@ -1457,18 +1014,15 @@ const get_messages_around = async (
     const newerMessages = await db
       .select({
         id: message_model.id,
-        conversation_id: message_model.conversation_id,
+        conversation_id: message_model.chat_id,
         sender_id: message_model.sender_id,
         type: message_model.type,
         body: message_model.body,
         attachments: message_model.attachments,
-        metadata: message_model.metadata,
+        replied_to: message_model.replied_to,
         sent_at: message_model.sent_at,
         created_at: message_model.created_at,
-        status: message_model.status,
-        deleted: message_model.deleted,
-        forwarded_from: message_model.forwarded_from,
-        forwarded_count: message_model.forwarded_to,
+        deleted_at: message_model.deleted_at,
         sender_name: user_model.name,
         sender_profile_pic: user_model.profile_pic,
       })
@@ -1476,9 +1030,9 @@ const get_messages_around = async (
       .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
       .where(
         and(
-          eq(message_model.conversation_id, conversation_id),
-          eq(message_model.deleted, false),
-          gt(message_model.created_at, targetMessage.created_at),
+          eq(message_model.chat_id, conversation_id),
+          isNull(message_model.deleted_at),
+          gt(message_model.created_at, target_created_at),
           deleteFilter,
         )
       )
@@ -1489,18 +1043,15 @@ const get_messages_around = async (
     const [target] = await db
       .select({
         id: message_model.id,
-        conversation_id: message_model.conversation_id,
+        conversation_id: message_model.chat_id,
         sender_id: message_model.sender_id,
         type: message_model.type,
         body: message_model.body,
         attachments: message_model.attachments,
-        metadata: message_model.metadata,
+        replied_to: message_model.replied_to,
         sent_at: message_model.sent_at,
         created_at: message_model.created_at,
-        status: message_model.status,
-        deleted: message_model.deleted,
-        forwarded_from: message_model.forwarded_from,
-        forwarded_count: message_model.forwarded_to,
+        deleted_at: message_model.deleted_at,
         sender_name: user_model.name,
         sender_profile_pic: user_model.profile_pic,
       })

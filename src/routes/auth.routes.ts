@@ -5,7 +5,6 @@ import { create_signup_request, get_signup_request_status, handle_login, handle_
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
-import { password } from "bun";
 import Elysia, { t } from "elysia";
 import { eq, sql } from "drizzle-orm";
 import { remove_fcm_token } from "@/services/cache-management/fcm-token.cache";
@@ -456,10 +455,10 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       await remove_fcm_token(info.data.id);
 
       // Update online status in DB
-      await db
-        .update(user_model)
-        .set({ online_status: false })
-        .where(eq(user_model.id, info.data.id));
+      // await db
+      //   .update(user_model)
+      //   .set({ online_status: false })
+      //   .where(eq(user_model.id, info.data.id));
     }
 
     const userAgent = headers['user-agent'];

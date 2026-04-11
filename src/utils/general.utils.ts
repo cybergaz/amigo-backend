@@ -5,8 +5,8 @@ import { customAlphabet } from "nanoid";
 import { parsePhoneNumberFromString } from "libphonenumber-js";
 
 const create_unique_id = () => {
-  const nanoid = customAlphabet("0123456789", 15);
-  return Number(nanoid());
+  const nanoid = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 20);
+  return nanoid();
 };
 
 const create_otp = () => {
@@ -20,7 +20,7 @@ const hash_password = async (password: string): Promise<string> => {
 };
 
 
-const generate_jwt = (id: number, role: string, time: StringValue = "1d") => {
+const generate_jwt = (id: string, role: string, time: StringValue = "1d") => {
   return jwt.sign({
     id,
     role,
@@ -30,7 +30,7 @@ const generate_jwt = (id: number, role: string, time: StringValue = "1d") => {
   });
 };
 
-const generate_refresh_jwt = (id: number, role: string, time: StringValue = "7d") => {
+const generate_refresh_jwt = (id: string, role: string, time: StringValue = "7d") => {
   return jwt.sign({ id, role }, process.env.ACCESS_KEY || "heymama", {
     expiresIn: time,
   });
@@ -59,7 +59,7 @@ function parse_phone(input: string, default_country_code?: string) {
   };
 }
 
-const create_dm_key = (user1: number, user2: number) => {
+const create_dm_key = (user1: string, user2: string) => {
   return [user1, user2].sort().join("_");
 }
 

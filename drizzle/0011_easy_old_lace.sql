@@ -1,1 +1,0 @@
-ALTER TABLE "message_status" ADD COLUMN "deleted_at" timestamp with time zone;

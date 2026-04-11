@@ -11,7 +11,7 @@ import { get_allowed_file_types, S3_FOLDERS } from "@/services/s3.service";
 import { app_middleware } from "@/middleware";
 
 const media_routes = new Elysia({ prefix: "/media" })
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });

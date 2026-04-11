@@ -7,7 +7,7 @@ import { get_user_details } from "@/services/user.services";
 import { polling_connections } from "@/sockets/socket.server";
 
 export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
@@ -85,7 +85,6 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
           delivered_at: new Date(),
           delivered_to: [],
           read_by: [],
-          offline_users: [],
         };
 
         // Return success - the handler will broadcast responses via polling cache

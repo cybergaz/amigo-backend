@@ -1,5 +1,5 @@
 import db from "@/config/db";
-import { conversation_model, conversation_member_model } from "@/models/chat.model";
+import { chat_model, chat_member_model } from "@/models/chat.model";
 import {
   message_model,
   message_info_model,
@@ -24,20 +24,22 @@ import {
 } from "@/types/chat.types";
 import { ResultType } from "@/types/core.types";
 import { ChatMessageAckPayload, ChatMessagePayload, MessagePinPayload, MessageReactPayload, SyncMessagesPayload } from "@/types/socket.types";
-import { convertBigIntToString, convertStringToBigInt } from "@/utils/serialization.utils";
+import { create_unique_id } from "@/utils/general.utils";
 import Snowflake from "@/utils/snowflake.utils";
 import { and, desc, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { log_current_cache_state, remove_pending_message } from "./cache-management/polling.cache";
+import { randomUUIDv7 } from "bun";
 
 // Helper function to verify user membership in conversation
-const verify_user_membership = async (conversation_id: number, user_id: number) => {
+const verify_user_membership = async (conversation_id: string, user_id: string) => {
   const membership = await db
-    .select({ id: conversation_member_model.id, role: conversation_member_model.role })
-    .from(conversation_member_model)
+    .select({ id: chat_member_model.id, role: chat_member_model.role })
+    .from(chat_member_model)
     .where(
       and(
-        eq(conversation_member_model.conversation_id, conversation_id),
-        eq(conversation_member_model.user_id, user_id)
+        eq(chat_member_model.chat_id, conversation_id),
+        eq(chat_member_model.user_id, user_id),
+        isNull(chat_member_model.removed_at)
       )
     );
 
@@ -45,7 +47,7 @@ const verify_user_membership = async (conversation_id: number, user_id: number) 
 };
 
 // Helper function to get user info
-const get_user_info = async (user_id: number) => {
+const get_user_info = async (user_id: string) => {
   const [user] = await db
     .select({ id: user_model.id, name: user_model.name })
     .from(user_model)
@@ -54,58 +56,19 @@ const get_user_info = async (user_id: number) => {
   return user;
 };
 
-const store_message = async (payload: ChatMessagePayload, custom_msg_id?: bigint): Promise<ResultType<DBInsertMessageType>> => {
+const store_message = async (payload: ChatMessagePayload, custom_msg_id?: string): Promise<ResultType<DBInsertMessageType>> => {
   try {
-
-    // Handle reply metadata if applicable
-    if (payload.reply_to_message_id) {
-      // Fetch original message info
-      const [originalMessage] = await db
-        .select({
-          id: message_model.id,
-          body: message_model.body,
-          sender_id: message_model.sender_id,
-          created_at: message_model.created_at,
-        })
-        .from(message_model)
-        .where(
-          and(
-            eq(message_model.id, payload.reply_to_message_id),
-            eq(message_model.conversation_id, payload.conv_id),
-            eq(message_model.deleted, false)
-          )
-        );
-
-      if (originalMessage) {
-        // Create reply metadata
-        const replyMetadata: MessageMetadata = {
-          reply_to: {
-            message_id: originalMessage.id,
-            sender_id: originalMessage.sender_id,
-            body: originalMessage.body?.substring(0, 100) || "", // Preview of original message
-            created_at: originalMessage.created_at?.toISOString() || ""
-          }
-        };
-
-        // Merge with existing metadata if any
-        // convert BigInt to string to avoid serialization issues
-        payload.metadata = convertBigIntToString({
-          ...(payload.metadata || {}),
-          ...replyMetadata
-        });
-      }
-    }
 
     const [new_message] = await db
       .insert(message_model)
       .values({
         id: custom_msg_id ? custom_msg_id : payload.id,
-        conversation_id: payload.conv_id,
+        chat_id: payload.conv_id,
+        replied_to: payload.replied_to || null,
         sender_id: payload.sender_id,
         type: payload.msg_type,
         body: payload.body,
         attachments: payload.attachments,
-        metadata: payload.metadata,
         sent_at: new Date(payload.sent_at),
       }).returning();
 
@@ -144,23 +107,22 @@ const store_message = async (payload: ChatMessagePayload, custom_msg_id?: bigint
 
 
 interface StoreWithRetryResultType extends ResultType<DBInsertMessageType> {
-  new_id?: bigint; // If a new ID was generated due to collision, return it here
+  new_id?: string; // If a new ID was generated due to collision, return it here
 }
 
 const store_message_with_retry = async (payload: ChatMessagePayload, retry_count: number): Promise<StoreWithRetryResultType> => {
-  // first try with the provided ID (optimistic case)
+  // first try with the provided ID (optimistic case — client generates UUIDv7)
   const store_result = await store_message(payload);
 
   if (store_result.success) {
     return store_result;
   }
   for (let i = 0; i < retry_count; i++) {
-
-    // if failed due to ID collision, generate a new ID and try again
-    const new_id = Snowflake.generateMessageId(payload.sender_id);
+    // if failed due to ID collision, generate a new server-side ID and try again
+    const new_id = randomUUIDv7();
     const store_result = await store_message(payload, new_id);
     if (store_result.success) {
-      return { ...store_result, new_id: new_id };
+      return { ...store_result, new_id };
     }
   }
 
@@ -171,17 +133,52 @@ const store_message_with_retry = async (payload: ChatMessagePayload, retry_count
   };
 };
 
-// Pin messages
+// Pin a message in a conversation — stores message_id in chat_model.pinned_msg_id
+// (only one pinned message per conversation; calling again overwrites the previous pin)
 const pin_message = async (payload: PinMessageRequest) => {
   try {
-    // Get current conversation metadata
-    const [conversation] = await db
-      .select({ metadata: conversation_model.metadata })
-      .from(conversation_model)
-      .where(eq(conversation_model.id, payload.conv_id))
+    // Verify user is a member of the conversation
+    const membership = await verify_user_membership(payload.conv_id, payload.user_id);
+    if (!membership) {
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
+
+    // Verify message exists in this conversation and isn't deleted
+    const [message] = await db
+      .select({
+        id: message_model.id,
+        type: message_model.type,
+      })
+      .from(message_model)
+      .where(
+        and(
+          eq(message_model.id, payload.message_id),
+          eq(message_model.chat_id, payload.conv_id),
+          isNull(message_model.deleted_at)
+        )
+      )
       .limit(1);
 
-    if (!conversation) {
+    if (!message) {
+      return {
+        success: false,
+        code: 404,
+        message: "Message not found",
+      };
+    }
+
+    // Store the pinned message ID on the chat
+    const [updated] = await db
+      .update(chat_model)
+      .set({ pinned_msg_id: payload.message_id })
+      .where(eq(chat_model.id, payload.conv_id))
+      .returning({ id: chat_model.id });
+
+    if (!updated) {
       return {
         success: false,
         code: 404,
@@ -189,82 +186,67 @@ const pin_message = async (payload: PinMessageRequest) => {
       };
     }
 
-    const currentMetadata = (conversation.metadata as ConversationMetadata) || {};
+    // Fetch sender name for the broadcast payload
+    const user = await get_user_info(payload.user_id);
 
-    // Check if this message is already pinned
-    const isCurrentlyPinned = currentMetadata.pinned_message?.message_id === payload.message_id;
+    // Broadcast pin event to all members of the conversation
+    const pinPayload: MessagePinPayload = {
+      conv_id: payload.conv_id,
+      message_id: payload.message_id,
+      message_type: message.type as MessageType,
+      sender_id: payload.user_id,
+      sender_name: user?.name ?? undefined,
+      pin: true,
+    };
 
-    let newMetadata: ConversationMetadata;
-
-    if (isCurrentlyPinned) {
-      // Unpin the message by removing pinned_message from metadata
-      const { pinned_message, ...restMetadata } = currentMetadata;
-
-      newMetadata = {
-        ...restMetadata,
-        pinned_message: {
-          message_id: payload.message_id,
-          user_id: payload.user_id,
-          pinned_at: new Date().toISOString()
-        }
-      };
-    } else {
-      // Pin the new message (this will replace any existing pinned message)
-
-      newMetadata = {
-        ...currentMetadata,
-        pinned_message: {
-          message_id: payload.message_id,
-          user_id: payload.user_id,
-          pinned_at: new Date().toISOString()
-        }
-      };
-    }
-
-    // Update conversation metadata
-    await db
-      .update(conversation_model)
-      .set({
-        // convert BigInt to string in metadata to avoid serialization issues
-        metadata: convertBigIntToString(newMetadata)
-      })
-      .where(eq(conversation_model.id, payload.conv_id));
+    await broadcast_message({
+      to: "conversation",
+      conv_id: payload.conv_id,
+      message: {
+        type: "message:pin",
+        payload: pinPayload,
+        ws_timestamp: new Date(),
+      },
+    });
 
     return {
       success: true,
       code: 200,
       message: "Message pinned successfully",
-      data: {
-        conversation_id: payload.conv_id,
-        message_id: payload.message_id,
-        pinned: !isCurrentlyPinned,
-        pinned_by: !isCurrentlyPinned ? {
-          user_id: payload.user_id,
-          pinned_at: new Date().toISOString()
-        } : null
-      },
+      data: { conv_id: payload.conv_id, message_id: payload.message_id },
     };
-  }
-  catch (error) {
-    console.error("pin_messages error", error);
+  } catch (error) {
+    console.error("pin_message error", error);
     return {
       success: false,
       code: 500,
-      message: "ERROR: pin_messages",
+      message: "ERROR: pin_message",
     };
   }
 };
 
+// Unpin a message — clears chat_model.pinned_msg_id, but only if the
+// currently pinned message matches the requested message_id (idempotent guard).
 const unpin_message = async (payload: PinMessageRequest) => {
   try {
-    // Get current conversation metadata
-    const [conversation] = await db
-      .select({ metadata: conversation_model.metadata })
-      .from(conversation_model)
-      .where(eq(conversation_model.id, payload.conv_id))
+    // Verify user is a member of the conversation
+    const membership = await verify_user_membership(payload.conv_id, payload.user_id);
+    if (!membership) {
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
+
+    // Get current pinned_msg_id to verify it matches
+    const [conv] = await db
+      .select({ pinned_msg_id: chat_model.pinned_msg_id })
+      .from(chat_model)
+      .where(eq(chat_model.id, payload.conv_id))
       .limit(1);
 
-    if (!conversation) {
+    if (!conv) {
       return {
         success: false,
         code: 404,
@@ -272,150 +254,68 @@ const unpin_message = async (payload: PinMessageRequest) => {
       };
     }
 
-    const currentMetadata = (conversation.metadata as ConversationMetadata) || {};
-
-    // Check if this message is already pinned
-    const isCurrentlyPinned = currentMetadata.pinned_message?.message_id === payload.message_id;
-
-    let newMetadata: ConversationMetadata = currentMetadata;
-
-    if (isCurrentlyPinned) {
-      // Unpin the message by removing pinned_message from metadata
-      const { pinned_message, ...restMetadata } = currentMetadata;
-      newMetadata = restMetadata;
+    if (conv.pinned_msg_id !== payload.message_id) {
+      return {
+        success: false,
+        code: 409,
+        message: "This message is not currently pinned",
+      };
     }
 
-    // Update conversation metadata
+    // Fetch message type for the broadcast payload (best-effort — may be deleted)
+    const [message] = await db
+      .select({ type: message_model.type })
+      .from(message_model)
+      .where(eq(message_model.id, payload.message_id))
+      .limit(1);
+
+    // Clear the pinned message
     await db
-      .update(conversation_model)
-      .set({ metadata: newMetadata })
-      .where(eq(conversation_model.id, payload.conv_id));
+      .update(chat_model)
+      .set({ pinned_msg_id: null })
+      .where(eq(chat_model.id, payload.conv_id));
+
+    // Fetch sender name for the broadcast payload
+    const user = await get_user_info(payload.user_id);
+
+    // Broadcast unpin event to all members of the conversation
+    const unpinPayload: MessagePinPayload = {
+      conv_id: payload.conv_id,
+      message_id: payload.message_id,
+      message_type: (message?.type ?? "text") as MessageType,
+      sender_id: payload.user_id,
+      sender_name: user?.name ?? undefined,
+      pin: false,
+    };
+
+    await broadcast_message({
+      to: "conversation",
+      conv_id: payload.conv_id,
+      message: {
+        type: "message:pin",
+        payload: unpinPayload,
+        ws_timestamp: new Date(),
+      },
+    });
 
     return {
       success: true,
       code: 200,
       message: "Message unpinned successfully",
-      data: {
-        conversation_id: payload.conv_id,
-        message_id: payload.message_id,
-        pinned: !isCurrentlyPinned,
-        pinned_by: !isCurrentlyPinned ? {
-          user_id: payload.user_id,
-          pinned_at: new Date().toISOString()
-        } : null
-      },
+      data: { conv_id: payload.conv_id, message_id: payload.message_id },
     };
-  }
-  catch (error) {
-    console.error("unpin_messages error", error);
-    return {
-      success: false,
-      code: 500,
-      message: "ERROR: unpin_messages",
-    };
-  }
-};
-
-// Star/Unstar messages
-const star_messages = async (request: StarMessageRequest, user_id: number) => {
-  try {
-    // Verify user membership
-    // const membership = await verify_user_membership(request.conversation_id, user_id);
-    // if (!membership) {
-    //   return {
-    //     success: false,
-    //     code: 403,
-    //     message: "You are not a member of this conversation",
-    //   };
-    // }
-    //
-    // // Get user info
-    // const user = await get_user_info(user_id);
-    // if (!user) {
-    //   return {
-    //     success: false,
-    //     code: 404,
-    //     message: "User not found",
-    //   };
-    // }
-
-    // Get messages to star
-    const messages = await db
-      .select()
-      .from(message_model)
-      .where(
-        and(
-          inArray(message_model.id, request.message_ids),
-          eq(message_model.conversation_id, request.conversation_id),
-          eq(message_model.deleted, false)
-        )
-      );
-
-    if (messages.length === 0) {
-      return {
-        success: false,
-        code: 404,
-        message: "No valid messages found to star",
-      };
-    }
-
-    // Update messages with star metadata
-    const updatedMessages = [];
-    for (const message of messages) {
-      const currentMetadata = convertStringToBigInt(message.metadata) as MessageMetadata || {};
-      const starredBy = currentMetadata.starred_by || [];
-
-      // Check if user already starred this message
-      const existingStarIndex = starredBy.findIndex(star => star.user_id === user_id);
-
-      let newStarredBy;
-      if (existingStarIndex >= 0) {
-        // Unstar - remove user from starred_by array
-        newStarredBy = starredBy.filter((_, index) => index !== existingStarIndex);
-      } else {
-        // Star - add user to starred_by array
-        newStarredBy = [
-          ...starredBy,
-          {
-            user_id,
-            starred_at: new Date().toISOString()
-          }
-        ];
-      }
-
-      const newMetadata = convertBigIntToString({
-        ...currentMetadata,
-        starred_by: newStarredBy.length > 0 ? newStarredBy : undefined
-      });
-
-      const [updatedMessage] = await db
-        .update(message_model)
-        .set({ metadata: newMetadata })
-        .where(eq(message_model.id, message.id))
-        .returning();
-
-      updatedMessages.push(updatedMessage);
-    }
-
-    return {
-      success: true,
-      code: 200,
-      message: "Messages star status updated successfully",
-      data: updatedMessages,
-    };
-
   } catch (error) {
-    console.error("star_messages error", error);
+    console.error("unpin_message error", error);
     return {
       success: false,
       code: 500,
-      message: "ERROR: star_messages",
+      message: "ERROR: unpin_message",
     };
   }
 };
 
 // Reply to message
-const reply_to_message = async (request: ReplyMessageRequest, user_id: number) => {
+const reply_to_message = async (request: ReplyMessageRequest, user_id: string) => {
   try {
     // Verify user membership
     // const membership = await verify_user_membership(request.conversation_id, user_id);
@@ -439,8 +339,8 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: number) =
       .where(
         and(
           eq(message_model.id, request.reply_to_message_id),
-          eq(message_model.conversation_id, request.conversation_id),
-          eq(message_model.deleted, false)
+          eq(message_model.chat_id, request.conversation_id),
+          isNull(message_model.deleted_at)
         )
       );
 
@@ -453,35 +353,25 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: number) =
       };
     }
 
-    // Create reply metadata
-    const replyMetadata: MessageMetadata = {
-      reply_to: {
-        message_id: originalMessage.id,
-        sender_id: originalMessage.sender_id,
-        body: originalMessage.body?.substring(0, 100) || "", // Preview of original message
-        created_at: originalMessage.created_at?.toISOString() || ""
-      }
-    };
-
-    // Create new reply message
+    // Create new reply message — replied_to column stores the reference
     const [replyMessage] = await db
       .insert(message_model)
       .values({
         id: request.message_id,
-        conversation_id: request.conversation_id,
+        chat_id: request.conversation_id,
         sender_id: user_id,
         type: "text",
         body: request.body,
         attachments: request.attachments,
-        metadata: convertBigIntToString(replyMetadata),
+        replied_to: originalMessage.id,
       })
       .returning();
 
-    // Update conversation's last_message_at
+    // Update conversation's last_msg_at
     await db
-      .update(conversation_model)
-      .set({ last_message_at: new Date() })
-      .where(eq(conversation_model.id, request.conversation_id));
+      .update(chat_model)
+      .set({ last_msg_at: new Date(), last_msg_id: replyMessage?.id })
+      .where(eq(chat_model.id, request.conversation_id));
 
     return {
       success: true,
@@ -501,7 +391,7 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: number) =
 };
 
 // Forward messages
-const forward_messages = async (request: ForwardMessageRequest, user_id: number) => {
+const forward_messages = async (request: ForwardMessageRequest, user_id: string) => {
   try {
 
     // Get messages to forward
@@ -511,8 +401,8 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
       .where(
         and(
           inArray(message_model.id, request.message_ids),
-          eq(message_model.conversation_id, request.source_conversation_id),
-          eq(message_model.deleted, false)
+          eq(message_model.chat_id, request.source_conversation_id),
+          isNull(message_model.deleted_at)
         )
       )
       .orderBy(message_model.created_at);
@@ -525,39 +415,28 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
       };
     }
 
-    const forwardedMessages: Map<number, (DBMessageType & { conv_type: string; })[]> = new Map();
+    const forwardedMessages: Map<string, (DBMessageType & { conv_type: string; })[]> = new Map();
 
     for (const target_conv_id of request.target_conversation_ids) {
 
       const all_msgs: (DBMessageType & { conv_type: string; })[] = [];
 
       const [conv] = await db
-        .select({ conv_type: conversation_model.type })
-        .from(conversation_model)
-        .where(eq(conversation_model.id, target_conv_id));
+        .select({ conv_type: chat_model.type })
+        .from(chat_model)
+        .where(eq(chat_model.id, target_conv_id));
 
 
       for (const message of original_messages) {
         const [inserted_msg] = await db
           .insert(message_model)
           .values({
-            id: Snowflake.generateMessageId(user_id),
-            conversation_id: target_conv_id,
+            id: randomUUIDv7(),
+            chat_id: target_conv_id,
             sender_id: user_id,
             type: message.type,
             body: message.body,
             attachments: message.attachments,
-            metadata: {
-              ...message.metadata as any,
-              forwarded_from: {
-                original_message_id: message.id.toString(),
-                original_conversation_id: request.source_conversation_id,
-                original_sender_id: message.sender_id,
-                forwarded_by: user_id,
-                forwarded_at: new Date().toISOString()
-              }
-            },
-            forwarded_from: request.source_conversation_id,
             sent_at: new Date(),
           }).returning();
 
@@ -588,7 +467,7 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: number)
 };
 
 // Delete messages
-const delete_messages = async (request: DeleteMessageRequest, user_id: number) => {
+const delete_messages = async (request: DeleteMessageRequest, user_id: string) => {
   try {
     // Verify user membership
     // const membership = await verify_user_membership(request.conversation_id, user_id);
@@ -607,8 +486,8 @@ const delete_messages = async (request: DeleteMessageRequest, user_id: number) =
       .where(
         and(
           inArray(message_model.id, request.message_ids),
-          eq(message_model.conversation_id, request.conversation_id),
-          eq(message_model.deleted, false)
+          eq(message_model.chat_id, request.conversation_id),
+          isNull(message_model.deleted_at)
         )
       );
 
@@ -639,16 +518,7 @@ const delete_messages = async (request: DeleteMessageRequest, user_id: number) =
       const [deletedMessage] = await db
         .update(message_model)
         .set({
-          deleted: true,
-          // body: null, // Clear message content
-          // attachments: null // Clear attachments
-          metadata: {
-            ...(messages.find(m => m.id === message)?.metadata as any || {}),
-            deleted_by: {
-              user_id,
-              deleted_at: new Date().toISOString()
-            }
-          }
+          deleted_at: new Date(),
         })
         .where(eq(message_model.id, message))
         .returning();
@@ -684,132 +554,25 @@ const delete_messages = async (request: DeleteMessageRequest, user_id: number) =
 };
 
 // Get pinned messages for a conversation
-const get_pinned_messages = async (conversation_id: number, user_id: number) => {
-  try {
-    // Verify user membership
-    // const membership = await verify_user_membership(conversation_id, user_id);
-    // if (!membership) {
-    //   return {
-    //     success: false,
-    //     code: 403,
-    //     message: "You are not a member of this conversation",
-    //   };
-    // }
-
-    // Get conversation metadata to find pinned message
-    const [conversation] = await db
-      .select({ metadata: conversation_model.metadata })
-      .from(conversation_model)
-      .where(eq(conversation_model.id, conversation_id))
-      .limit(1);
-
-    if (!conversation) {
-      return {
-        success: false,
-        code: 404,
-        message: "Conversation not found",
-      };
-    }
-
-    const conversationMetadata = (conversation.metadata as ConversationMetadata) || {};
-
-    // If no pinned message, return empty array
-    if (!conversationMetadata.pinned_message) {
-      return {
-        success: false,
-        code: 404,
-        message: "No pinned messages",
-      };
-    }
-
-    // Get the pinned message details
-    const pinnedMessage = await db
-      .select()
-      .from(message_model)
-      .where(
-        and(
-          eq(message_model.id, conversationMetadata.pinned_message.message_id),
-          eq(message_model.conversation_id, conversation_id),
-          eq(message_model.deleted, false)
-        )
-      )
-      .limit(1);
-
-    // Add pinned metadata to the message
-    const result = pinnedMessage.length > 0 ? [{
-      ...pinnedMessage[0],
-      pinned_by: {
-        user_id: conversationMetadata.pinned_message.user_id,
-        pinned_at: conversationMetadata.pinned_message.pinned_at
-      }
-    }] : [];
-
-    return {
-      success: true,
-      code: 200,
-      data: result,
-    };
-
-  } catch (error) {
-    console.error("get_pinned_messages error", error);
-    return {
-      success: false,
-      code: 500,
-      message: "ERROR: get_pinned_messages",
-    };
-  }
+// TODO: needs dedicated pinned_message_id column on chat_model (metadata column was removed)
+const get_pinned_messages = async (conversation_id: string, user_id: string) => {
+  return {
+    success: false,
+    code: 501,
+    message: "Get pinned feature pending migration — metadata column removed",
+  };
 };
 
-// Get starred messages for a user
-const get_starred_messages = async (user_id: number, conversation_id?: number) => {
-  try {
-    let whereConditions = and(
-      eq(message_model.deleted, false),
-      sql`${message_model.metadata}->'starred_by' @> '[{"user_id": ${user_id}}]'`
-    );
-
-    if (conversation_id) {
-      whereConditions = and(
-        whereConditions,
-        eq(message_model.conversation_id, conversation_id)
-      );
-    }
-
-    const starredMessages = await db
-      .select({
-        id: message_model.id,
-        conversation_id: message_model.conversation_id,
-        sender_id: message_model.sender_id,
-        type: message_model.type,
-        body: message_model.body,
-        attachments: message_model.attachments,
-        metadata: message_model.metadata,
-        created_at: message_model.created_at,
-        sender_name: user_model.name,
-        sender_profile_pic: user_model.profile_pic,
-      })
-      .from(message_model)
-      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
-      .where(whereConditions)
-      .orderBy(desc(message_model.created_at));
-
-    return {
-      success: true,
-      code: 200,
-      data: starredMessages,
-    };
-
-  } catch (error) {
-    console.error("get_starred_messages error", error);
-    return {
-      success: false,
-      code: 500,
-      message: "ERROR: get_starred_messages",
-    };
-  }
+// TODO: needs dedicated star tracking (e.g. via message_info_model) — metadata column was removed
+const get_starred_messages = async (user_id: string, conversation_id?: string) => {
+  return {
+    success: false,
+    code: 501,
+    message: "Get starred feature pending migration — metadata column removed",
+  };
 };
 
-const insert_message_status = async (msg_status: Pick<DBInsertMessageStatusType, "user_id" | "message_id" | "conv_id" | "delivered_at" | "read_at">) => {
+const insert_message_status = async (msg_status: Pick<DBInsertMessageStatusType, "user_id" | "message_id" | "chat_id" | "delivered_at" | "read_at">) => {
   try {
 
     // Upsert message status
@@ -818,10 +581,9 @@ const insert_message_status = async (msg_status: Pick<DBInsertMessageStatusType,
       .values({
         user_id: msg_status.user_id,
         message_id: msg_status.message_id,
-        conv_id: msg_status.conv_id,
+        chat_id: msg_status.chat_id,
         delivered_at: msg_status.delivered_at,
         read_at: msg_status.read_at,
-        updated_at: new Date()
       }).returning();
 
     if (!inserted_status) {
@@ -867,7 +629,6 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
         .update(message_info_model)
         .set({
           delivered_at: msg_status.delivered_at,
-          updated_at: new Date()
         }).where(
           and(
             eq(message_info_model.message_id, msg_status.message_id),
@@ -880,7 +641,6 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
         .update(message_info_model)
         .set({
           read_at: msg_status.delivered_at,
-          updated_at: new Date()
         }).where(
           and(
             eq(message_info_model.message_id, msg_status.message_id),
@@ -895,7 +655,6 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
         .set({
           delivered_at: msg_status.delivered_at,
           read_at: msg_status.read_at,
-          updated_at: new Date()
         }).where(
           and(
             eq(message_info_model.message_id, msg_status.message_id),
@@ -939,7 +698,7 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
 // @param statuses Array of message status records to insert
 // @returns Success/failure response
 const batch_insert_message_status = async (
-  statuses: Array<Pick<DBInsertMessageStatusType, "user_id" | "message_id" | "conv_id" | "delivered_at" | "read_at">>
+  statuses: Array<Pick<DBInsertMessageStatusType, "user_id" | "message_id" | "chat_id" | "delivered_at" | "read_at">>
 ) => {
   try {
     if (statuses.length === 0) {
@@ -955,10 +714,9 @@ const batch_insert_message_status = async (
     const records = statuses.map(status => ({
       user_id: status.user_id,
       message_id: status.message_id,
-      conv_id: status.conv_id,
+      chat_id: status.chat_id,
       delivered_at: status.delivered_at || null,
       read_at: status.read_at || null,
-      updated_at: new Date()
     }));
 
     // Batch insert all records in a single query
@@ -998,10 +756,10 @@ const batch_insert_message_status = async (
 // @param status_update Object containing delivered_at and/or read_at timestamps
 // @returns Success/failure response
 const batch_update_message_status = async (
-  user_id: number,
-  message_ids: bigint[],
+  user_id: string,
+  message_ids: string[],
   status_update: { delivered_at?: Date; read_at?: Date; },
-  conv_id?: number
+  conv_id?: string
 ) => {
   try {
     if (message_ids.length === 0) {
@@ -1014,9 +772,7 @@ const batch_update_message_status = async (
     }
 
     // Build the update object dynamically
-    const updateData: { delivered_at?: Date; read_at?: Date; updated_at: Date; } = {
-      updated_at: new Date()
-    };
+    const updateData: { delivered_at?: Date; read_at?: Date; } = {};
 
     if (status_update.delivered_at) {
       updateData.delivered_at = status_update.delivered_at;
@@ -1033,7 +789,7 @@ const batch_update_message_status = async (
 
     // Optionally filter by conversation ID for more specific updates
     if (conv_id !== undefined) {
-      whereConditions.push(eq(message_info_model.conv_id, conv_id));
+      whereConditions.push(eq(message_info_model.chat_id, conv_id));
     }
 
     // Update all message statuses in a single query
@@ -1072,9 +828,9 @@ const batch_update_message_status = async (
 // @param is_active_in_conv Whether the recipient is currently active in the conv
 // @returns Success/failure response
 const mark_message_delivered = async (
-  message_id: bigint,
-  conversation_id: number,
-  recipient_id: number,
+  message_id: string,
+  conversation_id: string,
+  recipient_id: string,
   is_active_in_conv: boolean = false,
 ) => {
   try {
@@ -1083,15 +839,14 @@ const mark_message_delivered = async (
       .select({
         id: message_model.id,
         sender_id: message_model.sender_id,
-        conversation_id: message_model.conversation_id,
-        status: message_model.status,
+        chat_id: message_model.chat_id,
       })
       .from(message_model)
       .where(
         and(
           eq(message_model.id, message_id),
-          eq(message_model.conversation_id, conversation_id),
-          eq(message_model.deleted, false)
+          eq(message_model.chat_id, conversation_id),
+          isNull(message_model.deleted_at)
         )
       )
       .limit(1);
@@ -1104,7 +859,7 @@ const mark_message_delivered = async (
       };
     }
 
-    const sender_id = message.sender_id;
+    const sender_id = message.sender_id ?? "";
     const now = new Date();
 
     // Update message_status table — always set delivered_at; also set read_at
@@ -1116,21 +871,6 @@ const mark_message_delivered = async (
       ...(is_active_in_conv && { read_at: now }),
     });
 
-    // Update message status in messages table (for DMs only — group aggregate
-    // status lives per-member in message_status, not in the messages row).
-    await db
-      .update(message_model)
-      .set({
-        status: "delivered"
-      })
-      .where(
-        and(
-          eq(message_model.id, message_id),
-          eq(message_model.conversation_id, conversation_id),
-          eq(message_model.status, "sent") // Only update if still "sent"
-        )
-      );
-
     const ack_payload: ChatMessageAckPayload = {
       id: message_id,
       conv_id: conversation_id,
@@ -1138,7 +878,6 @@ const mark_message_delivered = async (
       delivered_at: now,
       delivered_to: is_active_in_conv ? [] : [recipient_id],
       read_by: is_active_in_conv ? [recipient_id] : [],
-      offline_users: [],
     };
 
     // Send ack to the original message sender
@@ -1187,12 +926,12 @@ const mark_message_delivered = async (
 };
 
 const mark_messages_delivered_batch = async (
-  messages: Array<{ message_id: string; conversation_id: number; }>,
-  recipient_id: number
+  messages: Array<{ message_id: string; conversation_id: string; }>,
+  recipient_id: string
 ) => {
   const results = await Promise.allSettled(
     messages.map(({ message_id, conversation_id }) =>
-      mark_message_delivered(BigInt(message_id), conversation_id, recipient_id)
+      mark_message_delivered(message_id, conversation_id, recipient_id)
     )
   );
 
@@ -1210,11 +949,11 @@ const mark_messages_delivered_batch = async (
 };
 
 const verify_message_ids = async (
-  message_ids: bigint[],
-  conversation_id: number,
-  sender_id: number
+  message_ids: string[],
+  conversation_id: string,
+  sender_id: string
 ): Promise<ResultType<{
-  found: Record<string, { delivered_to: number[]; read_by: number[]; }>;
+  found: Record<string, { delivered_to: string[]; read_by: string[]; }>;
   not_found: string[];
 }>> => {
   try {
@@ -1234,20 +973,18 @@ const verify_message_ids = async (
       .where(
         and(
           inArray(message_model.id, message_ids),
-          eq(message_model.conversation_id, conversation_id),
+          eq(message_model.chat_id, conversation_id),
           eq(message_model.sender_id, sender_id),
-          eq(message_model.deleted, false),
+          isNull(message_model.deleted_at),
         )
       );
 
-    const foundIds = new Set(rows.map((r) => r.id.toString()));
-    const not_found = message_ids
-      .filter((id) => !foundIds.has(id.toString()))
-      .map((id) => id.toString());
+    const foundIds = new Set(rows.map((r) => r.id));
+    const not_found = message_ids.filter((id) => !foundIds.has(id));
 
-    const found: Record<string, { delivered_to: number[]; read_by: number[]; }> = {};
+    const found: Record<string, { delivered_to: string[]; read_by: string[]; }> = {};
     if (rows.length > 0) {
-      for (const r of rows) found[r.id.toString()] = { delivered_to: [], read_by: [] };
+      for (const r of rows) found[r.id] = { delivered_to: [], read_by: [] };
 
       const statusRows = await db
         .select({
@@ -1260,15 +997,15 @@ const verify_message_ids = async (
         .where(
           and(
             inArray(message_info_model.message_id, rows.map((r) => r.id)),
-            eq(message_info_model.conv_id, conversation_id),
+            eq(message_info_model.chat_id, conversation_id),
           )
         );
 
       for (const s of statusRows) {
-        const key = s.message_id.toString();
+        const key = s.message_id;
         if (!found[key]) continue;
-        if (s.delivered_at) found[key].delivered_to.push(Number(s.user_id));
-        if (s.read_at) found[key].read_by.push(Number(s.user_id));
+        if (s.delivered_at) found[key].delivered_to.push(s.user_id);
+        if (s.read_at) found[key].read_by.push(s.user_id);
       }
     }
 
@@ -1280,17 +1017,17 @@ const verify_message_ids = async (
 };
 
 // React/unreact to a message - stores per-user reaction in message_status table
-const react_to_message = async (request: ReactMessageRequest, user_id: number, user_name?: string) => {
+const react_to_message = async (request: ReactMessageRequest, user_id: string, user_name?: string) => {
   try {
     // Verify the message exists
     const [message] = await db
-      .select({ id: message_model.id, conversation_id: message_model.conversation_id })
+      .select({ id: message_model.id, chat_id: message_model.chat_id })
       .from(message_model)
       .where(
         and(
           eq(message_model.id, request.message_id),
-          eq(message_model.conversation_id, request.conversation_id),
-          eq(message_model.deleted, false)
+          eq(message_model.chat_id, request.conversation_id),
+          isNull(message_model.deleted_at)
         )
       )
       .limit(1);
@@ -1299,50 +1036,24 @@ const react_to_message = async (request: ReactMessageRequest, user_id: number, u
       return { success: false, code: 404, message: "Message not found" };
     }
 
-    // Upsert the user's reaction into message_status
+    // Upsert the user's reaction into message_info
     const newReaction = request.action === 'add' ? request.emoji : null;
     await db
       .insert(message_info_model)
       .values({
         message_id: request.message_id,
-        user_id: BigInt(user_id),
-        conv_id: BigInt(request.conversation_id),
+        user_id,
+        chat_id: request.conversation_id,
         reaction: newReaction,
-        updated_at: new Date(),
       })
       .onConflictDoUpdate({
         target: [message_info_model.message_id, message_info_model.user_id],
         set: {
           reaction: newReaction,
-          updated_at: new Date(),
         },
       });
 
-    // Build full reactions map from all message_status rows for broadcast
-    const allReactionStatuses = await db
-      .select({
-        user_id: message_info_model.user_id,
-        reaction: message_info_model.reaction,
-        updated_at: message_info_model.updated_at,
-      })
-      .from(message_info_model)
-      .where(
-        and(
-          eq(message_info_model.message_id, request.message_id),
-          isNotNull(message_info_model.reaction)
-        )
-      );
-
-    const reactions: Record<string, Array<{ user_id: number; user_name?: string; reacted_at: string; }>> = {};
-    for (const s of allReactionStatuses) {
-      if (!s.reaction) continue;
-      if (!reactions[s.reaction]) reactions[s.reaction] = [];
-      reactions[s.reaction].push({
-        user_id: Number(s.user_id),
-        reacted_at: s.updated_at?.toISOString() ?? new Date().toISOString(),
-      });
-    }
-
+    // Delta-only broadcast — send just the change, not the full reactions map
     const reactPayload: MessageReactPayload = {
       message_id: request.message_id,
       conv_id: request.conversation_id,
@@ -1350,7 +1061,6 @@ const react_to_message = async (request: ReactMessageRequest, user_id: number, u
       sender_name: user_name,
       emoji: request.emoji,
       action: request.action,
-      reactions,
     };
 
     await broadcast_message({
@@ -1363,7 +1073,7 @@ const react_to_message = async (request: ReactMessageRequest, user_id: number, u
       },
     });
 
-    return { success: true, code: 200, message: "Reaction updated", data: { reactions } };
+    return { success: true, code: 200, message: "Reaction updated" };
   } catch (error) {
     console.error("react_to_message error", error);
     return { success: false, code: 500, message: "ERROR: react_to_message" };
@@ -1375,7 +1085,6 @@ export {
   store_message_with_retry,
   pin_message,
   unpin_message,
-  star_messages,
   reply_to_message,
   forward_messages,
   delete_messages,

@@ -3,7 +3,7 @@ import { app_middleware } from "@/middleware";
 import { add_new_member, create_group, demote_to_member, get_group_info, promote_to_admin, remove_member, update_group_title } from "@/services/chat-group.service";
 
 export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
-  .state({ id: 0, role: "" })
+  .state({ id: "", role: "" })
   .guard({
     beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
@@ -23,7 +23,7 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
   }, {
     body: t.Object({
       title: t.String(),
-      member_ids: t.Optional(t.Array(t.Number()))
+      member_ids: t.Optional(t.Array(t.String()))
     })
   })
 
@@ -33,7 +33,7 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     return chats_result;
   },
     {
-      params: t.Object({ conversation_id: t.Number() })
+      params: t.Object({ conversation_id: t.String() })
     }
   )
 
@@ -48,8 +48,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     return member_result;
   }, {
     body: t.Object({
-      conversation_id: t.Number(),
-      user_ids: t.Array(t.Number()),
+      conversation_id: t.String(),
+      user_ids: t.Array(t.String()),
       role: t.Optional(t.Union([t.Literal("admin"), t.Literal("member")]))
     })
   })
@@ -64,8 +64,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     return member_result;
   }, {
     body: t.Object({
-      conversation_id: t.Number(),
-      user_id: t.Number()
+      conversation_id: t.String(),
+      user_id: t.String()
     })
   })
 
@@ -79,8 +79,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     return promotion_result;
   }, {
     body: t.Object({
-      conversation_id: t.Number(),
-      user_id: t.Number(),
+      conversation_id: t.String(),
+      user_id: t.String(),
     })
   })
 
@@ -94,8 +94,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     return promotion_result;
   }, {
     body: t.Object({
-      conversation_id: t.Number(),
-      user_id: t.Number(),
+      conversation_id: t.String(),
+      user_id: t.String(),
     })
   })
 
@@ -105,7 +105,7 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     return title_result;
   }, {
     body: t.Object({
-      conversation_id: t.Number(),
+      conversation_id: t.String(),
       title: t.String()
     })
   })

@@ -18,17 +18,17 @@ const REDIS_TTL_SECONDS = 30 * 24 * 60 * 60;  // 1 month
 
 // --- Tier 1: LRU in-memory cache ---
 // user_id → fcm_token (hot cache, 10min TTL)
-const fcm_token_lru = new LRUCache<number, string>(5000, LRU_TTL_MS);
+const fcm_token_lru = new LRUCache<string, string>(5000, LRU_TTL_MS);
 
 // --- Helper: Redis key for a user's FCM token ---
-const redis_fcm_key = (user_id: number) => `fcm:user:${user_id}:token`;
+const redis_fcm_key = (user_id: string) => `fcm:user:${user_id}:token`;
 
 // ============================================================================
 // WRITE PATH — store/update FCM token for a user
 // Writes to ALL three tiers simultaneously (fan-out).
 // ============================================================================
 async function store_fcm_token(
-  user_id: number,
+  user_id: string,
   fcm_token: string | null,
 ): Promise<void> {
   // If token is null, remove it from all tiers
@@ -72,7 +72,7 @@ async function store_fcm_token(
 //   3. DB (if Redis miss)
 // After reading from Redis/DB, populate LRU cache for future reads.
 // ============================================================================
-async function fetch_fcm_token(user_id: number): Promise<string | null> {
+async function fetch_fcm_token(user_id: string): Promise<string | null> {
   // --- Tier 1: LRU ---
   const lru_token = fcm_token_lru.get(user_id);
   if (lru_token !== null) {
@@ -132,7 +132,7 @@ async function fetch_fcm_token(user_id: number): Promise<string | null> {
 // ============================================================================
 // REMOVE PATH — remove FCM token from all tiers (for logout)
 // ============================================================================
-async function remove_fcm_token(user_id: number): Promise<void> {
+async function remove_fcm_token(user_id: string): Promise<void> {
   // --- Tier 1: LRU ---
   fcm_token_lru.delete(user_id);
 
@@ -163,8 +163,8 @@ async function remove_fcm_token(user_id: number): Promise<void> {
 // ============================================================================
 // BATCH FETCH — fetch FCM tokens for multiple users
 // ============================================================================
-async function fetch_fcm_tokens(user_ids: number[]): Promise<Map<number, string | null>> {
-  const results = new Map<number, string | null>();
+async function fetch_fcm_tokens(user_ids: string[]): Promise<Map<string, string | null>> {
+  const results = new Map<string, string | null>();
 
   // Fetch all tokens in parallel
   const promises = user_ids.map(async (user_id) => {

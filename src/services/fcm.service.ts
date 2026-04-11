@@ -1,8 +1,4 @@
 import admin from 'firebase-admin';
-import { eq, and } from 'drizzle-orm';
-import db from '@/config/db';
-import { user_model } from '@/models/user.model';
-import { conversation_member_model } from '@/models/chat.model';
 import { ChatMessagePayload, VitalWSMessage, WSMessage, } from '@/types/socket.types';
 import { MessageType } from '@/types/chat.types';
 import { ResultType } from '@/types/core.types';
@@ -25,30 +21,13 @@ if (!admin.apps.length) {
 interface FCMPayload {
   type: 'message' | 'call' | 'ws-message';
   fcm_mode: "notification" | "data-only";
-  user_ids: number[];
+  user_ids: string[];
   title?: string;
   body?: string;
   ws_message?: WSMessage;   // single — used for calls
   ws_messages?: WSMessage[]; // batched — used for chat messages
   data?: Record<string, any>;
 }
-
-// interface MessageNotificationData {
-//   conversationId: string;
-//   messageId: string;
-//   senderId: string;
-//   senderName: string;
-//   messageBody?: ChatMessagePayload;
-//   messageType: MessageType;
-// }
-
-// interface CallNotificationData {
-//   callId: string;
-//   callerId: string;
-//   callerName: string;
-//   callerProfilePic?: string;
-//   callType: 'audio' | 'video';
-// }
 
 export class FCMService {
   private static instance: FCMService;
@@ -59,7 +38,6 @@ export class FCMService {
     }
     return FCMService.instance;
   }
-
 
   // Send push notification to multiple users
   async send_notification(payload: FCMPayload) {
@@ -151,127 +129,8 @@ export class FCMService {
     }
   }
 
-  // async sendMessageNotification(
-  //   userId: number,
-  //   data: MessageNotificationData
-  // ): Promise<boolean> {
-  //
-  //   const payload: FcmPayload = {
-  //     title: `${data.senderName}`,
-  //     body: this._formatMessageBody(data.messageBody),
-  //     type: 'message',
-  //     data: {
-  //       conversationId: data.conversationId,
-  //       messageId: data.messageId,
-  //       senderId: data.senderId,
-  //       senderName: data.senderName,
-  //       messageType: data.messageType,
-  //       messagePayload: data.messageBody
-  //     },
-  //     // Include chat_message for local DB storage
-  //     message: data.messageBody,
-  //   };
-  //
-  //   return await this.sendNotificationToUser(userId, payload);
-  // }
-
-  // async sendCallNotification(
-  //   userId: number,
-  //   data: CallNotificationData
-  // ): Promise<boolean> {
-  //   try {
-  //     // Get user's FCM token from database
-  //     const user = await db
-  //       .select({ fcm_token: user_model.fcm_token })
-  //       .from(user_model)
-  //       .where(eq(user_model.id, userId))
-  //       .limit(1);
-  //
-  //     if (user.length === 0 || !user[0].fcm_token) {
-  //       console.log(`[FCM] No FCM token found for user ${userId}`);
-  //       return false;
-  //     }
-  //
-  //     const fcmToken = user[0].fcm_token;
-  //
-  //     // Special message structure for call notifications with action buttons
-  //     const message: admin.messaging.Message = {
-  //       token: fcmToken,
-  //       // notification: {
-  //       //   title: `Incoming ${data.callType} call`,
-  //       //   body: `${data.callerName} is calling you`,
-  //       // },
-  //       data: {
-  //         type: 'call',
-  //         callId: data.callId,
-  //         callerId: data.callerId,
-  //         callerName: data.callerName,
-  //         callType: data.callType,
-  //         callerProfilePic: data.callerProfilePic || '',
-  //         // title: `Incoming ${data.callType} call`,
-  //         // body: `${data.callerName} is calling you`,
-  //         // Add action data for Flutter to handle
-  //         click_action: 'FLUTTER_NOTIFICATION_CLICK',
-  //       },
-  //       android: {
-  //         priority: 'high',
-  //         ttl: 30000, // 30 seconds for call notifications
-  //         // notification: {
-  //         //   channelId: 'calls',
-  //         //   priority: 'max',
-  //         //   sticky: true,
-  //         //   sound: 'default',
-  //         //   vibrateTimingsMillis: [0, 250, 250, 250],
-  //         //   visibility: "public",
-  //         //   title: `Incoming ${data.callType} call`,
-  //         //   // tag: `call_${data.callId}`, // Group by call ID
-  //         //   // actions are not directly supported in FCM for Android,
-  //         //   // Add action buttons (handled in Flutter)
-  //         // },
-  //         data: {
-  //           type: 'call',
-  //           callId: data.callId,
-  //           callerId: data.callerId,
-  //           callerName: data.callerName,
-  //           callType: data.callType,
-  //           callerProfilePic: data.callerProfilePic || '',
-  //           title: `Incoming ${data.callType} call`,
-  //           body: `${data.callerName} is calling you`,
-  //         },
-  //       },
-  //       apns: {
-  //         payload: {
-  //           aps: {
-  //             sound: 'default',
-  //             badge: 1,
-  //             contentAvailable: true,
-  //             category: 'CALL_CATEGORY', // iOS action category
-  //             mutableContent: true,
-  //             alert: {
-  //               title: `Incoming ${data.callType} call`,
-  //               body: `${data.callerName} is calling you`,
-  //             },
-  //           },
-  //         },
-  //         headers: {
-  //           'apns-push-type': 'alert',
-  //           'apns-priority': '10',
-  //           'apns-expiration': (Math.floor(Date.now() / 1000) + 30).toString(), // 30 seconds
-  //         },
-  //       },
-  //     };
-  //
-  //     const response = await admin.messaging().send(message);
-  //     console.log(`[FCM] Successfully sent call notification to user ${userId}: ${response}`);
-  //     return true;
-  //   } catch (error) {
-  //     console.error(`[FCM] Error sending call notification to user ${userId}:`, error);
-  //     return false;
-  //   }
-  // }
-
   // Update user's FCM token (updates all 3 tiers)
-  async update_user_fcm_token(userId: number, fcmToken: string): Promise<ResultType> {
+  async update_user_fcm_token(userId: string, fcmToken: string): Promise<ResultType> {
     try {
       await store_fcm_token(userId, fcmToken);
 
@@ -291,7 +150,7 @@ export class FCMService {
   }
 
   // Remove user's FCM token (on logout, removes from all 3 tiers)
-  async remove_user_fcm_token(userId: number): Promise<ResultType> {
+  async remove_user_fcm_token(userId: string): Promise<ResultType> {
     try {
       await remove_fcm_token(userId);
 
@@ -353,34 +212,6 @@ export class FCMService {
         return message.body;
     }
   }
-
-  // async sendBulkMessageNotifications(
-  //   user_ids: number[],
-  //   msg_payload?: ChatMessagePayload,
-  // ): Promise<{ success: number; failed: number }> {
-  //   const messageId = Date.now().toString(); // Use timestamp as message ID for notifications
-  //
-  //   const promises = user_ids.map(async (user_id) => {
-  //
-  //     // Don't send notification to sender
-  //     if (user_id === msg_payload?.sender_id) return;
-  //
-  //     // return await this.sendMessageNotification(user_id, msg_payload);
-  //     return await this.sendNotificationToUser(user_id, {
-  //       title: `${msg_payload?.sender_name || 'New Message'}`,
-  //       body: this._formatMessageBody(msg_payload),
-  //       type: 'message',
-  //       message: msg_payload
-  //     });
-  //   });
-  //
-  //   const results = await Promise.allSettled(promises);
-  //
-  //   const success = results.filter(result => result.status === 'fulfilled' && result.value === true).length;
-  //   const failed = results.length - success;
-  //
-  //   return { success, failed };
-  // }
 }
 
 export default FCMService.getInstance();

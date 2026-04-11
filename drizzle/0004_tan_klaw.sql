@@ -1,1 +1,0 @@
-ALTER TABLE "messages" ADD COLUMN "status" varchar DEFAULT 'sent' NOT NULL;

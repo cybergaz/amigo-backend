@@ -223,7 +223,7 @@ const validate_refresh_token = async (token: string) => {
 // Force logout all other devices when a user logs in on a new device
 // This sends a WebSocket message to all active connections for the user
 // and closes those connections
-const force_logout_other_devices = async (user_id: number): Promise<void> => {
+const force_logout_other_devices = async (user_id: string): Promise<void> => {
   try {
     const connection = socket_connections.get(user_id);
 
