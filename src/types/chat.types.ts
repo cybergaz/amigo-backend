@@ -15,66 +15,66 @@ const MESSAGE_OPERATION_CONSTS = ["pin", "star", "reply", "forward", "delete", "
 type MessageOperationType = typeof MESSAGE_OPERATION_CONSTS[number];
 
 // Conversation metadata structure
-interface ConversationMetadata {
-  // Pin functionality - only one message can be pinned per conversation
-  pinned_message?: {
-    message_id: string;
-    user_id: string;
-    pinned_at: string;
-  };
-
-  // Other conversation-level metadata
-  [key: string]: any;
-}
+// interface ConversationMetadata {
+//   // Pin functionality - only one message can be pinned per conversation
+//   pinned_message?: {
+//     message_id: string;
+//     user_id: string;
+//     pinned_at: string;
+//   };
+//
+//   // Other conversation-level metadata
+//   [key: string]: any;
+// }
 
 // Message metadata structure
-interface MessageMetadata {
-  // Reply functionality
-  reply_to?: {
-    message_id: string;
-    sender_id: string;
-    body?: string; // Preview of original message
-    created_at: string;
-  };
-
-  // Star functionality - array of users who starred
-  starred_by?: Array<{
-    user_id: string;
-    starred_at: string;
-  }>;
-
-  // Forward functionality - track original message info
-  forwarded_from?: {
-    original_message_id: string;
-    original_conversation_id: string;
-    original_sender_id: string;
-    forwarded_by: string;
-    forwarded_at: string;
-  };
-
-  // Edit history
-  edits?: Array<{
-    body: string;
-    edited_at: string;
-  }>;
-
-  // Mentions
-  mentions?: Array<{
-    user_id: string;
-    start_index: number;
-    end_index: number;
-  }>;
-
-  // Emoji reactions - map of emoji -> array of user reactions
-  reactions?: Record<string, Array<{
-    user_id: string;
-    user_name?: string;
-    reacted_at: string;
-  }>>;
-
-  // Other metadata
-  [key: string]: any;
-}
+// interface MessageMetadata {
+//   // Reply functionality
+//   reply_to?: {
+//     message_id: string;
+//     sender_id: string;
+//     body?: string; // Preview of original message
+//     created_at: string;
+//   };
+//
+//   // Star functionality - array of users who starred
+//   starred_by?: Array<{
+//     user_id: string;
+//     starred_at: string;
+//   }>;
+//
+//   // Forward functionality - track original message info
+//   forwarded_from?: {
+//     original_message_id: string;
+//     original_conversation_id: string;
+//     original_sender_id: string;
+//     forwarded_by: string;
+//     forwarded_at: string;
+//   };
+//
+//   // Edit history
+//   edits?: Array<{
+//     body: string;
+//     edited_at: string;
+//   }>;
+//
+//   // Mentions
+//   mentions?: Array<{
+//     user_id: string;
+//     start_index: number;
+//     end_index: number;
+//   }>;
+//
+//   // Emoji reactions - map of emoji -> array of user reactions
+//   reactions?: Record<string, Array<{
+//     user_id: string;
+//     user_name?: string;
+//     reacted_at: string;
+//   }>>;
+//
+//   // Other metadata
+//   [key: string]: any;
+// }
 
 // Request types for bulk operations
 interface BulkMessageOperation {
@@ -137,8 +137,8 @@ export type {
   ChatRoleType,
   MessageOperationType,
   MessageStatusType,
-  ConversationMetadata,
-  MessageMetadata,
+  // ConversationMetadata,
+  // MessageMetadata,
   BulkMessageOperation,
   PinMessageRequest,
   StarMessageRequest,

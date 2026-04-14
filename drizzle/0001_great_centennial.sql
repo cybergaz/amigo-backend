@@ -1,0 +1,1 @@
+ALTER TABLE "chats" ADD COLUMN "pinned_msg_id" uuid;

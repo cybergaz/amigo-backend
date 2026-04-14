@@ -1,7 +1,7 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
 import { delete_message_for_me, soft_delete_message } from "@/services/chat.services";
-import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, mark_messages_delivered_batch, react_to_message, reply_to_message, star_messages, verify_message_ids } from "@/services/message.services";
+import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, mark_messages_delivered_batch, react_to_message, reply_to_message, verify_message_ids } from "@/services/message.services";
 
 export const message_routes = new Elysia({ prefix: "/message" })
   .state({ id: "", role: "" })
@@ -62,16 +62,16 @@ export const message_routes = new Elysia({ prefix: "/message" })
   //   })
   // })
 
-  .post("/star", async ({ set, store, body }) => {
-    const star_result = await star_messages(body, store.id);
-    set.status = star_result.code;
-    return star_result;
-  }, {
-    body: t.Object({
-      message_ids: t.Array(t.String()),
-      conversation_id: t.String()
-    })
-  })
+  // .post("/star", async ({ set, store, body }) => {
+  //   const star_result = await star_messages(body, store.id);
+  //   set.status = star_result.code;
+  //   return star_result;
+  // }, {
+  //   body: t.Object({
+  //     message_ids: t.Array(t.String()),
+  //     conversation_id: t.String()
+  //   })
+  // })
 
   .post("/reply", async ({ set, store, body }) => {
     const reply_result = await reply_to_message(body, store.id);

@@ -1,7 +1,7 @@
 import { ResultType } from "@/types/core.types";
 import { CallPayload, ChatMessageAckPayload, ChatMessagePayload, ConnectionStatusPayload, JoinLeavePayload, MessageForwardPayload, WSMessageEventsType, WSMessage } from "@/types/socket.types";
 import { broadcast_message, get_connected_users, handle_join_conversation, is_user_online, } from "./socket.handlers";
-import { update_user_connection_status } from "@/services/user.services";
+// import { update_user_connection_status } from "@/services/user.services";
 import { socket_connections } from "./socket.server";
 import { batch_insert_message_status, forward_messages, store_message_with_retry } from "@/services/message.services";
 import { get_conversation_members } from "@/services/cache-management/socket.cache";
@@ -37,7 +37,7 @@ const handle_connection_status = async (payload: ConnectionStatusPayload): Promi
     });
 
     // update user status in DB
-    await update_user_connection_status(payload.sender_id, payload.status);
+    // await update_user_connection_status(payload.sender_id, payload.status);
 
     return {
       success: true,
@@ -204,7 +204,7 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       });
 
       // 2. Increment unread for offline + online-but-not-active members via Redis pipeline
-      const unread_user_ids = [...sent_result.offline, ...sent_result.online]
+      const unread_user_ids = [...sent_result.offline, ...sent_result.online.filter(id => !sent_result.active_in_conv.includes(id))]
         .filter(id => id !== payload.sender_id);
       if (unread_user_ids.length > 0) {
         batch_increment_unread(unread_user_ids, payload.conv_id);

@@ -11,8 +11,8 @@ import {
 import { user_model } from "@/models/user.model";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import {
-  ConversationMetadata,
-  MessageMetadata,
+  // ConversationMetadata,
+  // MessageMetadata,
   PinMessageRequest,
   StarMessageRequest,
   ReplyMessageRequest,
