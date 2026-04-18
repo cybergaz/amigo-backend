@@ -8,7 +8,6 @@ import {
 import { eq, desc } from "drizzle-orm";
 import { socket_connections } from "@/sockets/socket.server";
 import { MiscPayload } from "@/types/socket.types";
-import { RequestStatusType } from "@/types/user.types";
 import { create_user } from "./user.services";
 
 const handle_login = async ({

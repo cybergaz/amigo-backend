@@ -89,10 +89,10 @@ interface PinMessageRequest {
   user_id: string;
 }
 
-interface StarMessageRequest {
-  message_ids: string[];
-  conversation_id: string;
-}
+// interface StarMessageRequest {
+//   message_ids: string[];
+//   conversation_id: string;
+// }
 
 interface ReplyMessageRequest {
   message_id: string;
@@ -113,15 +113,15 @@ interface DeleteMessageRequest {
   conversation_id: string;
 }
 
-interface MediaMetadataRequest {
-  conversation_id: string;
-  url: string;
-  key: string;
-  category: string; // e.g. "images", "docs"
-  file_name: string;
-  file_size: number;
-  mime_type: string;
-}
+// interface MediaMetadataRequest {
+//   conversation_id: string;
+//   url: string;
+//   key: string;
+//   category: string; // e.g. "images", "docs"
+//   file_name: string;
+//   file_size: number;
+//   mime_type: string;
+// }
 
 interface ReactMessageRequest {
   message_id: string;
@@ -141,10 +141,10 @@ export type {
   // MessageMetadata,
   BulkMessageOperation,
   PinMessageRequest,
-  StarMessageRequest,
+  // StarMessageRequest,
   ReplyMessageRequest,
   ForwardMessageRequest,
   DeleteMessageRequest,
-  MediaMetadataRequest,
+  // MediaMetadataRequest,
   ReactMessageRequest
 };

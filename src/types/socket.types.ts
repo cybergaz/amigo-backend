@@ -5,7 +5,7 @@ import { ChatRoleType, ChatType, MessageType } from "./chat.types";
 interface WebSocketData {
   user_id?: string;
   user_name?: string;
-  user_pfp?: string;
+  // user_pfp?: string;
 }
 
 // Transport types for fallback support
@@ -14,33 +14,34 @@ type TransportType = 'ws' | 'polling';
 // Connection management
 interface UserConnection {
   ws: ElysiaWS;
-  connection_status: ConnectionStatusType;
-  active_conv_id?: string;
-  last_ping_sent?: Date;
-  last_pong_received?: Date;
   missed_pings: number;
-  connected_at: Date;
-  client_ip?: string;
+  // client_ip?: string;
+  // connection_status: ConnectionStatusType;
+  // active_conv_id?: string;
+  // last_ping_sent?: Date;
+  // last_pong_received?: Date;
+  // connected_at: Date;
 }
 
 interface PollingConnection {
-  // transport_type: TransportType;
   connection_status: ConnectionStatusType;
-  active_conv_id?: string;
-  last_poll?: Date;
-  last_poll_message_id?: string;
-  connected_at: Date;
+  last_poll_at?: Date;
   client_ip?: string;
+  // last_poll_message_id?: string;
+  // active_conv_id?: string;
+  // connected_at: Date;
 }
 
 // Regular WebSocket message with payload
 type WSMessage = {
   type: WSMessageEventsType;
-  payload?: ConnectionStatusPayload
-  | JoinLeavePayload
+  payload?:
+  ConnectionStatusPayload
+  | ConvJoinPayload
   | NewConversationPayload
   | ChatMessagePayload
-  | ChatMessageAckPayload
+  | MessageSentAckPayload
+  | MessageStatusAckPayload
   | TypingPayload
   | DeleteMessagePayload
   | MessagePinPayload
@@ -48,28 +49,30 @@ type WSMessage = {
   | MessageReactPayload
   | CallPayload
   | MiscPayload
-  | ConversationActionPayload
-  | SyncMessagesPayload
-  | MessageDeliveredPayload;
+  | ConversationActionPayload;
+  // | SyncMessagesPayload
+  // | MessageDeliveredPayload;
   ws_timestamp?: Date;
 };
 
 // Subset of WSMessage for critical events that must be processed by clients even if they miss some messages (e.g. due to reconnection)
 interface VitalWSMessage {
   type: VitalWSMessageEventsType;
-  payload: JoinLeavePayload
+  payload:
+  ConvJoinPayload
   | NewConversationPayload
   | ChatMessagePayload
-  | ChatMessageAckPayload
+  | MessageSentAckPayload
+  | MessageStatusAckPayload
   | DeleteMessagePayload
   | MessagePinPayload
   | MessageForwardPayload
-  | ConversationActionPayload
-  | MessageDeliveredPayload;
+  | ConversationActionPayload;
+  // | MessageDeliveredPayload;
   ws_timestamp?: Date;
 }
 
-const CONNECTION_STATUS_CONST = ['foreground', 'background', 'disconnected', 'stale'] as const;
+const CONNECTION_STATUS_CONST = ['online', 'offline', 'stale'] as const;
 type ConnectionStatusType = typeof CONNECTION_STATUS_CONST[number];
 
 type ConnectionStatusPayload = {
@@ -77,46 +80,61 @@ type ConnectionStatusPayload = {
   status: ConnectionStatusType;
 };
 
-type JoinLeavePayload = {
+type ConvJoinPayload = {
   conv_id: string;
-  conv_type: ChatType;
   user_id: string;
-  user_name?: string;
+  last_read_msg_id: string;
 };
 
 type ChatMessagePayload = {
   id: string;
-  sender_id: string;
-  sender_name?: string;
   conv_id: string;
-  conv_type: ChatType;
+  sender_id: string;
   msg_type: MessageType;
   body?: string;
   attachments?: any;
   replied_to?: string;
   sent_at: Date;
+  // sender_name?: string;
+  // conv_type: ChatType;
 };
 
-type ChatMessageAckPayload = {
-  id: string;
+type MessageSentAckPayload = {
+  msg_id: string;
   conv_id: string;
-  sender_id: string;
-  delivered_at: Date;
-  delivered_to?: string[];   // optimistic state for DMs (1-element max)
-  read_by?: string[];        // optimistic state for DMs (1-element max)
-  delivered_count?: number;  // optimistic count for groups
-  read_count?: number;       // optimistic count for groups
-  is_failed?: boolean;
+  is_sent: boolean;
   error_code?: number;
   new_id?: string;  // In case of message ID change due to retry or edit
 };
 
+type MessageStatusAckPayload = {
+  recipient_id: string;
+  at: Date;
+  acks: {
+    chat_id: string;
+    msg_ids: string[];
+    status: ('delivered' | 'read')[];   // 1 or 2 elements
+  }[];
+};
+
+// type ChatMessageAckPayload = {
+//   msg_id: string;
+//   conv_id: string;
+//   sender_id: string;
+//   is_failed?: boolean;
+//   error_code?: number;
+//   new_id?: string;  // In case of message ID change due to retry or edit
+//   // delivered_at: Date;
+//   // delivered_to?: string[];   // optimistic state for DMs (1-element max)
+//   // read_by?: string[];        // optimistic state for DMs (1-element max)
+// };
+
 type TypingPayload = {
   conv_id: string;
   sender_id: string;
-  sender_name?: string;
-  sender_pfp?: string;
-  is_typing: boolean;
+  // is_typing: boolean;
+  // sender_name?: string;
+  // sender_pfp?: string;
 };
 
 type MessagePinPayload = {
@@ -124,9 +142,9 @@ type MessagePinPayload = {
   message_id: string;
   message_type: MessageType;
   sender_id: string;
-  sender_name?: string;
-  sender_pfp?: string;
   pin: boolean;
+  // sender_name?: string;
+  // sender_pfp?: string;
 };
 
 type MessageForwardPayload = {
@@ -147,9 +165,9 @@ type MessageReactPayload = {
   message_id: string;
   conv_id: string;
   sender_id: string;
-  sender_name?: string;
   emoji: string;
   action: 'add' | 'remove';
+  // sender_name?: string;
 };
 
 type NewConversationPayload = {
@@ -206,58 +224,43 @@ type ConversationActionPayload = {
   action: ConversationActionType;
   members: MembersType[];
   actor_id?: string;
-  actor_name?: string;
-  actor_pfp?: string;
   message: string;
   action_at: Date;
+  // actor_name?: string;
+  // actor_pfp?: string;
 };
 
-// Sync payload for missed messages on reconnection
-// type SyncMessageItem = {
-//   id: number
-//   conv_id: number
-//   conv_type: ChatType
-//   sender_id: number
-//   sender_name?: string
-//   sender_pfp?: string
-//   msg_type: MessageType
-//   body?: string
-//   attachments?: any
-//   metadata?: any
-//   sent_at: Date
-//   created_at: Date
-// }
-
-type SyncMessagesPayload = {
-  messages: ChatMessagePayload[];
-  sync_timestamp: Date;
-  total_count: number;
-};
+// type SyncMessagesPayload = {
+//   messages: ChatMessagePayload[];
+//   sync_timestamp: Date;
+//   total_count: number;
+// };
 
 // Delivery receipt payload - sent by recipient when message is delivered via FCM
-type MessageDeliveredPayload = {
-  message_id: string;
-  conv_id: string;
-  sender_id: string;
-  recipient_id: string;
-  delivered_at: Date;
-};
+// type MessageDeliveredPayload = {
+//   message_id: string;
+//   conv_id: string;
+//   sender_id: string;
+//   recipient_id: string;
+//   delivered_at: Date;
+// };
 
 const WS_MESSAGE_EVENTS_CONST = [
   'connection:status',
   'conversation:join',
-  'conversation:leave',
+  // 'conversation:leave',
   'conversation:new',
   'conversation:typing',
   'conversation:action',
   'message:new',
-  'message:ack',
+  'message:sent:ack',
+  'message:status:ack',
   'message:pin',
   'message:forward',
   'message:delete',
   'message:react',
-  'message:sync',  // Sync missed messages on reconnection
-  'message:delivered',  // Delivery receipt from FCM messages
+  // 'message:sync',  // Sync missed messages on reconnection
+  // 'message:delivered',  // Delivery receipt from FCM messages
   'call:init',
   'call:init:ack',
   'call:ringing',
@@ -280,27 +283,19 @@ const WS_MESSAGE_EVENTS_CONST = [
 
 const VITAL_WS_EVENTS_CONST = [
   'conversation:join',
-  'conversation:leave',
+  // 'conversation:leave',
   'conversation:new',
   'conversation:action',
+  'message:new',
+  'message:sent:ack',
+  'message:status:ack',
   'message:pin',
   'message:forward',
   'message:delete',
   'message:react',
-  'message:new',
-  'message:ack',
-  'message:delivered',
 ] as const;
 
-// const EVENTS_WITH_MESSAGE_ID_CONST = [
-//   'message:new',
-//   'message:ack',
-//   'message:delivered',
-//   'message:pin',
-// ] as const;
-
 const ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD = ['socket:ping', 'socket:pong', 'socket:health_check'] as const;
-
 
 type WSMessageEventsType = typeof WS_MESSAGE_EVENTS_CONST[number];
 type VitalWSMessageEventsType = typeof VITAL_WS_EVENTS_CONST[number];
@@ -320,9 +315,10 @@ export type {
   WSMessage,
   VitalWSMessage,
   ConnectionStatusPayload,
-  JoinLeavePayload,
+  ConvJoinPayload,
   ChatMessagePayload,
-  ChatMessageAckPayload,
+  MessageSentAckPayload,
+  MessageStatusAckPayload,
   TypingPayload,
   DeleteMessagePayload,
   MiscPayload,
@@ -335,8 +331,8 @@ export type {
   ConnectionStatusType,
   ConversationActionPayload,
   // SyncMessageItem,
-  SyncMessagesPayload,
-  MessageDeliveredPayload,
+  // SyncMessagesPayload,
+  // MessageDeliveredPayload,
   WSMessageEventsType,
   VitalWSMessageEventsType,
   AllowedWSEventsWithoutPayloadType

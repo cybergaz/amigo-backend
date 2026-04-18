@@ -6,6 +6,7 @@ import { missed_ws_messages_model } from "@/models/message.model";
 import { VITAL_WS_EVENTS_CONST, VitalWSMessage, VitalWSMessageEventsType, WSMessage, WSMessageEventsType } from "@/types/socket.types";
 import { eq, and, lt, asc, gt } from "drizzle-orm";
 import Snowflake from "@/utils/snowflake.utils";
+import { randomUUIDv7 } from "bun";
 
 // ============================================================================
 // Three-tier Polling Cache for Missed WS Messages
@@ -64,7 +65,8 @@ async function store_pending_message(
     return; // silently ignore non-cacheable events
   }
 
-  const pending_message_id = Snowflake.correlationId(user_id, ws_message.type, (ws_message.payload as any).id || (ws_message.payload as any).message_id);
+  // const pending_message_id = Snowflake.correlationId(user_id, ws_message.type, (ws_message.payload as any).id || (ws_message.payload as any).message_id);
+  const pending_message_id = randomUUIDv7();
   const now = Date.now();
 
   const entry: CachedPollMessage = {

@@ -4,7 +4,7 @@ import bcrypt from "bcryptjs";
 import { customAlphabet } from "nanoid";
 import { parsePhoneNumberFromString } from "libphonenumber-js";
 
-const create_unique_id = () => {
+const generate_unique_id = () => {
   const nanoid = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 20);
   return nanoid();
 };
@@ -61,7 +61,7 @@ function parse_phone(input: string, default_country_code?: string) {
 
 const create_dm_key = (user1: string, user2: string) => {
   return [user1, user2].sort().join("_");
-}
+};
 
 
-export { parse_phone, create_unique_id, create_otp, hash_password, generate_jwt, generate_refresh_jwt, compare_password, create_dm_key };
+export { parse_phone, generate_unique_id, create_otp, hash_password, generate_jwt, generate_refresh_jwt, compare_password, create_dm_key };

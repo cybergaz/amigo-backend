@@ -7,7 +7,7 @@ import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
 import Elysia, { t } from "elysia";
 import { eq, sql } from "drizzle-orm";
-import { remove_fcm_token } from "@/services/cache-management/fcm-token.cache";
+import { remove_fcm_token } from "@/cache-management/fcm-token.cache";
 
 // Cookie configuration based on environment
 // Use COOKIE_DOMAIN env var or detect production from FRONTEND_URL

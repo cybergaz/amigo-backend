@@ -5,7 +5,6 @@ import { get_communities, get_community_groups } from "@/services/community.serv
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
 import { chat_model } from "@/models/chat.model";
-import { create_unique_id } from "@/utils/general.utils";
 import { REQUEST_STATUS_CONST, RoleType } from "@/types/user.types";
 import { eq, sql } from "drizzle-orm";
 import { community_model } from "@/models/community.model";
@@ -24,7 +23,6 @@ const admin_routes = new Elysia({ prefix: "/admin" })
         email: "admin@gmail.com",
         role: "admin" as RoleType,
         hashed_password: "$2b$10$F0.mx/.RuN.J3NDSxzvUBOyiFYdiktAPuMCJWUs.08uOmOmNGdXpG",
-        refresh_token: "temp_token_to_be_changed",
       });
 
     if (!newAdmin) {

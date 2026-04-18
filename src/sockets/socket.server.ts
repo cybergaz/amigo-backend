@@ -1,11 +1,12 @@
 import { authenticate_jwt } from "@/middleware";
 import { WSMessageSchema } from "@/types/socket.elysia-schema";
 import Elysia, { t } from "elysia";
-import { broadcast_message, get_connected_users, get_ws_data, set_ws_data, socket_message_handler } from "./socket.handlers";
+import { broadcast_message, get_ws_data, set_ws_data, socket_message_handler } from "./socket.handlers";
 import { ConnectionStatusPayload, PollingConnection, UserConnection, WSMessage } from "@/types/socket.types";
 import { update_user_details } from "@/services/user.services";
 // import { sync_missed_messages } from "@/services/chat.services";
-import { start_cleanup_cron, stop_cleanup_cron } from "@/services/cache-management/polling.cache";
+import { start_cleanup_cron, stop_cleanup_cron } from "@/cache-management/polling.cache";
+import { get_user_peers } from "@/cache-management/user-peer.cache";
 
 // Connection maps for different transport types
 const socket_connections = new Map<string, UserConnection>(); // user_id -> UserConnection (WebSocket)
@@ -133,10 +134,10 @@ const web_socket_server = new Elysia({
         set_ws_data(ws, { user_id });
 
         // update the online status of user in the DB
-        const user_res = await update_user_details(user_id,
-          {
-            last_seen: new Date(),
-          });
+        const user_res = await update_user_details(
+          user_id,
+          { last_seen: new Date() }
+        );
 
         // insert user_name into WebSocket data using type-safe helper
         set_ws_data(ws, { user_name: user_res.data?.name });
@@ -150,11 +151,11 @@ const web_socket_server = new Elysia({
         // Add to active socket connections with new tracking fields
         socket_connections.set(user_id, {
           ws,
-          connection_status: "foreground",
-          // transport_type: "ws",
           missed_pings: 0,
-          connected_at: new Date(),
-          client_ip
+          // connection_status: "online",
+          // transport_type: "ws",
+          // connected_at: new Date(),
+          // client_ip
         });
 
         // removing from polling connections if exists (in case user switched transport without closing previous connection properly)
@@ -164,11 +165,11 @@ const web_socket_server = new Elysia({
         }
 
         // notify all connected users about this user being online
-        const connected_users = await get_connected_users(user_id);
+        const connected_users = await get_user_peers(user_id);
 
         const message_payload: ConnectionStatusPayload = {
           sender_id: user_id,
-          status: 'foreground',
+          status: 'online',
         };
 
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -207,7 +208,7 @@ const web_socket_server = new Elysia({
       await socket_message_handler({
         user_id: get_ws_data(ws, "user_id") as string,
         user_name: get_ws_data(ws, "user_name") as string,
-        user_pfp: get_ws_data(ws, "user_pfp") as string,
+        // user_pfp: get_ws_data(ws, "user_pfp") as string,
       }, message as WSMessage);
     },
     // idleTimeout: 60, // x seconds of inactivity before closing the connection
@@ -235,10 +236,10 @@ const web_socket_server = new Elysia({
           }
 
           // Notify all connected users about this user being offline
-          const connected_users = await get_connected_users(user_id);
+          const connected_users = await get_user_peers(user_id);
           const message_payload: ConnectionStatusPayload = {
             sender_id: user_id,
-            status: 'disconnected',
+            status: 'offline',
           };
           // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
           await broadcast_message({
@@ -283,48 +284,20 @@ function startHeartbeat() {
     const now = new Date();
 
     socket_connections.forEach(async (connection, user_id) => {
-      // Check if connection missed too many pings
-      if (connection.missed_pings >= MAX_MISSED_PINGS) {
+      // Check if connection missed too many pings or Check if WebSocket is still open
+      if (connection.missed_pings >= MAX_MISSED_PINGS || connection.ws.readyState !== 1) {
         console.log(`[WS-HEARTBEAT] User ${user_id} missed ${connection.missed_pings} pings, closing connection`);
-        connection.connection_status = "stale";
-        return;
-      }
 
-      // Check if WebSocket is still open
-      if (connection.ws.readyState !== 1) { // 1 = OPEN
-        console.log(`[WS-HEARTBEAT] User ${user_id} WebSocket not open (state: ${connection.ws.readyState}), removing`);
-        connection.connection_status = "stale";
-        return;
-      }
-
-      // Send ping to client
-      try {
-        connection.ws.send({
-          type: 'socket:ping',
-          ws_timestamp: now.toISOString()
-        }, true);
-        connection.last_ping_sent = now;
-        connection.missed_pings++;
-        // console.log(`[WS-HEARTBEAT] Sent ping to user ${user_id}, missed_pings: ${connection.missed_pings}`);
-      } catch (error) {
-        console.error(`[WS-HEARTBEAT] Error sending ping to user ${user_id}:`, error);
-        connection.connection_status = "stale";
-      }
-
-
-      // handle stale connections that have missed too many pings or have WebSocket issues
-      if (connection.connection_status === "stale") {
-        console.log(`[WS-HEARTBEAT] Cleaning up stale connection for user ${user_id}`);
         try {
           connection.ws.close(4000, "Connection timeout - no pong response");
         } catch (e) { }
         socket_connections.delete(user_id);
 
         try {
-          const connected_users = await get_connected_users(user_id);
+          const connected_users = await get_user_peers(user_id);
           const message_payload: ConnectionStatusPayload = {
             sender_id: user_id,
-            status: 'disconnected',
+            status: 'offline',
           };
           await broadcast_message({
             to: "users",
@@ -342,9 +315,24 @@ function startHeartbeat() {
 
         await update_user_details(user_id, { last_seen: new Date() });
         console.log(`[WS-HEARTBEAT] Cleaned up stale connection for user ${user_id}. Total connections: ${socket_connections.size}`);
+
+        return;
+      }
+
+      // Send ping to client
+      try {
+        connection.ws.send({
+          type: 'socket:ping',
+          ws_timestamp: now.toISOString()
+        }, true);
+        // connection.last_ping_sent = now;
+        connection.missed_pings++;
+        // console.log(`[WS-HEARTBEAT] Sent ping to user ${user_id}, missed_pings: ${connection.missed_pings}`);
+      } catch (error) {
+        console.error(`[WS-HEARTBEAT] Error sending ping to user ${user_id}:`, error);
+        // connection.connection_status = "stale";
       }
     });
-
   }, HEARTBEAT_INTERVAL_MS);
 
   console.log(`[WS-HEARTBEAT] Started heartbeat interval (${HEARTBEAT_INTERVAL_MS}ms)`);
@@ -363,7 +351,6 @@ function stopHeartbeat() {
 function handlePongResponse(user_id: string) {
   const connection = socket_connections.get(user_id);
   if (connection) {
-    connection.last_pong_received = new Date();
     connection.missed_pings = 0;
     // console.log(`[WS-HEARTBEAT] Received pong from user ${user_id}`);
   }
@@ -372,38 +359,6 @@ function handlePongResponse(user_id: string) {
 // =============================================================================
 // Connection Statistics & Enhanced Logging
 // =============================================================================
-function getConnectionStats() {
-  const now = Date.now();
-  let oldestConnectionAge = 0;
-  let totalMissedPings = 0;
-  // let polling_connections_count = 0;
-  let stale_connections_count = 0;
-
-  socket_connections.forEach((conn) => {
-    const age = (now - conn.connected_at.getTime()) / 1000;
-    if (age > oldestConnectionAge) {
-      oldestConnectionAge = age;
-    }
-    totalMissedPings += conn.missed_pings;
-
-    // if (conn.transport_type === "polling") {
-    //   polling_connections_count++;
-    // }
-    if (conn.connection_status === "stale") {
-      stale_connections_count++;
-    }
-  });
-
-  return {
-    total_ws_cnx: socket_connections.size,
-    total_polling_cnx: polling_connections.size,
-    total_stale_cnx: stale_connections_count,
-    oldest_cnx_age_sec: Math.round(oldestConnectionAge),
-    avg_missed_pings: socket_connections.size > 0
-      ? totalMissedPings / socket_connections.size
-      : 0,
-  };
-}
 
 // Log detailed connection error with context
 function logConnectionError(
@@ -420,30 +375,14 @@ function logConnectionError(
     client_ip,
     error: error?.message || String(error),
     error_stack: error?.stack,
-    connection_stats: getConnectionStats(),
+    connection_stats: {
+      total_ws_cnx: socket_connections.size,
+      total_polling_cnx: polling_connections.size,
+    },
     ...additional_info,
   };
 
   console.error(`[CONNECTION-ERROR] ${JSON.stringify(errorLog)}`);
-}
-
-// Log successful connection with diagnostics
-function logConnectionSuccess(
-  transport: 'ws' | 'polling',
-  user_id: string,
-  client_ip: string,
-  additional_info?: Record<string, any>
-) {
-  const successLog = {
-    timestamp: new Date().toISOString(),
-    transport,
-    user_id,
-    client_ip,
-    connection_stats: getConnectionStats(),
-    ...additional_info,
-  };
-
-  console.log(`[CONNECTION-SUCCESS] ${JSON.stringify(successLog)}`);
 }
 
 function startStatsLogging() {
@@ -452,10 +391,10 @@ function startStatsLogging() {
   }
 
   statsInterval = setInterval(() => {
-    const stats = getConnectionStats();
     console.log(`[CONNECTION-STATS] ${JSON.stringify({
       timestamp: new Date().toISOString(),
-      ...stats,
+      total_ws_cnx: socket_connections.size,
+      total_polling_cnx: polling_connections.size,
     })}`);
   }, STATS_LOGGING_INTERVAL_MS);
 

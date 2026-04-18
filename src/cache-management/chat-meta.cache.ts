@@ -1,4 +1,5 @@
 import { redis } from "@/config/redis";
+import { MessageType } from "@/types/chat.types";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Redis hash: chat_meta:{chat_id}
@@ -9,11 +10,11 @@ import { redis } from "@/config/redis";
 // ────────────────────────────────────────────────────────────────────────────
 
 type ChatMetaFields = {
-  id: string;
+  id: string; // message ID
   body: string;
-  type: string;
+  type: MessageType;
   sender_id: string;
-  sender_name: string;
+  // sender_name: string;
   sent_at: string; // ISO timestamp
 };
 
@@ -30,7 +31,7 @@ const update_chat_meta = async (chat_id: string, msg: ChatMetaFields): Promise<v
       body: msg.body ?? "",
       type: msg.type,
       sender_id: msg.sender_id,
-      sender_name: msg.sender_name ?? "",
+      // sender_name: msg.sender_name ?? "",
       sent_at: msg.sent_at,
     });
   } catch (err) {
@@ -132,6 +133,22 @@ const reset_unread = async (user_id: string, chat_id: string): Promise<void> => 
 };
 
 /**
+ * Get unread count for a user in a specific chat.
+ * Returns 0 if no entry exists (treated as "no unread").
+ */
+const get_unread = async (user_id: string, chat_id: string): Promise<number> => {
+  try {
+    const raw = await redis.hget(unread_key(user_id), chat_id);
+    if (!raw) return 0;
+    const count = parseInt(raw, 10);
+    return Number.isFinite(count) && count > 0 ? count : 0;
+  } catch (err) {
+    console.error(`[CACHE] get_unread failed for user ${user_id}, chat ${chat_id}:`, err);
+    return 0;
+  }
+};
+
+/**
  * Get all unread counts for a user (for chat list enrichment).
  * Returns Map<chat_id, count>.
  */
@@ -156,6 +173,7 @@ export {
   increment_unread,
   batch_increment_unread,
   reset_unread,
+  get_unread,
   get_all_unread,
 };
 export type { ChatMetaFields };

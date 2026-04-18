@@ -1,22 +1,18 @@
-import { WebSocketData, WSMessage, ConnectionStatusPayload, JoinLeavePayload, ChatMessagePayload, WSMessageEventsType, ChatMessageAckPayload, TypingPayload, MessagePinPayload, MessageForwardPayload, MessageDeliveredPayload, DeleteMessagePayload, MiscPayload, VitalWSMessage, VITAL_WS_EVENTS_CONST, VitalWSMessageEventsType, CallPayload, ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD, type AllowedWSEventsWithoutPayloadType } from "@/types/socket.types";
+import { WebSocketData, WSMessage, ConnectionStatusPayload, ChatMessagePayload, TypingPayload, MessagePinPayload, MessageForwardPayload, VitalWSMessage, CallPayload, ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD, type AllowedWSEventsWithoutPayloadType, ConvJoinPayload, MessageStatusAckPayload } from "@/types/socket.types";
 import { ElysiaWS } from "elysia/dist/ws";
-import { get_conversation_members, get_user_conversations } from "@/services/cache-management/socket.cache";
+import { get_conversation_members, get_user_conversations } from "@/cache-management/conv.cache";
 import { socket_connections, handlePongResponse, polling_connections } from "./socket.server";
-import { store_pending_message_for_users, is_allowed_event, store_pending_message } from "@/services/cache-management/polling.cache";
-import { reset_unread } from "@/services/cache-management/chat-meta.cache";
+import { is_allowed_event, store_pending_message } from "@/cache-management/polling.cache";
+import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_connection_status, handle_message_forward, handle_message_new, handle_conv_join, handle_message_status_ack, } from "./socket.service";
+import { pin_message, unpin_message } from "@/services/message.services";
+import { mark_message_delivered } from "@/services/message-status.service";
+import { batch_mark_status } from "@/cache-management/message.cache";
 import db from "@/config/db";
-import { chat_member_model } from "@/models/chat.model";
-import { message_model, message_info_model } from "@/models/message.model";
-import { and, desc, eq, isNull, ne, or, sql } from "drizzle-orm";
-import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_connection_status, handle_conv_join_leave, handle_message_forward, handle_message_new } from "./socket.service";
-import { pin_message, unpin_message, mark_message_delivered } from "@/services/message.services";
+import { message_model } from "@/models/message.model";
+import { inArray } from "drizzle-orm";
 
-// Generate unique message ID for polling
-let polling_message_counter = 0;
-function generateMessageId(): string {
-  polling_message_counter++;
-  return `${Date.now()}-${polling_message_counter}`;
-}
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 const set_ws_data = (ws: ElysiaWS, data: WebSocketData) => {
   Object.assign(ws.data, data);
@@ -51,20 +47,22 @@ const broadcast_message = async (data: BroadcastData) => {
   }
 
   // sent to both specific users and conversation members (if both conv_id & user_ids are provided)
-  let recipients_list = [...members];
-  if (data.user_ids) {
-    recipients_list = data.user_ids;
-  }
+  let recipients_list = Array.from(new Set([...members, ...(data.user_ids ? data.user_ids : [])]));
+  // if (data.user_ids) {
+  //   recipients_list = recipients_list.concat(data.user_ids);
+  // }
 
-  const active_in_conv: Set<string> = new Set<string>();
+  // const active_in_conv: Set<string> = new Set<string>();
   const online_users_id: Set<string> = new Set<string>();
   const offline_users_id: Set<string> = new Set<string>();
   const polling_users_id: Set<string> = new Set<string>();
 
   // console.log("all ws connections:", socket_connections)
 
+  const serialized_payload = JSON.stringify(data.message);
+
   // Separate online and offline users across all transport types
-  recipients_list.forEach(async user_id => {
+  await Promise.all(recipients_list.map(async user_id => {
     if (data.exclude_user_ids && data.exclude_user_ids.includes(user_id)) {
       return; // Skip excluded users
     }
@@ -77,14 +75,14 @@ const broadcast_message = async (data: BroadcastData) => {
     if (ws_connection && ws_connection.ws.readyState === 1) {
       // User is online via WebSocket
       online_users_id.add(user_id);
-      if (data.conv_id && ws_connection.active_conv_id === data.conv_id) {
-        // User is active in the conversation 
-        active_in_conv.add(user_id);
-      }
+      // if (data.conv_id && ws_connection.active_conv_id === data.conv_id) {
+      //   // User is active in the conversation 
+      //   active_in_conv.add(user_id);
+      // }
 
       // Send message immediately via WebSocket
       try {
-        ws_connection.ws.send(data.message, true);
+        ws_connection.ws.send(serialized_payload, true);
       } catch (error) {
         console.error(`[WS] Error sending to user ${user_id}:`, error);
       }
@@ -94,8 +92,8 @@ const broadcast_message = async (data: BroadcastData) => {
     }
 
     else if (poll_connection) {
-      if (poll_connection.last_poll) {
-        const timeSinceLastPoll = Date.now() - poll_connection.last_poll.getTime();
+      if (poll_connection.last_poll_at) {
+        const timeSinceLastPoll = Date.now() - poll_connection.last_poll_at.getTime();
         // Consider users with a poll in the last 10 seconds as online for polling transport
         if (timeSinceLastPoll < 10000) {
           polling_users_id.add(user_id);
@@ -114,170 +112,170 @@ const broadcast_message = async (data: BroadcastData) => {
     // Store missed messages in three-tier polling cache for offline users
     // Only allowed event types are cached (message:new, conversation:new, etc.)
     if (is_allowed_event(data.message.type)) {
-      await store_pending_message(
-        user_id,
-        data.message as VitalWSMessage,
-      ).then(() => {
-        // console.log("stored in missed_ws_message ", data.message.type);
-      }).catch(err => {
+      try {
+        await store_pending_message(user_id, data.message as VitalWSMessage);
+      } catch (err) {
         console.error("[BROADCAST] Error storing pending messages for offline users:", err);
-      });
+      }
     }
-  });
+  }));
 
   return {
     online: Array.from(online_users_id),
     offline: Array.from(offline_users_id),
     polling: Array.from(polling_users_id),
-    active_in_conv: Array.from(active_in_conv),
+    // active_in_conv: Array.from(active_in_conv),
   };
 };
 
 // Get all connected users (optimized with parallel fetching)
-const get_connected_users = async (user_id: string): Promise<Set<string>> => {
-  // Get user's conversations (cached)
-  const conversations = await get_user_conversations(user_id);
+// const get_connected_users = async (user_id: string): Promise<Set<string>> => {
+//   // Get user's conversations (cached)
+//   const conversations = await get_user_conversations(user_id);
+//
+//   if (conversations.size === 0) {
+//     return new Set<string>();
+//   }
+//
+//   // Fetch members from all conversations in parallel
+//   const memberPromises = Array.from(conversations).map(conv_id =>
+//     get_conversation_members(conv_id)
+//   );
+//
+//   const all_members = await Promise.all(memberPromises);
+//
+//   // Combine and deduplicate
+//   const connected_users = new Set<string>();
+//   all_members.forEach(members => {
+//     members.forEach(member_id => {
+//       if (member_id !== user_id) {
+//         connected_users.add(member_id);
+//       }
+//     });
+//   });
+//
+//   return connected_users;
+// };
 
-  if (conversations.size === 0) {
-    return new Set<string>();
-  }
+// const handle_join_conversation = async ({
+//   conv_id,
+//   user_id,
+// }: {
+//   conv_id: string,
+//   user_id: string,
+//   // is_active_in_conv: boolean
+// }) => {
+//   try {
+//     // Reset unread count in Redis (fire-and-forget)
+//     reset_unread(user_id, conv_id);
+//
+//     // Get the latest message in this conversation to update last_read_msg_id
+//     const [latest_message] = await db
+//       .select({ id: message_model.id })
+//       .from(message_model)
+//       .where(
+//         and(
+//           eq(message_model.chat_id, conv_id),
+//         )
+//       )
+//       .orderBy(desc(message_model.sent_at))
+//       .limit(1);
+//
+//     if (latest_message) {
+//       // Only update last_read_message_id if user wasn't already active in this conversation
+//       // This prevents resetting read receipts when user comes back to the same conversation
+//       // if (!is_active_in_conv) {
+//       await db
+//         .update(chat_member_model)
+//         .set({
+//           last_read_msg_id: latest_message.id,
+//         })
+//         .where(
+//           and(
+//             eq(chat_member_model.chat_id, conv_id),
+//             eq(chat_member_model.user_id, user_id)
+//           )
+//         );
+//       // }
+//     }
+//
+//     // Capture unread messages BEFORE marking them read, so we can push real read receipts to senders
+//     const unread_messages = await db
+//       .select({ message_id: message_info_model.message_id, sender_id: message_model.sender_id })
+//       .from(message_info_model)
+//       .innerJoin(message_model, eq(message_info_model.message_id, message_model.id))
+//       .where(
+//         and(
+//           eq(message_info_model.chat_id, conv_id),
+//           eq(message_info_model.user_id, user_id),
+//           isNull(message_info_model.read_at),
+//           ne(message_model.sender_id, user_id),
+//         )
+//       );
+//
+//     // update message_status to set read_at for all messages in this conversation for this user
+//     await db
+//       .update(message_info_model)
+//       .set({ read_at: new Date() })
+//       .where(
+//         and(
+//           eq(message_info_model.chat_id, conv_id),
+//           eq(message_info_model.user_id, user_id),
+//           isNull(message_info_model.read_at),
+//         )
+//       );
+//
+//     // DM status tracking is now handled via message_info_model (read_at/delivered_at)
+//     // No per-message `status` column exists anymore.
+//
+//     // Push real read receipts to senders so they can correct optimistic pre-fills
+//     // Group messages by sender and push message:ack with read_by=[user_id] to each unique sender
+//     if (unread_messages.length > 0) {
+//       const now = new Date();
+//       // Group latest message ID per sender (client marks all earlier messages read on single ack)
+//       const latest_per_sender = new Map<string, string>();
+//       for (const row of unread_messages) {
+//         if (row.sender_id) latest_per_sender.set(row.sender_id, row.message_id);
+//       }
+//
+//       for (const [sender_id, message_id] of latest_per_sender) {
+//         const ack_payload: ChatMessageAckPayload = {
+//           id: message_id,
+//           conv_id,
+//           sender_id,
+//           delivered_at: now,
+//           read_by: [user_id],
+//           delivered_to: [],
+//         };
+//         await broadcast_message({
+//           to: "users",
+//           user_ids: [sender_id],
+//           message: {
+//             type: "message:ack",
+//             payload: ack_payload,
+//             ws_timestamp: now,
+//           },
+//         });
+//       }
+//     }
+//
+//   }
+//   catch (error) {
+//     console.error("[WS] Error in handle_join_conversation:", error);
+//   }
+// };
 
-  // Fetch members from all conversations in parallel
-  const memberPromises = Array.from(conversations).map(conv_id =>
-    get_conversation_members(conv_id)
-  );
-
-  const all_members = await Promise.all(memberPromises);
-
-  // Combine and deduplicate
-  const connected_users = new Set<string>();
-  all_members.forEach(members => {
-    members.forEach(member_id => {
-      if (member_id !== user_id) {
-        connected_users.add(member_id);
-      }
-    });
-  });
-
-  return connected_users;
-};
-
-const handle_join_conversation = async ({
-  conv_id,
-  user_id,
-}: {
-  conv_id: string,
-  user_id: string,
-  // is_active_in_conv: boolean
-}) => {
-  try {
-    // Reset unread count in Redis (fire-and-forget)
-    reset_unread(user_id, conv_id);
-
-    // Get the latest message in this conversation to update last_read_msg_id
-    const [latest_message] = await db
-      .select({ id: message_model.id })
-      .from(message_model)
-      .where(
-        and(
-          eq(message_model.chat_id, conv_id),
-        )
-      )
-      .orderBy(desc(message_model.sent_at))
-      .limit(1);
-
-    if (latest_message) {
-      // Only update last_read_message_id if user wasn't already active in this conversation
-      // This prevents resetting read receipts when user comes back to the same conversation
-      // if (!is_active_in_conv) {
-      await db
-        .update(chat_member_model)
-        .set({
-          last_read_msg_id: latest_message.id,
-        })
-        .where(
-          and(
-            eq(chat_member_model.chat_id, conv_id),
-            eq(chat_member_model.user_id, user_id)
-          )
-        );
-      // }
-    }
-
-    // Capture unread messages BEFORE marking them read, so we can push real read receipts to senders
-    const unread_messages = await db
-      .select({ message_id: message_info_model.message_id, sender_id: message_model.sender_id })
-      .from(message_info_model)
-      .innerJoin(message_model, eq(message_info_model.message_id, message_model.id))
-      .where(
-        and(
-          eq(message_info_model.chat_id, conv_id),
-          eq(message_info_model.user_id, user_id),
-          isNull(message_info_model.read_at),
-          ne(message_model.sender_id, user_id),
-        )
-      );
-
-    // update message_status to set read_at for all messages in this conversation for this user
-    await db
-      .update(message_info_model)
-      .set({ read_at: new Date() })
-      .where(
-        and(
-          eq(message_info_model.chat_id, conv_id),
-          eq(message_info_model.user_id, user_id),
-          isNull(message_info_model.read_at),
-        )
-      );
-
-    // DM status tracking is now handled via message_info_model (read_at/delivered_at)
-    // No per-message `status` column exists anymore.
-
-    // Push real read receipts to senders so they can correct optimistic pre-fills
-    // Group messages by sender and push message:ack with read_by=[user_id] to each unique sender
-    if (unread_messages.length > 0) {
-      const now = new Date();
-      // Group latest message ID per sender (client marks all earlier messages read on single ack)
-      const latest_per_sender = new Map<string, string>();
-      for (const row of unread_messages) {
-        if (row.sender_id) latest_per_sender.set(row.sender_id, row.message_id);
-      }
-
-      for (const [sender_id, message_id] of latest_per_sender) {
-        const ack_payload: ChatMessageAckPayload = {
-          id: message_id,
-          conv_id,
-          sender_id,
-          delivered_at: now,
-          read_by: [user_id],
-          delivered_to: [],
-        };
-        await broadcast_message({
-          to: "users",
-          user_ids: [sender_id],
-          message: {
-            type: "message:ack",
-            payload: ack_payload,
-            ws_timestamp: now,
-          },
-        });
-      }
-    }
-
-  }
-  catch (error) {
-    console.error("[WS] Error in handle_join_conversation:", error);
-  }
-};
-
-const socket_message_handler = async (user_details: {
-  user_id?: string,
-  user_name?: string;
-  user_pfp?: string;
-}, message: WSMessage) => {
+const socket_message_handler = async (
+  user_details: {
+    user_id?: string,
+    user_name?: string;
+    // user_pfp?: string;
+  },
+  message: WSMessage
+) => {
   const user_id = user_details.user_id || "";
   const user_name = user_details.user_name || "Unknown User";
-  const user_pfp = user_details.user_pfp || "";
+  // const user_pfp = user_details.user_pfp || "";
 
   if (!user_id) {
     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -332,10 +330,10 @@ const socket_message_handler = async (user_details: {
 
       // ----------------------------------------------------
       case 'conversation:join':
-      case 'conversation:leave':
+        // case 'conversation:leave':
         // --------------------------------------------------
         {
-          const result = await handle_conv_join_leave(message.payload as JoinLeavePayload, message.type);
+          const result = await handle_conv_join(message.payload as ConvJoinPayload, message.ws_timestamp);
           if (!result.success) {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
@@ -346,38 +344,6 @@ const socket_message_handler = async (user_details: {
                 payload: {
                   code: result.code || 500,
                   message: result.message || "Error handling conversation join/leave",
-                  error: result.error
-                },
-                ws_timestamp: new Date()
-              }
-            });
-          }
-          break;
-        }
-
-
-      // ----------------------------------------------------
-      case 'message:new':
-        // --------------------------------------------------
-        {
-          // console.log('recieved message new');
-          // console.log(message.payload);
-          // // ID is now bigint after conversion
-          // console.log('message id type:', typeof (message.payload as any).id);
-          // console.log('message id value:', (message.payload as any).id?.toString());
-
-          const result = await handle_message_new(message.payload as ChatMessagePayload, user_name);
-          // console.log("result -> ", result);
-          if (!result.success) {
-            // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-            await broadcast_message({
-              to: "users",
-              user_ids: [user_id],
-              message: {
-                type: "socket:error",
-                payload: {
-                  code: result.code || 500,
-                  message: result.message || "Error handling new message",
                   error: result.error
                 },
                 ws_timestamp: new Date()
@@ -406,6 +372,57 @@ const socket_message_handler = async (user_details: {
             exclude_user_ids: [payload.sender_id],
           });
 
+          break;
+        }
+
+
+      // ----------------------------------------------------
+      case 'message:new':
+        // --------------------------------------------------
+        {
+          const result = await handle_message_new(message.payload as ChatMessagePayload, user_name);
+          // console.log("result -> ", result);
+          if (!result.success) {
+            // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            await broadcast_message({
+              to: "users",
+              user_ids: [user_id],
+              message: {
+                type: "socket:error",
+                payload: {
+                  code: result.code || 500,
+                  message: result.message || "Error handling new message",
+                  error: result.error
+                },
+                ws_timestamp: new Date()
+              }
+            });
+          }
+          break;
+        }
+
+      // ----------------------------------------------------
+      case 'message:status:ack':
+        // --------------------------------------------------
+        {
+          const result = await handle_message_status_ack(message.payload as MessageStatusAckPayload, user_id, message.ws_timestamp);
+          // console.log("result -> ", result);
+          if (!result.success) {
+            // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            await broadcast_message({
+              to: "users",
+              user_ids: [user_id],
+              message: {
+                type: "socket:error",
+                payload: {
+                  code: result.code || 500,
+                  message: result.message || "Error handling message status ack",
+                  error: result.error
+                },
+                ws_timestamp: new Date()
+              }
+            });
+          }
           break;
         }
 
@@ -467,35 +484,15 @@ const socket_message_handler = async (user_details: {
 
 
       // ----------------------------------------------------
-      case 'message:delivered':
-        // --------------------------------------------------
-        {
-          // Real delivery receipt from recipient's device
-          // This reconciles the optimistic pre-fill ACK with ground truth
-          if (message.payload) {
-            const payload = message.payload as MessageDeliveredPayload;
-            // If the recipient is currently active in this conversation their
-            // delivery receipt also implies they are reading — mark as read.
-            const recipient_conn = socket_connections.get(payload.recipient_id);
-            const is_active_in_conv = recipient_conn?.active_conv_id === payload.conv_id;
-            await mark_message_delivered(
-              payload.message_id,
-              payload.conv_id,
-              payload.recipient_id,
-              is_active_in_conv,
-            );
-          } else {
-            console.error('[WS] message:delivered payload missing');
-          }
-          break;
-        }
-
-
-      // ----------------------------------------------------
       case 'call:init':
         // --------------------------------------------------
         {
-          const result = await handle_call_init(message.payload as CallPayload, user_id, user_name, user_pfp);
+          const result = await handle_call_init(
+            message.payload as CallPayload,
+            user_id,
+            user_name,
+            // user_pfp
+          );
           if (!result.success) {
             // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
             await broadcast_message({
@@ -701,8 +698,8 @@ export {
   get_ws_data,
   is_user_online,
   broadcast_message,
-  get_connected_users,
-  handle_join_conversation,
+  // get_connected_users,
+  // handle_join_conversation,
   socket_message_handler,
   // convertBigIntIdsToString,
   // convertStringIdsToBigInt,

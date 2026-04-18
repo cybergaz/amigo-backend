@@ -1,10 +1,8 @@
 import db from "@/config/db";
-import { redis } from "@/config/redis";
 import { chat_member_model } from "@/models/chat.model";
 import { UpdateUserType, user_model } from "@/models/user.model";
 import { RoleType } from "@/types/user.types";
 import {
-  create_unique_id,
   generate_jwt,
   generate_refresh_jwt,
   hash_password,
@@ -12,7 +10,8 @@ import {
 } from "@/utils/general.utils";
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
 import { eq, and, inArray, isNull, ne, sql, or, ilike } from "drizzle-orm";
-import { store_fcm_token } from "@/services/cache-management/fcm-token.cache";
+import { store_fcm_token } from "@/cache-management/fcm-token.cache";
+import { remove_member, invalidate_user_conversations } from "@/cache-management/conv.cache";
 import { polling_connections, socket_connections } from "@/sockets/socket.server";
 
 type CreateUserParams = {
@@ -29,10 +28,10 @@ const create_user = async ({
   phone,
 }: CreateUserParams) => {
   try {
-    let user_id;
-    do {
-      user_id = create_unique_id();
-    } while ((await find_user_by_id(user_id)).success);
+    // let user_id;
+    // do {
+    //   user_id = create_unique_id();
+    // } while ((await find_user_by_id(user_id)).success);
 
     let hashed_password;
     if (!password || password === null) {
@@ -41,28 +40,31 @@ const create_user = async ({
       hashed_password = await hash_password(password);
     }
 
-    const access_token = generate_jwt(user_id, role, "7d");
-    const refresh_token = generate_refresh_jwt(user_id, role, "90d");
-
-    await db
+    const [new_user] = await db
       .insert(user_model)
       .values({
-        id: user_id,
         name,
         role,
         phone: phone.replace(" ", ""),
         hashed_password,
-        refresh_token,
         call_access: true,
       })
       .returning();
+
+    const access_token = generate_jwt(new_user.id, role, "7d");
+    const refresh_token = generate_refresh_jwt(new_user.id, role, "90d");
+
+    await db
+      .update(user_model)
+      .set({ refresh_token })
+      .where(eq(user_model.id, new_user.id));
 
     return {
       success: true,
       code: 200,
       message: "User Created Successfully",
       data: {
-        id: user_id,
+        id: new_user.id,
         name,
         role,
         phone,
@@ -82,7 +84,7 @@ const create_user = async ({
     return {
       success: false,
       code: 500,
-      message: "Internal Server Error",
+      message: "Failed to create user, Please try again.",
     };
   }
 };
@@ -648,26 +650,22 @@ const create_admin_user = async (email: string, password: string, permissions: s
     }
 
     // Generate unique ID
-    let user_id;
-    do {
-      user_id = create_unique_id();
-    } while ((await find_user_by_id(user_id)).success);
+    // let user_id;
+    // do {
+    //   user_id = create_unique_id();
+    // } while ((await find_user_by_id(user_id)).success);
 
     const hashed_password = await hash_password(password);
-    const access_token = generate_jwt(user_id, "sub_admin");
-    const refresh_token = generate_refresh_jwt(user_id, "sub_admin");
 
     // Create the admin user
-    const newAdmin = await db
+    const [new_admin] = await db
       .insert(user_model)
       .values({
-        id: user_id,
         name: email.split("@")[0], // Use email prefix as name
         email: email,
         role: "sub_admin" as RoleType,
         call_access: true,
         hashed_password,
-        refresh_token,
         permissions: permissions,
       })
       .returning({
@@ -679,11 +677,20 @@ const create_admin_user = async (email: string, password: string, permissions: s
         created_at: user_model.created_at,
       });
 
+    const access_token = generate_jwt(new_admin.id, "sub_admin");
+    const refresh_token = generate_refresh_jwt(new_admin.id, "sub_admin");
+
+    // store refresh token in database
+    await db
+      .update(user_model)
+      .set({ refresh_token })
+      .where(eq(user_model.id, new_admin.id));
+
     return {
       success: true,
       code: 201,
       message: "Admin user created successfully",
-      data: newAdmin[0],
+      data: new_admin
     };
   } catch (error: any) {
     console.error("Error creating admin user:", error);
@@ -880,10 +887,9 @@ const delete_user_permanently = async (user_id: string) => {
       );
 
       for (const convId of convIds) {
-        const redisKey = `conv:${convId}:members`;
-        await redis.srem(redisKey, user_id);
-        await redis.publish("conv:invalidate", convId);
+        await remove_member(user_id, convId);
       }
+      await invalidate_user_conversations(user_id);
     } catch (error) {
       console.error("Error removing user from redis conversations:", error);
     }

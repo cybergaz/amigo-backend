@@ -1,25 +1,29 @@
 import { ResultType } from "@/types/core.types";
-import { CallPayload, ChatMessageAckPayload, ChatMessagePayload, ConnectionStatusPayload, JoinLeavePayload, MessageForwardPayload, WSMessageEventsType, WSMessage } from "@/types/socket.types";
-import { broadcast_message, get_connected_users, handle_join_conversation, is_user_online, } from "./socket.handlers";
+import { CallPayload, ChatMessagePayload, ConnectionStatusPayload, MessageForwardPayload, WSMessageEventsType, WSMessage, ConvJoinPayload, MessageSentAckPayload, MessageStatusAckPayload, } from "@/types/socket.types";
+import { broadcast_message, is_user_online, } from "./socket.handlers";
 // import { update_user_connection_status } from "@/services/user.services";
 import { socket_connections } from "./socket.server";
-import { batch_insert_message_status, forward_messages, store_message_with_retry } from "@/services/message.services";
-import { get_conversation_members } from "@/services/cache-management/socket.cache";
-import { update_chat_meta, batch_increment_unread } from "@/services/cache-management/chat-meta.cache";
+import { forward_messages, store_message_with_retry } from "@/services/message.services";
+import { batch_insert_message_status, mark_read_upto } from "@/services/message-status.service";
+import { get_conversation_members } from "@/cache-management/conv.cache";
+import { update_chat_meta, batch_increment_unread, reset_unread } from "@/cache-management/chat-meta.cache";
 import db from "@/config/db";
 import { chat_member_model } from "@/models/chat.model";
 import { message_model } from "@/models/message.model";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { update_conversation } from "@/services/chat.services";
 import FCMService from "@/services/fcm.service";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
 import { ChatType } from "@/types/chat.types";
 import { CALL_TIMEOUT_MS, CallService, active_calls, register_missed_call_notifier } from "@/services/call.service";
 import { call_model } from "@/models/call.model";
+import { get_user_peers } from "@/cache-management/user-peer.cache";
+import { set_last_read, get_receipt } from "@/cache-management/chat-member.cache";
+import { batch_mark_status } from "@/cache-management/message.cache";
 
 const handle_connection_status = async (payload: ConnectionStatusPayload): Promise<ResultType> => {
   try {
-    const connected_users = await get_connected_users(payload.sender_id);
+    const connected_users = await get_user_peers(payload.sender_id);
     const message_payload: ConnectionStatusPayload = {
       sender_id: payload.sender_id,
       status: payload.status,
@@ -57,36 +61,70 @@ const handle_connection_status = async (payload: ConnectionStatusPayload): Promi
   }
 };
 
-const handle_conv_join_leave = async (payload: JoinLeavePayload, ws_msg_type: WSMessageEventsType): Promise<ResultType> => {
+const handle_conv_join = async (payload: ConvJoinPayload, timestamp?: Date | string): Promise<ResultType> => {
   try {
-    // update active_conv_id in socket_connections map
-    const sock_conn = socket_connections.get(payload.user_id);
-    if (sock_conn) {
-      ws_msg_type === 'conversation:join'
-        ? sock_conn.active_conv_id = payload.conv_id
-        : sock_conn.active_conv_id = undefined;
+    if (!payload.last_read_msg_id) {
+      return { success: true, code: 200, message: "No messages to mark as read" };
     }
+    const now = new Date();
 
-    if (ws_msg_type === 'conversation:join') {
-      await handle_join_conversation({
-        conv_id: payload.conv_id,
+    // grab the previous cursor BEFORE overwriting it
+    const prev_receipt = await get_receipt(payload.user_id, payload.conv_id);
+    const prev_read_msg_id = prev_receipt.last_read_msg_id;
+
+    // update last_read in the chat member cache
+    set_last_read(
+      payload.user_id,
+      payload.conv_id,
+      payload.last_read_msg_id,
+      timestamp ?? now
+    );
+
+    // reset the unread count for this user - conversation
+    reset_unread(payload.user_id, payload.conv_id);
+
+    // mark messages as read upto last_read_msg_id in message_info table — only the unread window
+    mark_read_upto(payload.user_id, payload.conv_id, payload.last_read_msg_id, timestamp ?? now, prev_read_msg_id);
+
+    // find distinct senders only in the unread window (prev_cursor, new_cursor]
+    const lower_bound = prev_read_msg_id
+      ? sql`${message_model.sent_at} > (SELECT ${message_model.sent_at} FROM ${message_model} WHERE ${message_model.id} = ${prev_read_msg_id} LIMIT 1)`
+      : sql`TRUE`;
+
+    const unread_senders = await db
+      .selectDistinct({ sender_id: message_model.sender_id })
+      .from(message_model)
+      .where(
+        and(
+          eq(message_model.chat_id, payload.conv_id),
+          sql`${message_model.sent_at} <= (SELECT ${message_model.sent_at} FROM ${message_model} WHERE ${message_model.id} = ${payload.last_read_msg_id} LIMIT 1)`,
+          lower_bound,
+          sql`${message_model.sender_id} IS NOT NULL AND ${message_model.sender_id} <> ${payload.user_id}::uuid`,
+          isNull(message_model.deleted_at),
+        )
+      );
+
+    const sender_ids = unread_senders
+      .map(r => r.sender_id)
+      .filter((id): id is string => id !== null);
+
+    if (sender_ids.length > 0) {
+      const conversation_join_payload: ConvJoinPayload = {
         user_id: payload.user_id,
+        conv_id: payload.conv_id,
+        last_read_msg_id: payload.last_read_msg_id,
+      };
 
-        // is_active_in_conv: socket_connections.get(payload.user_id)?.active_conv_id === payload.conv_id
+      await broadcast_message({
+        to: "users",
+        user_ids: sender_ids,
+        message: {
+          type: "conversation:join",
+          payload: conversation_join_payload,
+          ws_timestamp: now,
+        },
       });
     }
-
-    // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    await broadcast_message({
-      to: "conversation",
-      conv_id: payload.conv_id,
-      message: {
-        type: ws_msg_type,
-        payload: payload,
-        ws_timestamp: new Date()
-      },
-      exclude_user_ids: [payload.user_id]
-    });
 
     return {
       success: true,
@@ -107,32 +145,35 @@ const handle_conv_join_leave = async (payload: JoinLeavePayload, ws_msg_type: WS
   }
 };
 
+
 const handle_message_new = async (payload: ChatMessagePayload, user_name: string): Promise<ResultType> => {
   try {
-
-    const ack_message_payload: ChatMessageAckPayload = {
-      id: payload.id,
-      conv_id: payload.conv_id,
-      sender_id: payload.sender_id,
-      delivered_at: new Date(),
-    };
+    //
+    // const ack_message_payload: ChatMessageAckPayload = {
+    //   id: payload.id,
+    //   conv_id: payload.conv_id,
+    //   sender_id: payload.sender_id,
+    //   delivered_at: new Date(),
+    // };
 
     // store the new message in DB
     const store_msg_result = await store_message_with_retry(payload, 5);
     if (!store_msg_result.success) {
       // send message is failed ack to the sender
-      const failed_ack: ChatMessageAckPayload = {
-        ...ack_message_payload,
-        is_failed: true,
+      const failed_to_send_ack: MessageSentAckPayload = {
+        msg_id: payload.id,
+        conv_id: payload.conv_id,
+        is_sent: false,
         error_code: store_msg_result.code || 500,
       };
+
       // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
       await broadcast_message({
         to: "users",
         user_ids: [payload.sender_id],
         message: {
-          type: "message:ack",
-          payload: failed_ack,
+          type: "message:sent:ack",
+          payload: failed_to_send_ack,
           ws_timestamp: new Date()
         },
       });
@@ -147,8 +188,8 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
 
     const updated_message_payload: ChatMessagePayload = {
       ...payload,
-      id: store_msg_result.new_id ? store_msg_result.new_id : payload.id,  // update message ID if it was changed during retry
-      sender_name: payload.sender_name || String(user_name) || undefined,
+      id: store_msg_result.new_id ?? payload.id, // update message ID if it was changed during retry
+      // sender_name: payload.sender_name || String(user_name) || undefined,
     };
 
     // broadcast to the chat recipients about the new message
@@ -166,13 +207,13 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
 
     // const is_sender_online = socket_connections.has(payload.sender_id);
     // const is_sender_in_conv = socket_connections.get(payload.sender_id)?.active_conv_id === payload.conv_id;
-    const sent_res_ack: ChatMessageAckPayload = {
-      ...ack_message_payload,
-      ...(store_msg_result.new_id !== undefined && {
-        new_id: store_msg_result.new_id,
-      }),  // update message ID if it was changed during retry
-      delivered_to: sent_result.online,
-      read_by: sent_result.active_in_conv,
+    const sent_ack: MessageSentAckPayload = {
+      msg_id: payload.id,
+      conv_id: payload.conv_id,
+      is_sent: true,
+      new_id: store_msg_result.new_id,
+      // delivered_to: sent_result.online,
+      // read_by: sent_result.active_in_conv,
     };
 
     // send ack to sender along with message delivery status
@@ -181,8 +222,8 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       to: "users",
       user_ids: [payload.sender_id],
       message: {
-        type: "message:ack",
-        payload: sent_res_ack,
+        type: "message:sent:ack",
+        payload: sent_ack,
         ws_timestamp: new Date()
       },
     });
@@ -190,70 +231,75 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
     // ── Fire-and-forget: Redis caches, DB status inserts, FCM ───────────
     // These run after the sender ACK is sent — latency-insensitive work.
     if (store_msg_result.data) {
-      const conv_members = await get_conversation_members(payload.conv_id);
+      // const conv_members = await get_conversation_members(payload.conv_id);
       const now = new Date();
 
       // 1. Update Redis chat_meta (last message display data)
       update_chat_meta(payload.conv_id, {
-        id: store_msg_result.data.id,
+        id: store_msg_result.new_id ?? store_msg_result.data.id,
         body: payload.body ?? "",
         type: payload.msg_type,
         sender_id: payload.sender_id,
-        sender_name: payload.sender_name ?? "",
-        sent_at: now.toISOString(),
+        sent_at: payload.sent_at instanceof Date ? payload.sent_at.toISOString() : (payload.sent_at?.toString() ?? now.toISOString()),
+        // sender_name: payload.sender_name ?? "",
       });
 
-      // 2. Increment unread for offline + online-but-not-active members via Redis pipeline
-      const unread_user_ids = [...sent_result.offline, ...sent_result.online.filter(id => !sent_result.active_in_conv.includes(id))]
-        .filter(id => id !== payload.sender_id);
+      // 2. Increment unread for all chat members except the sender
+      const unread_user_ids = [...sent_result.offline, ...sent_result.online, ...sent_result.polling].filter(id => id !== payload.sender_id);
       if (unread_user_ids.length > 0) {
         batch_increment_unread(unread_user_ids, payload.conv_id);
       }
 
-      // 3. Batch insert message_info rows for delivery tracking
-      const message_statuses: Array<{ user_id: string; message_id: string; chat_id: string; delivered_at: Date | null; read_at: Date | null; }> = [];
-      for (const member_id of conv_members) {
-        if (member_id !== payload.sender_id) {
-          message_statuses.push({
-            user_id: member_id,
-            message_id: store_msg_result.data.id,
-            chat_id: payload.conv_id,
-            delivered_at: sent_result.online.includes(member_id) ? now : null,
-            read_at: sent_result.active_in_conv.includes(member_id) ? now : null,
-          });
-        }
-      }
-      if (message_statuses.length > 0) {
-        batch_insert_message_status(message_statuses);
-      }
+      // 3. Batch insert message_status in the redis (redis first to wait for status updates)
+      // const message_statuses: Array<{
+      //   user_id: string;
+      //   message_id: string;
+      //   chat_id: string;
+      //   delivered_at: Date | null;
+      //   // read_at: Date | null;
+      // }> = [];
+      // for (const member_id of conv_members) {
+      //   if (member_id !== payload.sender_id) {
+      //     message_statuses.push({
+      //       user_id: member_id,
+      //       message_id: store_msg_result.data.id,
+      //       chat_id: payload.conv_id,
+      //       delivered_at: sent_result.online.includes(member_id) ? now : null,
+      //       // read_at: sent_result.active_in_conv.includes(member_id) ? now : null,
+      //     });
+      //   }
+      // }
+      // if (message_statuses.length > 0) {
+      //   batch_insert_message_status(message_statuses);
+      // }
 
       // 4. Update chat_member delivery/read cursors
-      const offline_and_inactive_users = new Set([...sent_result.offline, ...sent_result.online]);
-      for (const user_id of offline_and_inactive_users) {
-        db.update(chat_member_model)
-          .set({
-            last_delivered_msg_id: sent_result.online.includes(user_id) || sent_result.active_in_conv.includes(user_id)
-              ? store_msg_result.data.id
-              : sql`${chat_member_model.last_delivered_msg_id}`,
-            last_read_msg_id: sent_result.active_in_conv.includes(user_id)
-              ? store_msg_result.data.id
-              : sql`${chat_member_model.last_read_msg_id}`,
-          })
-          .where(
-            and(
-              eq(chat_member_model.chat_id, payload.conv_id),
-              eq(chat_member_model.user_id, user_id)
-            )
-          );
-      }
+      // const offline_and_inactive_users = new Set([...sent_result.offline, ...sent_result.online]);
+      // for (const user_id of offline_and_inactive_users) {
+      //   db.update(chat_member_model)
+      //     .set({
+      //       last_delivered_msg_id: sent_result.online.includes(user_id) || sent_result.active_in_conv.includes(user_id)
+      //         ? store_msg_result.data.id
+      //         : sql`${chat_member_model.last_delivered_msg_id}`,
+      //       last_read_msg_id: sent_result.active_in_conv.includes(user_id)
+      //         ? store_msg_result.data.id
+      //         : sql`${chat_member_model.last_read_msg_id}`,
+      //     })
+      //     .where(
+      //       and(
+      //         eq(chat_member_model.chat_id, payload.conv_id),
+      //         eq(chat_member_model.user_id, user_id)
+      //       )
+      //     );
+      // }
     }
 
-    // 5. Update conversation's last_msg_id and last_msg_at (fire-and-forget)
-    update_conversation({
-      id: payload.conv_id,
-      last_msg_id: store_msg_result.data?.id,
-      last_msg_at: new Date()
-    });
+    // 5. Update conversation's last_msg_id and last_msg_at in the DB (fire-and-forget)
+    // update_conversation({
+    //   id: payload.conv_id,
+    //   last_msg_id: store_msg_result.data?.id,
+    //   last_msg_at: new Date()
+    // });
 
     // 6. Queue FCM for offline users
     const fcm_ws_message: WSMessage = {
@@ -283,6 +329,82 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
   }
 };
 
+const handle_message_status_ack = async (payload: MessageStatusAckPayload, user_id: string, timestamp?: Date | string): Promise<ResultType> => {
+  try {
+    const total_msgs = payload.acks?.reduce((s, g) => s + (g.msg_ids?.length ?? 0), 0) ?? 0;
+    console.log(`[STATUS-ACK] from=${user_id}, chats=${payload.acks?.length ?? 0}, msgs=${total_msgs}`);
+
+    const recipient_id = user_id ?? payload.recipient_id;
+    const ack_at = payload.at instanceof Date ? payload.at : (typeof payload.at === 'string' ? new Date(payload.at) : new Date());
+
+    // store in redis cache (fire-and-forget, flushed to DB by worker)
+    batch_mark_status(recipient_id, ack_at, payload.acks);
+
+    // collect all msg_ids, one PK lookup to get sender_id per message
+    const all_msg_ids = payload.acks.flatMap(g => g.msg_ids);
+    if (all_msg_ids.length > 0) {
+      const rows = await db
+        .select({ id: message_model.id, sender_id: message_model.sender_id })
+        .from(message_model)
+        .where(inArray(message_model.id, all_msg_ids));
+
+      const sender_map = new Map<string, string>();
+      for (const r of rows) {
+        if (r.sender_id) sender_map.set(r.id, r.sender_id);
+      }
+
+      // group acks by sender so each sender gets only their messages
+      const per_sender = new Map<string, MessageStatusAckPayload["acks"]>();
+      for (const group of payload.acks) {
+        for (const msg_id of group.msg_ids) {
+          const sid = sender_map.get(msg_id);
+          if (!sid || sid === recipient_id) continue;
+          let entry = per_sender.get(sid);
+          if (!entry) {
+            entry = [];
+            per_sender.set(sid, entry);
+          }
+          let chat_group = entry.find(e => e.chat_id === group.chat_id && e.status.join() === group.status.join());
+          if (!chat_group) {
+            chat_group = { chat_id: group.chat_id, msg_ids: [], status: group.status };
+            entry.push(chat_group);
+          }
+          chat_group.msg_ids.push(msg_id);
+        }
+      }
+
+      // broadcast to each sender with only their messages
+      for (const [sender_id, acks] of per_sender) {
+        await broadcast_message({
+          to: "users",
+          user_ids: [sender_id],
+          message: {
+            type: "message:status:ack",
+            payload: { recipient_id, at: ack_at, acks },
+            ws_timestamp: new Date(),
+          },
+        });
+      }
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Message status ack processed and broadcasted successfully"
+    };
+  }
+  catch (error) {
+    console.error('[WS] Error handling message status ack:', error);
+
+    return {
+      success: false,
+      code: 500,
+      message: "Failed to process message status ack",
+      error: error as any
+    };
+  }
+};
+
 const handle_message_forward = async (payload: MessageForwardPayload, username: string): Promise<ResultType> => {
   try {
 
@@ -294,22 +416,22 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
 
     if (forward_res.success && forward_res.data) {
       // Collect all message status records for batch insert
-      const all_message_statuses: Array<{ user_id: string; message_id: string; chat_id: string; delivered_at: Date | null; read_at: Date | null; }> = [];
+      // const all_message_statuses: Array<{ user_id: string; message_id: string; chat_id: string; delivered_at: Date | null; read_at: Date | null; }> = [];
 
       // loop on all target conversations (use for...of to properly await)
       for (const [conv_id, all_msgs_for_conv] of forward_res.data.entries()) {
 
         // Get all members of this conversation for batch message status creation
-        const conv_members = await get_conversation_members(conv_id);
+        // const conv_members = await get_conversation_members(conv_id);
 
         // loop on all forward message in that target conversation
         for (const msg of all_msgs_for_conv) {
           const new_chat_msg_payload: ChatMessagePayload = {
             id: msg.id,
             sender_id: msg.sender_id ?? payload.forwarder_id,
-            sender_name: payload.forwarder_name || username ? String(username) : undefined,
+            // sender_name: payload.forwarder_name || username ? String(username) : undefined,
             conv_id: conv_id,
-            conv_type: msg.conv_type as ChatType,
+            // conv_type: msg.conv_type as ChatType,
             msg_type: msg.type,
             body: msg.body || undefined,
             attachments: msg.attachments,
@@ -329,21 +451,21 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
           });
 
           // Prepare message status records for all members except sender
-          for (const member_id of conv_members) {
-            if (member_id !== payload.forwarder_id) {
-
-              const is_member_online = socket_connections.has(member_id);
-              const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === conv_id;
-
-              all_message_statuses.push({
-                user_id: member_id,
-                message_id: msg.id,
-                chat_id: conv_id,
-                delivered_at: is_member_online ? new Date() : null,
-                read_at: is_member_in_conv ? new Date() : null,
-              });
-            }
-          }
+          // for (const member_id of conv_members) {
+          //   if (member_id !== payload.forwarder_id) {
+          //
+          //     const is_member_online = socket_connections.has(member_id);
+          //     const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === conv_id;
+          //
+          //     all_message_statuses.push({
+          //       user_id: member_id,
+          //       message_id: msg.id,
+          //       chat_id: conv_id,
+          //       delivered_at: is_member_online ? new Date() : null,
+          //       read_at: is_member_in_conv ? new Date() : null,
+          //     });
+          //   }
+          // }
         }
 
         // sort message based on sent_at, and extract the most recent message if sent_at is not present then sort based on message_id
@@ -360,20 +482,28 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
 
         // update the conversation's last message
         const last_msg = all_msgs_for_conv[all_msgs_for_conv.length - 1];
-        await update_conversation({
-          id: conv_id,
-          last_msg_id: last_msg.id,
-          last_msg_at: new Date()
+        // await update_conversation({
+        //   id: conv_id,
+        //   last_msg_id: last_msg.id,
+        //   last_msg_at: new Date()
+        // });
+        update_chat_meta(conv_id, {
+          id: last_msg.id,
+          body: last_msg.body ?? "",
+          type: last_msg.type,
+          sender_id: last_msg.sender_id ?? payload.forwarder_id,
+          sent_at: last_msg.sent_at?.toISOString() ?? new Date().toISOString(),
+          // sender_name: payload.sender_name ?? "",
         });
 
       }
 
       // Batch insert all message statuses in ONE database call
       // This is MASSIVELY more efficient than individual inserts
-      if (all_message_statuses.length > 0) {
-        await batch_insert_message_status(all_message_statuses);
-        console.log(`[WS] Batch inserted ${all_message_statuses.length} message statuses for forwarded messages`);
-      }
+      // if (all_message_statuses.length > 0) {
+      //   await batch_insert_message_status(all_message_statuses);
+      //   console.log(`[WS] Batch inserted ${all_message_statuses.length} message statuses for forwarded messages`);
+      // }
     }
 
     return {
@@ -830,8 +960,9 @@ const handle_call_hold = async (payload: CallPayload, user_id: string): Promise<
 
 export {
   handle_connection_status,
-  handle_conv_join_leave,
+  handle_conv_join,
   handle_message_new,
+  handle_message_status_ack,
   handle_message_forward,
   handle_call_init,
   handle_call_signaling,

@@ -1,12 +1,10 @@
 import db from "@/config/db";
 import { chat_model, chat_member_model } from "@/models/chat.model";
 import { user_model } from "@/models/user.model";
-import { create_unique_id } from "@/utils/general.utils";
 import { and, eq, exists, isNull } from "drizzle-orm";
-import { redis } from "@/config/redis";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { NewConversationPayload } from "@/types/socket.types";
-import { socket_connections } from "@/sockets/socket.server";
+import { add_members } from "@/cache-management/conv.cache";
 
 const create_dm = async (sender_id: string, receiver_id: string) => {
   try {
@@ -54,7 +52,6 @@ const create_dm = async (sender_id: string, receiver_id: string) => {
     const [chat] = await db
       .insert(chat_model)
       .values({
-        id: create_unique_id(),
         creater_id: sender_id,
         type: "dm",
       })
@@ -81,18 +78,14 @@ const create_dm = async (sender_id: string, receiver_id: string) => {
         .limit(1);
 
       if (sender) {
-        // update redis entries
-        const redis_key = `conv:${chat.id}:members`;
-        await redis.sadd(redis_key, receiver_id, sender_id);
-
-        // Invalidate conversation lru cache in other services
-        await redis.publish("conv:invalidate", chat.id);
+        // hydrate member set + invalidate LRU across instances
+        await add_members([receiver_id, sender_id], chat.id);
 
         // mark the creater as active in conversation in socket connection if online
-        const conn = socket_connections.get(sender_id);
-        if (conn && conn.ws.readyState === 1) {
-          conn.active_conv_id = chat.id;
-        }
+        // const conn = socket_connections.get(sender_id);
+        // if (conn && conn.ws.readyState === 1) {
+        //   conn.active_conv_id = chat.id;
+        // }
 
         const new_conversation_payload: NewConversationPayload = {
           conv_id: chat.id,

@@ -14,6 +14,8 @@ import { chat_dm_routes } from "./routes/chat-dm.routes";
 import { chat_group_routes } from "./routes/chat-group.routes";
 import { chat_poll_routes } from "./routes/chat-poll.routes";
 import { message_routes } from "./routes/message.routes";
+import { start_receipts_flush } from "./cache-management/receipt-flush";
+import { start_message_status_flush } from "./cache-management/message-status-flush";
 const SERVER_PORT = parseInt(process.env.SERVER_PORT || "5000");
 if (!SERVER_PORT || isNaN(SERVER_PORT)) {
   throw new Error("SERVER_PORT environment variable is not set or invalid");
@@ -70,13 +72,20 @@ console.log(
   `🦊 Elysia is running at port ${app.server?.url} (PID: ${process.pid})`
 );
 
+const receipts_flush_stop = start_receipts_flush();
+const message_status_flush_stop = start_message_status_flush();
+
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully');
+  receipts_flush_stop();
+  message_status_flush_stop();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   console.log('SIGINT received, shutting down gracefully');
+  receipts_flush_stop();
+  message_status_flush_stop();
   process.exit(0);
 });

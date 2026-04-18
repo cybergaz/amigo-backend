@@ -7,13 +7,13 @@ import {
   ChatType,
 } from "@/types/chat.types";
 import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
-import { redis } from "@/config/redis";
 import { add_new_member, promote_to_admin } from "./chat-group.service";
+import { add_member, invalidate_conversation } from "@/cache-management/conv.cache";
 
 
 const get_all_conversations_admin = async (type?: string) => {
   try {
-    let whereCondition
+    let whereCondition;
 
     if (type && type !== "all") {
       whereCondition = eq(chat_model.type, type as ChatType);
@@ -366,11 +366,12 @@ const force_declare_group_creater = async (conversation_id: string, member_id: s
     }
 
     if (memberWasJustAdded) {
-      const redis_key = `conv:${conversation_id}:members`;
-      await redis.sadd(redis_key, member_id);
+      // hydrate member set + invalidate LRU across instances
+      await add_member(member_id, conversation_id);
+    } else {
+      // membership unchanged but other conv state did — flush LRU only
+      await invalidate_conversation(conversation_id);
     }
-
-    await redis.publish("conv:invalidate", conversation_id);
 
     return {
       success: true,
@@ -391,7 +392,7 @@ const force_declare_group_creater = async (conversation_id: string, member_id: s
       data: null,
     };
   }
-}
+};
 
 const hard_delete_chat = async (conversation_id: string) => {
   try {
@@ -432,4 +433,4 @@ export {
   get_conversation_history_admin,
   force_declare_group_creater,
   hard_delete_chat
-}
+};

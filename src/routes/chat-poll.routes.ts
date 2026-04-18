@@ -1,8 +1,8 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
-import { fetch_pending_messages } from "@/services/cache-management/polling.cache";
+import { fetch_pending_messages } from "@/cache-management/polling.cache";
 import { socket_message_handler } from "@/sockets/socket.handlers";
-import { ChatMessageAckPayload, ChatMessagePayload, WSMessage } from "@/types/socket.types";
+import { ChatMessagePayload, MessageSentAckPayload, WSMessage } from "@/types/socket.types";
 import { get_user_details } from "@/services/user.services";
 import { polling_connections } from "@/sockets/socket.server";
 
@@ -46,14 +46,14 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
       // Update or create polling connection
       const existing_connection = polling_connections.get(user_id);
       if (existing_connection) {
-        existing_connection.last_poll = new Date();
+        existing_connection.last_poll_at = new Date();
         existing_connection.client_ip = client_ip;
       } else {
         polling_connections.set(user_id, {
-          connection_status: "foreground",
-          last_poll: new Date(),
+          connection_status: "online",
+          last_poll_at: new Date(),
           client_ip,
-          connected_at: new Date(),
+          // connected_at: new Date(),
         });
       }
 
@@ -69,7 +69,7 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
       await socket_message_handler({
         user_id: user_id,
         user_name: user_name,
-        user_pfp: user_pfp,
+        // user_pfp: user_pfp,
       }, message);
 
 
@@ -78,13 +78,10 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
       // ------------------------------------------------------------
       if (message.type == "message:new") {
         const payload = message.payload as ChatMessagePayload;
-        const ack_message_payload: ChatMessageAckPayload = {
-          id: payload.id,
+        const ack_message_payload: MessageSentAckPayload = {
+          msg_id: payload.id,
           conv_id: payload.conv_id,
-          sender_id: payload.sender_id,
-          delivered_at: new Date(),
-          delivered_to: [],
-          read_by: [],
+          is_sent: true,
         };
 
         // Return success - the handler will broadcast responses via polling cache
@@ -137,14 +134,14 @@ export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
         // Update or create polling connection
         const existing_connection = polling_connections.get(user_id);
         if (existing_connection) {
-          existing_connection.last_poll = new Date();
+          existing_connection.last_poll_at = new Date();
           existing_connection.client_ip = client_ip;
         } else {
           polling_connections.set(user_id, {
-            connection_status: "foreground",
-            last_poll: new Date(),
+            connection_status: "online",
+            last_poll_at: new Date(),
             client_ip,
-            connected_at: new Date(),
+            // connected_at: new Date(),
           });
         }
       }

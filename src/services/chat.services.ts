@@ -8,16 +8,15 @@ import { message_model, message_info_model } from "@/models/message.model";
 import { user_model } from "@/models/user.model";
 import {
   ChatType,
-  ConversationMetadata,
 } from "@/types/chat.types";
-import { create_unique_id } from "@/utils/general.utils";
 import { and, arrayContains, asc, desc, eq, gt, lt, inArray, isNotNull, isNull, ne, not, or, sql } from "drizzle-orm";
 import { broadcast_message } from "@/sockets/socket.handlers";
-import { ConversationActionPayload, DeleteMessagePayload, MembersType, SyncMessagesPayload, WSMessage } from "@/types/socket.types";
+import { ConversationActionPayload, DeleteMessagePayload, MembersType, WSMessage } from "@/types/socket.types";
 import FCMService from "./fcm.service";
 import { queue_message_fcm } from "./fcm-batch.service";
-import { get_conversation_members } from "./cache-management/socket.cache";
-import { get_chat_metas, get_all_unread } from "./cache-management/chat-meta.cache";
+import { get_conversation_members } from "@/cache-management/conv.cache";
+import { get_chat_metas, get_all_unread } from "@/cache-management/chat-meta.cache";
+import { generate_unique_id } from "@/utils/general.utils";
 
 const build_conversation_action_message = (
   action: ConversationActionPayload["action"],
@@ -53,14 +52,14 @@ const broadcast_conversation_action = async (data: {
 
   const action_at = new Date();
   const payload: ConversationActionPayload = {
-    event_id: create_unique_id(),
+    event_id: generate_unique_id(),
     conv_id: data.conv_id,
     conv_type: data.conv_type,
     action: data.action,
     members: data.members,
     actor_id: data.actor_id,
-    actor_name: data.actor_name,
-    actor_pfp: data.actor_pfp,
+    // actor_name: data.actor_name,
+    // actor_pfp: data.actor_pfp,
     message: build_conversation_action_message(data.action, data.members),
     action_at,
   };

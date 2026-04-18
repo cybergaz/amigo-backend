@@ -1,6 +1,6 @@
 import { t } from "elysia";
 import { CONNECTION_STATUS_CONST, VITAL_WS_EVENTS_CONST, WS_MESSAGE_EVENTS_CONST } from "./socket.types";
-import { CHAT_TYPE_CONSTS, MESSAGE_TYPE_CONSTS, CHAT_ROLE_CONST, MESSAGE_STATUS_CONSTS } from "./chat.types";
+import { CHAT_TYPE_CONSTS, MESSAGE_TYPE_CONSTS, CHAT_ROLE_CONST } from "./chat.types";
 
 // Flexible date type that accepts Date objects, ISO date-time strings (with or without timezone),
 // and numeric timestamps. Dart's DateTime.toIso8601String() omits the timezone suffix,
@@ -13,50 +13,54 @@ const ConnectionStatusPayloadSchema = t.Object({
   status: t.Enum(Object.fromEntries(CONNECTION_STATUS_CONST.map(x => [x, x]))),
 });
 
-// JoinLeavePayload schema
-const JoinLeavePayloadSchema = t.Object({
+// ConvJoinPayload schema
+const ConvJoinPayloadSchema = t.Object({
   conv_id: t.String(),
-  conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
   user_id: t.String(),
-  user_name: t.Optional(t.String()),
+  last_read_msg_id: t.String(),
 });
 
 // ChatMessagePayload schema
 const ChatMessagePayloadSchema = t.Object({
   id: t.String(),
-  sender_id: t.String(),
-  sender_name: t.Optional(t.String()),
   conv_id: t.String(),
-  conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
+  sender_id: t.String(),
   msg_type: t.Enum(Object.fromEntries(MESSAGE_TYPE_CONSTS.map(x => [x, x]))),
   body: t.Optional(t.String()),
   attachments: t.Optional(t.Any()),
   replied_to: t.Optional(t.String()),
   sent_at: FlexDate(),
+  // sender_name: t.Optional(t.String()),
+  // conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
 });
 
-// ChatMessageAckPayload schema
-const ChatMessageAckPayloadSchema = t.Object({
-  id: t.String(),
+// MessageSentAckPayload schema
+const MessageSentAckPayloadSchema = t.Object({
+  msg_id: t.String(),
   conv_id: t.String(),
-  sender_id: t.String(),
-  delivered_at: FlexDate(),
-  delivered_to: t.Optional(t.Array(t.String())),
-  read_by: t.Optional(t.Array(t.String())),
-  delivered_count: t.Optional(t.Number()),
-  read_count: t.Optional(t.Number()),
-  is_failed: t.Optional(t.Boolean()),
+  is_sent: t.Boolean(),
   error_code: t.Optional(t.Number()),
   new_id: t.Optional(t.String()),
+});
+
+// MessageStatusAckPayload schema
+const MessageStatusAckPayloadSchema = t.Object({
+  recipient_id: t.String(),
+  at: FlexDate(),
+  acks: t.Array(t.Object({
+    chat_id: t.String(),
+    msg_ids: t.Array(t.String()),
+    status: t.Array(t.Union([t.Literal('delivered'), t.Literal('read')])),
+  })),
 });
 
 // TypingPayload schema
 const TypingPayloadSchema = t.Object({
   conv_id: t.String(),
   sender_id: t.String(),
-  sender_name: t.Optional(t.String()),
-  sender_pfp: t.Optional(t.String()),
-  is_typing: t.Boolean(),
+  // is_typing: t.Boolean(),
+  // sender_name: t.Optional(t.String()),
+  // sender_pfp: t.Optional(t.String()),
 });
 
 // DeleteMessagePayload schema
@@ -90,7 +94,7 @@ const NewConversationPayloadSchema = t.Object({
 
 // MiscPayload schema
 const MiscPayloadSchema = t.Object({
-  message: t.String(),
+  message: t.Optional(t.String()),
   data: t.Optional(t.Any()),
   code: t.Optional(t.Number()),
   error: t.Optional(t.Any()),
@@ -117,26 +121,20 @@ const MessagePinPayloadSchema = t.Object({
   message_id: t.String(),
   message_type: t.Enum(Object.fromEntries(MESSAGE_TYPE_CONSTS.map(x => [x, x]))),
   sender_id: t.String(),
-  sender_name: t.Optional(t.String()),
-  sender_pfp: t.Optional(t.String()),
   pin: t.Boolean(),
+  // sender_name: t.Optional(t.String()),
+  // sender_pfp: t.Optional(t.String()),
 });
 
-// // MessageReplyPayload schema (extends ChatMessagePayload)
-// const MessageReplyPayloadSchema = t.Object({
-//   optimistic_id: t.Number(),
-//   canonical_id: t.Optional(t.Number()),
-//   sender_id: t.Number(),
-//   sender_name: t.Optional(t.String()),
-//   conv_id: t.Number(),
-//   conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
-//   msg_type: t.Enum(Object.fromEntries(MESSAGE_TYPE_CONSTS.map(x => [x, x]))),
-//   body: t.Optional(t.String()),
-//   attachments: t.Optional(t.Any()),
-//   metadata: t.Optional(t.Any()),
-//   sent_at: t.String(),
-//   reply_to_message_id: t.Number(),
-// });
+// MessageReactPayload schema
+const MessageReactPayloadSchema = t.Object({
+  message_id: t.String(),
+  conv_id: t.String(),
+  sender_id: t.String(),
+  emoji: t.String(),
+  action: t.Union([t.Literal('add'), t.Literal('remove')]),
+  // sender_name: t.Optional(t.String()),
+});
 
 // MessageForwardPayload schema
 const MessageForwardPayloadSchema = t.Object({
@@ -160,20 +158,20 @@ const ConversationActionPayloadSchema = t.Object({
   }),
   members: t.Array(MembersTypeSchema),
   actor_id: t.Optional(t.String()),
-  actor_name: t.Optional(t.String()),
-  actor_pfp: t.Optional(t.String()),
+  // actor_name: t.Optional(t.String()),
+  // actor_pfp: t.Optional(t.String()),
   message: t.String(),
   action_at: FlexDate(),
 });
 
-// MessageDeliveredPayload schema - for delivery receipts from FCM messages
-const MessageDeliveredPayloadSchema = t.Object({
-  message_id: t.String(),
-  conv_id: t.String(),
-  sender_id: t.String(),
-  recipient_id: t.String(),
-  delivered_at: FlexDate(),
-});
+// // MessageDeliveredPayload schema - for delivery receipts from FCM messages
+// const MessageDeliveredPayloadSchema = t.Object({
+//   message_id: t.String(),
+//   conv_id: t.String(),
+//   sender_id: t.String(),
+//   recipient_id: t.String(),
+//   delivered_at: FlexDate(),
+// });
 
 // // Ping message schema (for heartbeat)
 // const PingMessageSchema = t.Object({
@@ -190,9 +188,10 @@ const MessageDeliveredPayloadSchema = t.Object({
 // Union schema for payload
 const WSPayloadSchema = t.Union([
   ConnectionStatusPayloadSchema,
-  JoinLeavePayloadSchema,
+  ConvJoinPayloadSchema,
   ChatMessagePayloadSchema,
-  ChatMessageAckPayloadSchema,
+  MessageSentAckPayloadSchema,
+  MessageStatusAckPayloadSchema,
   TypingPayloadSchema,
   DeleteMessagePayloadSchema,
   MiscPayloadSchema,
@@ -200,8 +199,9 @@ const WSPayloadSchema = t.Union([
   NewConversationPayloadSchema,
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
+  MessageReactPayloadSchema,
   ConversationActionPayloadSchema,
-  MessageDeliveredPayloadSchema,
+  // MessageDeliveredPayloadSchema,
   // PingMessageSchema,
   // PongMessageSchema,
 ]);
@@ -214,13 +214,17 @@ const WSMessageSchema = t.Object({
 });
 
 const VitalWSPayloadSchema = t.Union([
+  ConvJoinPayloadSchema,
   NewConversationPayloadSchema,
   ChatMessagePayloadSchema,
+  MessageSentAckPayloadSchema,
+  MessageStatusAckPayloadSchema,
   DeleteMessagePayloadSchema,
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
+  MessageReactPayloadSchema,
   ConversationActionPayloadSchema,
-  MessageDeliveredPayloadSchema,
+  // MessageDeliveredPayloadSchema,
 ]);
 
 const VitalWSMessageSchema = t.Object({
@@ -231,9 +235,10 @@ const VitalWSMessageSchema = t.Object({
 
 export {
   ConnectionStatusPayloadSchema,
-  JoinLeavePayloadSchema,
+  ConvJoinPayloadSchema,
   ChatMessagePayloadSchema,
-  ChatMessageAckPayloadSchema,
+  MessageSentAckPayloadSchema,
+  MessageStatusAckPayloadSchema,
   TypingPayloadSchema,
   DeleteMessagePayloadSchema,
   MembersTypeSchema,
@@ -242,8 +247,9 @@ export {
   CallPayloadSchema,
   MessagePinPayloadSchema,
   MessageForwardPayloadSchema,
+  MessageReactPayloadSchema,
   ConversationActionPayloadSchema,
-  MessageDeliveredPayloadSchema,
+  // MessageDeliveredPayloadSchema,
   // PingMessageSchema,
   // PongMessageSchema,
   WSPayloadSchema,

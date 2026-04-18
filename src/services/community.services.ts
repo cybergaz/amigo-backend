@@ -11,7 +11,6 @@ import {
   RemoveCommunityGroupRequest,
 } from "@/types/community.types";
 import { ChatRoleType } from "@/types/chat.types";
-import { create_unique_id } from "@/utils/general.utils";
 import { and, eq, inArray, isNull, sql, desc, arrayContains, arrayOverlaps } from "drizzle-orm";
 
 // Community CRUD operations
@@ -37,7 +36,6 @@ const create_community = async (
     const [community] = await db
       .insert(community_model)
       .values({
-        id: create_unique_id(),
         name: data.name,
         metadata: data.metadata || {},
         updated_at: new Date(),
@@ -437,7 +435,6 @@ const create_community_group = async (
     const [group] = await db
       .insert(chat_model)
       .values({
-        id: create_unique_id(),
         creater_id: admin_user_id,
         type: "community_group",
         title: data.title,
@@ -726,7 +723,7 @@ const get_all_community_groups = async () => {
       data: null,
     };
   }
-}
+};
 
 const create_standalone_comminity_group = async (
   admin_user_id: string,
@@ -738,7 +735,6 @@ const create_standalone_comminity_group = async (
     const [group] = await db
       .insert(chat_model)
       .values({
-        id: create_unique_id(),
         creater_id: admin_user_id,
         type: "community_group",
         title: data.title,
@@ -758,7 +754,7 @@ const create_standalone_comminity_group = async (
       code: 201,
       message: "Standalone community group created successfully",
       data: group,
-    }
+    };
 
   }
   catch (error) {
@@ -769,7 +765,7 @@ const create_standalone_comminity_group = async (
       message: "ERROR: add_standalone_comminity_group",
     };
   }
-}
+};
 
 // Add group to multiple communities at once
 const add_group_to_multiple_communities = async (
@@ -864,7 +860,7 @@ const add_group_to_multiple_communities = async (
       message: "ERROR: add_group_to_multiple_communities",
     };
   }
-}
+};
 
 export {
   create_community,

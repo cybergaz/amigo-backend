@@ -8,13 +8,12 @@ import {
   ChatRoleType,
   ChatType,
 } from "@/types/chat.types";
-import { create_unique_id } from "@/utils/general.utils";
 import { and, asc, eq, inArray, isNull, or, } from "drizzle-orm";
-import { redis } from "@/config/redis";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { NewConversationPayload, MembersType } from "@/types/socket.types";
 import { get_user_details } from "./user.services";
 import { broadcast_conversation_action } from "./chat.services";
+import { add_members, remove_member as cache_remove_member } from "@/cache-management/conv.cache";
 
 const create_group = async (
   creater_id: string,
@@ -26,7 +25,6 @@ const create_group = async (
     const [chat] = await db
       .insert(chat_model)
       .values({
-        id: create_unique_id(),
         creater_id,
         type: "group",
         title,
@@ -82,12 +80,8 @@ const create_group = async (
         },
       });
 
-      // update redis entries
-      const redis_key = `conv:${chat.id}:members`;
-      await redis.sadd(redis_key, ...uniqueMemberIds);
-
-      // Invalidate conversation lru cache in other services
-      await redis.publish("conv:invalidate", chat.id);
+      // hydrate member set + invalidate LRU across instances
+      await add_members(uniqueMemberIds, chat.id);
 
     } catch (error) {
       console.error('Error sending conversation_added notification for group:', error);
@@ -411,14 +405,10 @@ const add_new_member = async (
       });
     }
 
-    // update redis entries
-    const redis_key = `conv:${conversation_id}:members`;
+    // hydrate new members + invalidate LRU across instances
     if (eligibleIds.length > 0) {
-      await redis.sadd(redis_key, ...eligibleIds);
+      await add_members(eligibleIds, conversation_id);
     }
-
-    // Invalidate conversation lru cache in other services
-    await redis.publish("conv:invalidate", conversation_id);
 
     return {
       success: true,
@@ -495,12 +485,8 @@ const remove_member = async (
       };
     }
 
-    // Update redis set
-    const redis_key = `conv:${conversation_id}:members`;
-    await redis.srem(redis_key, user_id);
-
-    // Invalidate conversation lru cache in other services
-    await redis.publish("conv:invalidate", conversation_id);
+    // drop from member set + invalidate LRU across instances
+    await cache_remove_member(user_id, conversation_id);
 
     if (member_info.length) {
       const members_for_action: MembersType[] = member_info.filter(m => m.user_id !== null).map((m) => ({

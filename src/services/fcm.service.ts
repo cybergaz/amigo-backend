@@ -2,7 +2,7 @@ import admin from 'firebase-admin';
 import { ChatMessagePayload, VitalWSMessage, WSMessage, } from '@/types/socket.types';
 import { MessageType } from '@/types/chat.types';
 import { ResultType } from '@/types/core.types';
-import { store_fcm_token, fetch_fcm_token, fetch_fcm_tokens, remove_fcm_token } from '@/services/cache-management/fcm-token.cache';
+import { store_fcm_token, fetch_fcm_token, fetch_fcm_tokens, remove_fcm_token } from '@/cache-management/fcm-token.cache';
 
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {

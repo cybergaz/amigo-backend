@@ -1,7 +1,13 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
 import { delete_message_for_me, soft_delete_message } from "@/services/chat.services";
-import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, mark_message_delivered, mark_messages_delivered_batch, react_to_message, reply_to_message, verify_message_ids } from "@/services/message.services";
+import { delete_messages, forward_messages, get_pinned_messages, get_starred_messages, react_to_message, reply_to_message } from "@/services/message.services";
+import { mark_message_delivered, mark_messages_delivered_batch, verify_message_ids } from "@/services/message-status.service";
+import { MessageStatusAckPayloadSchema } from "@/types/socket.elysia-schema";
+import { socket_message_handler } from "@/sockets/socket.handlers";
+import { MessageType } from "@/types/chat.types";
+import { MessageStatusAckPayload } from "@/types/socket.types";
+import { handle_message_status_ack } from "@/sockets/socket.service";
 
 export const message_routes = new Elysia({ prefix: "/message" })
   .state({ id: "", role: "" })
@@ -44,6 +50,14 @@ export const message_routes = new Elysia({ prefix: "/message" })
         conversation_id: t.String()
       }))
     })
+  })
+
+  .post("/status-ack", async ({ set, store, body }) => {
+    const delivery_result = await handle_message_status_ack(body as MessageStatusAckPayload, store.id, new Date());
+    set.status = delivery_result.code;
+    return delivery_result;
+  }, {
+    body: MessageStatusAckPayloadSchema
   })
 
   // // Message operations routes
