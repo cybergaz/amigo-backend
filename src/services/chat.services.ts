@@ -16,6 +16,7 @@ import FCMService from "./fcm.service";
 import { queue_message_fcm } from "./fcm-batch.service";
 import { get_conversation_members } from "@/cache-management/conv.cache";
 import { get_chat_metas, get_all_unread } from "@/cache-management/chat-meta.cache";
+import { get_message_statuses_bulk } from "@/cache-management/message.cache";
 import { generate_unique_id } from "@/utils/general.utils";
 
 const build_conversation_action_message = (
@@ -736,8 +737,7 @@ const get_message_statuses = async (
     // Calculate offset for pagination
     const offset = (page - 1) * limit;
 
-    // Get all message statuses for this conversation
-    // This includes statuses for all users in the conversation
+    // Get all message statuses for this conversation from DB
     const statuses = await db
       .select()
       .from(message_info_model)
@@ -749,6 +749,40 @@ const get_message_statuses = async (
       .orderBy(desc(message_info_model.delivered_at))
       .limit(limit)
       .offset(offset);
+
+    // Enrich with unflushed Redis statuses
+    const msg_ids = [...new Set(statuses.map(s => s.message_id))];
+    const redis_statuses = await get_message_statuses_bulk(msg_ids);
+
+    const enriched_statuses = statuses.map(s => {
+      const redis_map = redis_statuses.get(s.message_id);
+      if (!redis_map) return s;
+      const redis_user = redis_map.get(s.user_id);
+      if (!redis_user) return s;
+      return {
+        ...s,
+        delivered_at: s.delivered_at ?? (redis_user.delivered_at ? new Date(redis_user.delivered_at) : null),
+        read_at: s.read_at ?? (redis_user.read_at ? new Date(redis_user.read_at) : null),
+      };
+    });
+
+    // Also add Redis-only entries (not yet in DB) for messages in this page
+    for (const [msg_id, user_map] of redis_statuses) {
+      for (const [uid, status] of user_map) {
+        const exists = statuses.some(s => s.message_id === msg_id && s.user_id === uid);
+        if (!exists && (status.delivered_at || status.read_at)) {
+          enriched_statuses.push({
+            message_id: msg_id,
+            user_id: uid,
+            chat_id: conversation_id,
+            delivered_at: status.delivered_at ? new Date(status.delivered_at) : null,
+            read_at: status.read_at ? new Date(status.read_at) : null,
+            reaction: null,
+            deleted_at: null,
+          });
+        }
+      }
+    }
 
     // Get total count for pagination info
     const totalCountResult = await db
@@ -765,7 +799,7 @@ const get_message_statuses = async (
       success: true,
       code: 200,
       data: {
-        statuses,
+        statuses: enriched_statuses,
         pagination: {
           currentPage: page,
           totalPages,
