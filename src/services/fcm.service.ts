@@ -45,6 +45,10 @@ export class FCMService {
       // Fetch FCM tokens for all users using the 3-tier cache
       const token_map = await fetch_fcm_tokens(payload.user_ids);
 
+      const with_tokens = Array.from(token_map.entries()).filter(([_, t]) => t !== null).length;
+      const without_tokens = payload.user_ids.length - with_tokens;
+      console.log(`[FCM] send_notification: ${with_tokens} with token, ${without_tokens} without token (type=${payload.type})`);
+
       // Filter out users without tokens and send notifications
       const send_promises = Array.from(token_map.entries())
         .filter(([_, token]) => token !== null)
@@ -103,7 +107,8 @@ export class FCMService {
               },
             };
 
-            await admin.messaging().send(message);
+            const msg_id = await admin.messaging().send(message);
+            console.log(`[FCM] ✅ Sent to user ${user_id}: ${msg_id}`);
             return true;
           } catch (error: any) {
             // Handle invalid token errors

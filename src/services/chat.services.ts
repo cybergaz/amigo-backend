@@ -18,6 +18,7 @@ import { get_conversation_members } from "@/cache-management/conv.cache";
 import { get_chat_metas, get_all_unread } from "@/cache-management/chat-meta.cache";
 import { get_message_statuses_bulk } from "@/cache-management/message.cache";
 import { generate_unique_id } from "@/utils/general.utils";
+import { randomUUIDv7 } from "bun";
 
 const build_conversation_action_message = (
   action: ConversationActionPayload["action"],
@@ -53,7 +54,7 @@ const broadcast_conversation_action = async (data: {
 
   const action_at = new Date();
   const payload: ConversationActionPayload = {
-    event_id: generate_unique_id(),
+    event_id: randomUUIDv7(),
     conv_id: data.conv_id,
     conv_type: data.conv_type,
     action: data.action,
@@ -1116,6 +1117,68 @@ const get_messages_around = async (
   }
 };
 
+const get_chat_members = async (conversation_id: string, user_id: string) => {
+  try {
+    const [membership] = await db
+      .select({ id: chat_member_model.id })
+      .from(chat_member_model)
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at),
+        )
+      )
+      .limit(1);
+
+    if (!membership) {
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
+
+    const members = await db
+      .select({
+        id: chat_member_model.id,
+        chat_id: chat_member_model.chat_id,
+        user_id: chat_member_model.user_id,
+        role: chat_member_model.role,
+        joined_at: chat_member_model.joined_at,
+        removed_at: chat_member_model.removed_at,
+        last_read_msg_id: chat_member_model.last_read_msg_id,
+        last_delivered_msg_id: chat_member_model.last_delivered_msg_id,
+        name: user_model.name,
+        phone: user_model.phone,
+        profile_pic: user_model.profile_pic,
+        user_role: user_model.role,
+      })
+      .from(chat_member_model)
+      .innerJoin(user_model, eq(user_model.id, chat_member_model.user_id))
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          isNull(chat_member_model.removed_at),
+        )
+      )
+      .orderBy(asc(chat_member_model.joined_at));
+
+    return {
+      success: true,
+      code: 200,
+      data: { members },
+    };
+  } catch (error) {
+    console.error("get_chat_members error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : get_chat_members",
+    };
+  }
+};
+
 export {
   get_chat_list,
   update_conversation,
@@ -1129,4 +1192,5 @@ export {
   getConversationDetailsForUser,
   broadcast_conversation_action,
   get_messages_around,
+  get_chat_members,
 };

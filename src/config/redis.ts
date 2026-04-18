@@ -34,6 +34,8 @@ async function cleanRedis() {
   }
 }
 
+// cleanRedis();
+
 redis_ping();
 
 export { redis, redis_ping, get_new_redis_client, cleanRedis };

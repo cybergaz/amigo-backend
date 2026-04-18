@@ -1,6 +1,6 @@
 import { Elysia, t } from "elysia";
 import { app_middleware } from "@/middleware";
-import { get_chat_list, get_conversation_history, get_message_statuses, get_messages_around, soft_delete_chat, soft_delete_message } from "@/services/chat.services";
+import { get_chat_list, get_chat_members, get_conversation_history, get_message_statuses, get_messages_around, soft_delete_chat, soft_delete_message } from "@/services/chat.services";
 import { dm_delete_status } from "@/services/chat-dm.service";
 
 const chat_routes = new Elysia({ prefix: "/chat" })
@@ -71,6 +71,16 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     query: t.Object({
       before: t.Optional(t.Number({ minimum: 0, maximum: 100, default: 32 })),
       after: t.Optional(t.Number({ minimum: 0, maximum: 100, default: 32 })),
+    })
+  })
+
+  .get("/get-chat-members/:conversation_id", async ({ set, store, params }) => {
+    const result = await get_chat_members(params.conversation_id, store.id);
+    set.status = result.code;
+    return result;
+  }, {
+    params: t.Object({
+      conversation_id: t.String()
     })
   })
 
