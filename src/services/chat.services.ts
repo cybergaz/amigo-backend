@@ -75,6 +75,21 @@ const broadcast_conversation_action = async (data: {
       ws_timestamp: action_at,
     },
   });
+
+  // For member_removed: removed users are no longer in the conv member cache,
+  // so the conversation broadcast above skips them. Send them the event too
+  // so their client can mark themselves as removed and disable messaging.
+  if (data.action === "member_removed" && data.members.length > 0) {
+    await broadcast_message({
+      to: "users",
+      user_ids: data.members.map(m => m.user_id),
+      message: {
+        type: "conversation:action",
+        payload,
+        ws_timestamp: action_at,
+      },
+    });
+  }
 };
 
 
