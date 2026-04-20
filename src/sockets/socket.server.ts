@@ -183,6 +183,26 @@ const web_socket_server = new Elysia({
           },
         });
 
+        // Presence snapshot: send current online status of B's peers back to B
+        // so B's UI reflects who's already online. Without this, B only ever
+        // learns about peers when they toggle state (connect/disconnect) —
+        // peers already online before B connected would appear offline forever.
+        const snapshot_at = new Date();
+        for (const peer_id of connected_users) {
+          const peer_conn = socket_connections.get(peer_id);
+          if (peer_conn && peer_conn.ws.readyState === 1) {
+            try {
+              ws.send({
+                type: "connection:status",
+                payload: { sender_id: peer_id, status: "online" } as ConnectionStatusPayload,
+                ws_timestamp: snapshot_at,
+              }, true);
+            } catch (err) {
+              console.error(`[WS] presence snapshot send failed for peer ${peer_id}:`, err);
+            }
+          }
+        }
+
         // logConnectionSuccess('ws', user_id, client_ip, { user_name: user_res.data?.name });
 
         // =============================================================================

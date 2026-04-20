@@ -19,6 +19,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
 
   .get("/get-chat-list/:type", async ({ set, store, params }) => {
     const chats_result = await get_chat_list(store.id, params.type ? params.type : "all");
+    console.log("chats_result -> ", chats_result);
     set.status = chats_result.code;
     return chats_result;
   },
@@ -47,9 +48,9 @@ const chat_routes = new Elysia({ prefix: "/chat" })
       conversation_id: t.String()
     }),
     query: t.Object({
-      limit:             t.Optional(t.Number({ minimum: 1, maximum: 500, default: 20 })),
+      limit: t.Optional(t.Number({ minimum: 1, maximum: 500, default: 20 })),
       before_message_id: t.Optional(t.String()),
-      after_message_id:  t.Optional(t.String()),
+      after_message_id: t.Optional(t.String()),
     })
   })
 

@@ -292,9 +292,15 @@ const add_new_member = async (
       };
     }
 
-    // 2. Find already existing members
-    const existingMembers = await db
-      .select({ user_id: chat_member_model.user_id })
+    // 2. Look up existing rows, distinguishing ACTIVE (removed_at IS NULL)
+    //    from previously-REMOVED (removed_at IS NOT NULL). Revived members
+    //    need an UPDATE to clear removed_at and reset joined_at/role, not
+    //    just a no-op skip.
+    const existingRows = await db
+      .select({
+        user_id: chat_member_model.user_id,
+        removed_at: chat_member_model.removed_at,
+      })
       .from(chat_member_model)
       .where(
         and(
@@ -303,24 +309,55 @@ const add_new_member = async (
         )
       );
 
-    const existingIds = existingMembers.map((m) => m.user_id);
+    const activeIds: string[] = existingRows
+      .filter((r) => r.removed_at === null && r.user_id !== null)
+      .map((r) => r.user_id as string);
+    const removedIds: string[] = existingRows
+      .filter((r) => r.removed_at !== null && r.user_id !== null)
+      .map((r) => r.user_id as string);
+    const brandNewIds: string[] = validUserIds.filter(
+      (id) => !activeIds.includes(id) && !removedIds.includes(id),
+    );
 
-    // 3. Eligible new members = valid - existing
-    const eligibleIds = validUserIds.filter((id) => !existingIds.includes(id));
+    // 3. Eligible = brand-new inserts + revived updates (both make a user
+    //    active again; both should be broadcast as "added").
+    const eligibleIds = [...brandNewIds, ...removedIds];
 
-    // 4. Insert eligible members
+    // 4. Insert brand-new rows
     let inserted: typeof chat_member_model.$inferSelect[] = [];
-    if (eligibleIds.length > 0) {
+    if (brandNewIds.length > 0) {
       inserted = await db
         .insert(chat_member_model)
         .values(
-          eligibleIds.map((id) => ({
+          brandNewIds.map((id) => ({
             chat_id: conversation_id,
             user_id: id,
             role,
           }))
         )
         .returning();
+    }
+
+    // 4b. Revive removed rows: clear removed_at, reset joined_at & role,
+    //     clear any stale cursor fields so the user starts fresh.
+    if (removedIds.length > 0) {
+      const revived = await db
+        .update(chat_member_model)
+        .set({
+          removed_at: null,
+          joined_at: new Date(),
+          role,
+          last_read_msg_id: null,
+          last_delivered_msg_id: null,
+        })
+        .where(
+          and(
+            eq(chat_member_model.chat_id, conversation_id),
+            inArray(chat_member_model.user_id, removedIds),
+          )
+        )
+        .returning();
+      inserted = [...inserted, ...revived];
     }
 
     const [conv_details] = await db
@@ -416,7 +453,8 @@ const add_new_member = async (
       message: "Processed members",
       data: {
         inserted,
-        existing: existingIds,
+        existing: activeIds,
+        revived: removedIds,
         invalid: invalidUserIds,
       },
     };
