@@ -19,7 +19,7 @@ const chat_routes = new Elysia({ prefix: "/chat" })
 
   .get("/get-chat-list/:type", async ({ set, store, params }) => {
     const chats_result = await get_chat_list(store.id, params.type ? params.type : "all");
-    console.log("chats_result -> ", chats_result);
+    // console.log("chats_result -> ", chats_result);
     set.status = chats_result.code;
     return chats_result;
   },

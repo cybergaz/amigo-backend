@@ -67,6 +67,13 @@ const handle_conv_join = async (payload: ConvJoinPayload, timestamp?: Date | str
       return { success: true, code: 200, message: "No messages to mark as read" };
     }
     const now = new Date();
+    // WS ws_timestamp arrives as a string over the wire; normalize to Date once.
+    const effective_ts: Date =
+      timestamp instanceof Date
+        ? timestamp
+        : typeof timestamp === "string"
+          ? new Date(timestamp)
+          : now;
 
     // grab the previous cursor BEFORE overwriting it
     const prev_receipt = await get_receipt(payload.user_id, payload.conv_id);
@@ -77,14 +84,14 @@ const handle_conv_join = async (payload: ConvJoinPayload, timestamp?: Date | str
       payload.user_id,
       payload.conv_id,
       payload.last_read_msg_id,
-      timestamp ?? now
+      effective_ts,
     );
 
     // reset the unread count for this user - conversation
     reset_unread(payload.user_id, payload.conv_id);
 
     // mark messages as read upto last_read_msg_id in message_info table — only the unread window
-    mark_read_upto(payload.user_id, payload.conv_id, payload.last_read_msg_id, timestamp ?? now, prev_read_msg_id);
+    mark_read_upto(payload.user_id, payload.conv_id, payload.last_read_msg_id, effective_ts, prev_read_msg_id);
 
     // find distinct senders only in the unread window (prev_cursor, new_cursor]
     const lower_bound = prev_read_msg_id
@@ -240,7 +247,14 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
         body: payload.body ?? "",
         type: payload.msg_type,
         sender_id: payload.sender_id,
-        sent_at: payload.sent_at instanceof Date ? payload.sent_at.toISOString() : (payload.sent_at?.toString() ?? now.toISOString()),
+        sent_at: (() => {
+          // WS wire sends sent_at as an ISO string, but the type claims Date.
+          // Handle both safely without relying on TS's narrowing.
+          const raw = payload.sent_at as unknown;
+          if (raw instanceof Date) return raw.toISOString();
+          if (typeof raw === "string" && raw.length > 0) return raw;
+          return now.toISOString();
+        })(),
         // sender_name: payload.sender_name ?? "",
       });
 
