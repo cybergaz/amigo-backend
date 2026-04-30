@@ -98,6 +98,11 @@ const get_chat_list = async (user_id: string, type: string) => {
     // ── Single query: my memberships → chats, with DM peer via self-join ──
     // For DMs we self-join chat_members to get the other user in the same query.
     // For groups the peer columns come back null — no N+1.
+    const is_deleted_dm = type === "deleted_dm";
+
+    // dm_peer matches the *other* member of the DM. The peer's row should be
+    // active (their removed_at is null) — even for the deleted_dm case where
+    // it's the *current* user's row that has removed_at set.
     const dm_peer = db.$with("dm_peer").as(
       db.select({
         chat_id: chat_member_model.chat_id,
@@ -124,6 +129,9 @@ const get_chat_list = async (user_id: string, type: string) => {
 
         role: chat_member_model.role,
         joinedAt: chat_member_model.joined_at,
+        // For deleted DMs, expose the soft-delete timestamp so the UI can
+        // show "deleted X ago". Null for active chats.
+        deletedAt: chat_member_model.removed_at,
 
         // DM peer info (null for groups)
         userId: user_model.id,
@@ -139,7 +147,9 @@ const get_chat_list = async (user_id: string, type: string) => {
       .where(
         and(
           eq(chat_member_model.user_id, user_id),
-          isNull(chat_member_model.removed_at),
+          is_deleted_dm
+            ? isNotNull(chat_member_model.removed_at)
+            : isNull(chat_member_model.removed_at),
           isNull(chat_model.deleted_at),
           type !== "all"
             ? type === "group"

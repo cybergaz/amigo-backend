@@ -1,7 +1,7 @@
 const CHAT_TYPE_CONSTS = ["dm", "group", "community_group"] as const;
 type ChatType = typeof CHAT_TYPE_CONSTS[number];
 
-const MESSAGE_TYPE_CONSTS = ["text", "image", "video", "audio", "document", "media", "reply", "forwarded", "system", "attachment", "reaction"] as const;
+const MESSAGE_TYPE_CONSTS = ["text", "image", "video", "audio", "document", "media", "reply", "forwarded", "system", "attachment", "reaction", "contact"] as const;
 type MessageType = typeof MESSAGE_TYPE_CONSTS[number];
 
 const MESSAGE_STATUS_CONSTS = ["sent", "delivered", "read"] as const;

@@ -418,6 +418,8 @@ const mark_read_upto = async (
   prev_read_msg_id?: string | null,
 ): Promise<ResultType<{ rows_affected: number; }>> => {
   try {
+    const at_iso = at instanceof Date ? at.toISOString() : at;
+
     const lower_bound = prev_read_msg_id
       ? sql`AND m.sent_at > (SELECT sent_at FROM ${message_model} WHERE id = ${prev_read_msg_id} LIMIT 1)`
       : sql``;
@@ -432,7 +434,7 @@ const mark_read_upto = async (
       )
       INSERT INTO ${message_info_model}
         (message_id, user_id, chat_id, delivered_at, read_at)
-      SELECT m.id, ${user_id}::uuid, m.chat_id, ${at}, ${at}
+      SELECT m.id, ${user_id}::uuid, m.chat_id, ${at_iso}::timestamptz, ${at_iso}::timestamptz
       FROM ${message_model} m, target t
       WHERE m.chat_id = ${conversation_id}
         AND m.sent_at IS NOT NULL
