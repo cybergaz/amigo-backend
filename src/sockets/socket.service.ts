@@ -10,6 +10,7 @@ import { update_chat_meta, batch_increment_unread, reset_unread } from "@/cache-
 import db from "@/config/db";
 import { chat_member_model } from "@/models/chat.model";
 import { message_model } from "@/models/message.model";
+import { user_model } from "@/models/user.model";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { update_conversation } from "@/services/chat.services";
 import FCMService from "@/services/fcm.service";
@@ -89,6 +90,13 @@ const handle_conv_join = async (payload: ConvJoinPayload, timestamp?: Date | str
 
     // reset the unread count for this user - conversation
     reset_unread(payload.user_id, payload.conv_id);
+
+    // Pin the user's currently-active conversation on their socket connection so
+    // handle_message_new can skip incrementing unread for them while they're here.
+    // Polling-only clients have no socket_connections entry and fall through;
+    // their reset comes from the read-status ack path in handle_message_status_ack.
+    const ws_conn = socket_connections.get(payload.user_id);
+    if (ws_conn) ws_conn.active_conv_id = payload.conv_id;
 
     // mark messages as read upto last_read_msg_id in message_info table — only the unread window
     mark_read_upto(payload.user_id, payload.conv_id, payload.last_read_msg_id, effective_ts, prev_read_msg_id);
@@ -193,10 +201,54 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       };
     }
 
+    // Pre-warm replied-to preview on the broadcast payload so recipients can
+    // render the reply container on first paint without a local DB lookup.
+    let replied_to_message: ChatMessagePayload["replied_to_message"] = null;
+    if (payload.replied_to) {
+      try {
+        const [orig] = await db
+          .select({
+            id: message_model.id,
+            sender_id: message_model.sender_id,
+            type: message_model.type,
+            body: message_model.body,
+            attachments: message_model.attachments,
+            sent_at: message_model.sent_at,
+          })
+          .from(message_model)
+          .where(eq(message_model.id, payload.replied_to))
+          .limit(1);
+        if (orig) {
+          // sender_name lookup is best-effort; the client falls back to
+          // its UserInfoCache if null.
+          let sender_name: string | null = null;
+          if (orig.sender_id) {
+            const [u] = await db
+              .select({ name: user_model.name })
+              .from(user_model)
+              .where(eq(user_model.id, orig.sender_id))
+              .limit(1);
+            sender_name = u?.name ?? null;
+          }
+          replied_to_message = {
+            id: orig.id,
+            sender_id: orig.sender_id,
+            sender_name,
+            type: orig.type,
+            body: orig.body,
+            attachments: orig.attachments,
+            sent_at: orig.sent_at,
+          };
+        }
+      } catch (err) {
+        console.error("[message:new] replied_to enrichment failed:", err);
+      }
+    }
+
     const updated_message_payload: ChatMessagePayload = {
       ...payload,
       id: store_msg_result.new_id ?? payload.id, // update message ID if it was changed during retry
-      // sender_name: payload.sender_name || String(user_name) || undefined,
+      replied_to_message,
     };
 
     // broadcast to the chat recipients about the new message
@@ -258,8 +310,20 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
         // sender_name: payload.sender_name ?? "",
       });
 
-      // 2. Increment unread for all chat members except the sender
-      const unread_user_ids = [...sent_result.offline, ...sent_result.online, ...sent_result.polling].filter(id => id !== payload.sender_id);
+      // 2. Increment unread for all chat members except the sender, and except
+      //    users currently active in this conversation (their UI is already
+      //    showing the message; bumping their unread would inflate the badge
+      //    until they re-join). active_conv_id is set in handle_conv_join.
+      const unread_user_ids = [
+        ...sent_result.offline,
+        ...sent_result.online,
+        ...sent_result.polling,
+      ].filter(id => {
+        if (id === payload.sender_id) return false;
+        const conn = socket_connections.get(id);
+        if (conn && conn.active_conv_id === payload.conv_id) return false;
+        return true;
+      });
       if (unread_user_ids.length > 0) {
         batch_increment_unread(unread_user_ids, payload.conv_id);
       }
@@ -353,6 +417,17 @@ const handle_message_status_ack = async (payload: MessageStatusAckPayload, user_
 
     // store in redis cache (fire-and-forget, flushed to DB by worker)
     batch_mark_status(recipient_id, ack_at, payload.acks);
+
+    // Read-status acks mean the user has caught up to the messages they're
+    // acking — reset Redis unread for those chats. Polling-only clients
+    // (which never set active_conv_id) rely on this path to keep their badge
+    // counts honest. Newer messages arriving after the ack will re-bump for
+    // recipients who aren't currently in the conv via handle_message_new.
+    for (const g of payload.acks) {
+      if (g.status.includes("read")) {
+        reset_unread(recipient_id, g.chat_id);
+      }
+    }
 
     // collect all msg_ids, one PK lookup to get sender_id per message
     const all_msg_ids = payload.acks.flatMap(g => g.msg_ids);

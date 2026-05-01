@@ -15,12 +15,7 @@ type TransportType = 'ws' | 'polling';
 interface UserConnection {
   ws: ElysiaWS;
   missed_pings: number;
-  // client_ip?: string;
-  // connection_status: ConnectionStatusType;
-  // active_conv_id?: string;
-  // last_ping_sent?: Date;
-  // last_pong_received?: Date;
-  // connected_at: Date;
+  active_conv_id?: string;
 }
 
 interface PollingConnection {
@@ -94,9 +89,18 @@ type ChatMessagePayload = {
   body?: string;
   attachments?: any;
   replied_to?: string;
+  // Pre-warmed compact preview of the replied-to message so the client can
+  // render the reply container on first paint without a local DB lookup.
+  replied_to_message?: {
+    id: string;
+    sender_id: string | null;
+    sender_name: string | null;
+    type: string;
+    body: string | null;
+    attachments: unknown;
+    sent_at: Date | null;
+  } | null;
   sent_at: Date;
-  // sender_name?: string;
-  // conv_type: ChatType;
 };
 
 type MessageSentAckPayload = {
@@ -215,7 +219,8 @@ type ConversationActionType =
   | 'member_added'
   | 'member_removed'
   | 'member_promoted'
-  | 'member_demoted';
+  | 'member_demoted'
+  | 'chat_delete';
 
 type ConversationActionPayload = {
   event_id: string;

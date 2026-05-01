@@ -9,6 +9,8 @@ import {
 import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
 import { add_new_member, promote_to_admin } from "./chat-group.service";
 import { add_member, invalidate_conversation } from "@/cache-management/conv.cache";
+import { broadcast_conversation_action } from "./chat.services";
+import { MembersType } from "@/types/socket.types";
 
 
 const get_all_conversations_admin = async (type?: string) => {
@@ -394,8 +396,42 @@ const force_declare_group_creater = async (conversation_id: string, member_id: s
   }
 };
 
-const hard_delete_chat = async (conversation_id: string) => {
+const hard_delete_chat = async (conversation_id: string, actor_id?: string) => {
   try {
+    // Snapshot the active members + chat row BEFORE deleting — chat_member rows
+    // cascade-delete with the chat, so we need them in hand to broadcast the
+    // conversation:action event after the row is gone.
+    const members = await db
+      .select({
+        user_id: chat_member_model.user_id,
+        user_name: user_model.name,
+        user_pfp: user_model.profile_pic,
+        role: chat_member_model.role,
+        joined_at: chat_member_model.joined_at,
+      })
+      .from(chat_member_model)
+      .innerJoin(user_model, eq(user_model.id, chat_member_model.user_id))
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          isNull(chat_member_model.removed_at),
+        )
+      );
+
+    const [chat_row] = await db
+      .select({ id: chat_model.id, type: chat_model.type })
+      .from(chat_model)
+      .where(eq(chat_model.id, conversation_id));
+
+    if (!chat_row) {
+      return {
+        success: false,
+        code: 404,
+        message: "Conversation not found",
+        data: { conversation_id, deleted: false },
+      };
+    }
+
     const [conversation] = await db
       .delete(chat_model)
       .where(eq(chat_model.id, conversation_id))
@@ -408,6 +444,28 @@ const hard_delete_chat = async (conversation_id: string) => {
         message: "Conversation not found",
         data: { conversation_id, deleted: false },
       };
+    }
+
+    // Notify former members in real time so their clients can purge the chat
+    // from local state without waiting for next reconcile. Fire-and-forget —
+    // failure to broadcast shouldn't roll back the delete.
+    if (members.length > 0) {
+      const member_payload: MembersType[] = members
+        .filter((m): m is typeof m & { user_id: string } => m.user_id !== null)
+        .map(m => ({
+          user_id: m.user_id,
+          user_name: m.user_name,
+          user_pfp: m.user_pfp ?? undefined,
+          role: m.role as ChatRoleType,
+          joined_at: m.joined_at ?? new Date(),
+        }));
+      broadcast_conversation_action({
+        conv_id: conversation_id,
+        conv_type: chat_row.type as ChatType,
+        action: "chat_delete",
+        members: member_payload,
+        actor_id,
+      }).catch(err => console.error("[chat_delete] broadcast failed:", err));
     }
 
     return {

@@ -755,7 +755,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   })
 
   .delete("/chat-management/hard-delete-chat/:conversation_id", async ({ set, store, params }) => {
-    const delete_result = await hard_delete_chat(params.conversation_id);
+    const delete_result = await hard_delete_chat(params.conversation_id, store.id);
     set.status = delete_result.code;
     return delete_result;
   }, {

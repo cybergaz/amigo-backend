@@ -36,6 +36,8 @@ const build_conversation_action_message = (
       return `${target} promoted to admin`;
     case "member_demoted":
       return `${target} demoted to member`;
+    case "chat_delete":
+      return "This group was deleted";
     default:
       return target;
   }
@@ -66,20 +68,31 @@ const broadcast_conversation_action = async (data: {
     action_at,
   };
 
-  await broadcast_message({
-    to: "conversation",
-    conv_id: data.conv_id,
-    message: {
-      type: "conversation:action",
-      payload,
-      ws_timestamp: action_at,
-    },
-  });
+  // For chat_delete the chat row is already gone, so the conversation member
+  // cache lookup returns nothing → skip the conversation broadcast and rely
+  // on the per-user broadcast below. For all other actions, broadcast to
+  // the conversation (which fan-outs to current members via Redis cache).
+  if (data.action !== "chat_delete") {
+    await broadcast_message({
+      to: "conversation",
+      conv_id: data.conv_id,
+      message: {
+        type: "conversation:action",
+        payload,
+        ws_timestamp: action_at,
+      },
+    });
+  }
 
-  // For member_removed: removed users are no longer in the conv member cache,
-  // so the conversation broadcast above skips them. Send them the event too
-  // so their client can mark themselves as removed and disable messaging.
-  if (data.action === "member_removed" && data.members.length > 0) {
+  // For member_removed and chat_delete: the affected users are no longer in
+  // the conv member cache (or the cache is gone), so the conversation
+  // broadcast above either skips them or didn't run. Send the event direct
+  // to user IDs so their client can mark themselves as removed / purge the
+  // chat from local state.
+  if (
+    (data.action === "member_removed" || data.action === "chat_delete") &&
+    data.members.length > 0
+  ) {
     await broadcast_message({
       to: "users",
       user_ids: data.members.map(m => m.user_id),
@@ -90,6 +103,66 @@ const broadcast_conversation_action = async (data: {
       },
     });
   }
+};
+
+
+// Compact preview of a replied-to message attached to history fetches and
+// message:new broadcasts so the client can render the reply container on
+// first paint without a local DB lookup falling through to "empty".
+type RepliedToPreview = {
+  id: string;
+  sender_id: string | null;
+  sender_name: string | null;
+  type: string;
+  body: string | null;
+  attachments: unknown;
+  sent_at: Date | null;
+};
+
+const fetch_replied_to_previews = async (
+  ids: string[],
+): Promise<Map<string, RepliedToPreview>> => {
+  const out = new Map<string, RepliedToPreview>();
+  if (ids.length === 0) return out;
+  const rows = await db
+    .select({
+      id: message_model.id,
+      sender_id: message_model.sender_id,
+      sender_name: user_model.name,
+      type: message_model.type,
+      body: message_model.body,
+      attachments: message_model.attachments,
+      sent_at: message_model.sent_at,
+    })
+    .from(message_model)
+    .leftJoin(user_model, eq(user_model.id, message_model.sender_id))
+    .where(inArray(message_model.id, ids));
+  for (const r of rows) {
+    out.set(r.id, r);
+  }
+  return out;
+};
+
+// Attach `replied_to_message` to each message that has a non-null replied_to,
+// using a single batched query. Mutates and returns the input array for
+// caller convenience.
+const enrich_with_replied_to = async <
+  T extends { replied_to: string | null;[key: string]: unknown },
+>(
+  messages: T[],
+): Promise<(T & { replied_to_message: RepliedToPreview | null })[]> => {
+  const ids = Array.from(
+    new Set(
+      messages
+        .map(m => m.replied_to)
+        .filter((id): id is string => !!id),
+    ),
+  );
+  const previews = await fetch_replied_to_previews(ids);
+  return messages.map(m => ({
+    ...m,
+    replied_to_message: m.replied_to ? previews.get(m.replied_to) ?? null : null,
+  }));
 };
 
 
@@ -711,11 +784,13 @@ const get_conversation_history = async (
     // Reverse if we fetched backwards (before cursor) or initial load (newest first → oldest first for display)
     if (before_message_id || !after_message_id) messages.reverse();
 
+    const enriched = await enrich_with_replied_to(messages);
+
     return {
       success: true,
       code: 200,
       data: {
-        messages,
+        messages: enriched,
         has_more,
       },
     };
@@ -1120,13 +1195,15 @@ const get_messages_around = async (
       .limit(1);
 
     // 7. Combine: older (reversed to chronological) + target + newer
-    const messages = [...olderMessages.reverse(), target, ...newerMessages];
+    const messages = [...olderMessages.reverse(), target, ...newerMessages]
+      .filter((m): m is NonNullable<typeof m> => m !== undefined);
+    const enriched = await enrich_with_replied_to(messages);
 
     return {
       success: true,
       code: 200,
       data: {
-        messages,
+        messages: enriched,
         members,
         hasOlder: olderMessages.length === before,
         hasNewer: newerMessages.length === after,
