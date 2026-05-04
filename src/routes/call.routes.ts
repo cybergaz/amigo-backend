@@ -1,13 +1,41 @@
 import { Elysia, t } from "elysia";
 import { CallService } from "@/services/call.service";
+import { StreamCallService } from "@/services/stream-call.service";
 import { app_middleware } from "@/middleware";
 import db from "@/config/db";
 import { eq } from "drizzle-orm";
 import { call_model } from "@/models/call.model";
+import { user_model } from "@/models/user.model";
 import { broadcast_message, is_user_online } from "@/sockets/socket.handlers";
 import FCMService from "@/services/fcm.service";
 
 const call_routes = new Elysia({ prefix: "/call" })
+
+  // ---- Stream Video webhook (unauthenticated; verified via shared secret) ----
+  // Configure this URL in the Stream dashboard:
+  //   https://<your-domain>/api/call/stream/webhook
+  // and set STREAM_WEBHOOK_SECRET to the value Stream shows you.
+  .post("/stream/webhook", async ({ set, body, request, headers }) => {
+    try {
+      const rawBody = typeof body === 'string' ? body : JSON.stringify(body);
+      const signature = headers["x-signature"] || headers["x-webhook-signature"];
+
+      if (!StreamCallService.verifyWebhookSignature(rawBody, signature as string | undefined)) {
+        set.status = 401;
+        return { success: false, message: "Invalid webhook signature" };
+      }
+
+      const event = typeof body === 'string' ? JSON.parse(body) : body;
+      await StreamCallService.handleWebhookEvent(event);
+
+      set.status = 200;
+      return { success: true };
+    } catch (err) {
+      console.error('[CALL ROUTES] Stream webhook error:', err);
+      set.status = 500;
+      return { success: false, message: "Webhook processing error" };
+    }
+  })
 
   // ---- Unprotected routes (accessible from background handlers without auth) ----
 
@@ -222,6 +250,74 @@ const call_routes = new Elysia({ prefix: "/call" })
         message: "Internal server error"
       };
     }
+  })
+
+  // ---- Stream Video credentials ----
+  // Returns api key + a freshly minted user token. The client should call this
+  // when it needs to (re)connect to Stream, and use it as the SDK tokenLoader.
+  .get("/stream/credentials", async ({ set, store }) => {
+    try {
+      if (!StreamCallService.isConfigured()) {
+        set.status = 503;
+        return { success: false, message: "Stream Video is not configured on this server" };
+      }
+
+      const [me] = await db
+        .select({ id: user_model.id, name: user_model.name, profile_pic: user_model.profile_pic })
+        .from(user_model)
+        .where(eq(user_model.id, store.id))
+        .limit(1);
+
+      if (!me) {
+        set.status = 404;
+        return { success: false, message: "User not found" };
+      }
+
+      const token = StreamCallService.createUserToken(me.id);
+
+      set.status = 200;
+      return {
+        success: true,
+        data: {
+          api_key: StreamCallService.getApiKey(),
+          token,
+          user: { id: me.id, name: me.name, image: me.profile_pic },
+        },
+        message: "Stream credentials issued",
+      };
+    } catch (err) {
+      console.error('[CALL ROUTES] Error issuing Stream credentials:', err);
+      set.status = 500;
+      return { success: false, message: "Failed to issue Stream credentials" };
+    }
+  })
+
+  // Pre-flight gate for outgoing Stream calls. Mirrors WebRTC `initiate_call`:
+  // confirms callee exists and has `call_access` enabled. The actual call is
+  // created on the client via `call.getOrCreate({ ringing: true })`.
+  .post("/stream/precheck", async ({ set, body }) => {
+    try {
+      const { callee_id } = body as { callee_id: string };
+      if (!callee_id) {
+        set.status = 400;
+        return { success: false, message: "callee_id is required" };
+      }
+
+      const result = await StreamCallService.assertCalleeReachable(callee_id);
+      if (!result.ok) {
+        set.status = result.code;
+        return { success: false, message: result.message };
+      }
+
+      set.status = 200;
+      return { success: true, message: "OK" };
+    } catch (err) {
+      console.error('[CALL ROUTES] Stream precheck error:', err);
+      set.status = 500;
+      return { success: false, message: "Internal server error" };
+    }
+  }, {
+    body: t.Object({ callee_id: t.String() }),
   });
 
 // .get("/status", async ({ set, store, query }) => {

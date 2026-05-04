@@ -52,10 +52,13 @@ const CALL_END_REASONS_CONSTS = [
   'network_error',
 ] as const;
 
+const CALL_PROVIDER_CONSTS = ['webrtc', 'stream'] as const;
+
 type CallStatusType = typeof CALL_STATUS_CONSTS[number];
 type CallEndReasonsType = typeof CALL_END_REASONS_CONSTS[number];
+type CallProviderType = typeof CALL_PROVIDER_CONSTS[number];
 
-export { CALL_STATUS_CONSTS, CALL_END_REASONS_CONSTS };
+export { CALL_STATUS_CONSTS, CALL_END_REASONS_CONSTS, CALL_PROVIDER_CONSTS };
 export type {
   CallSignalingMessage,
   CallInitPayload,
@@ -63,6 +66,7 @@ export type {
   ICEPayload,
   CallEndPayload,
   CallEndReasonsType,
-  CallStatusType
+  CallStatusType,
+  CallProviderType
 };
 
