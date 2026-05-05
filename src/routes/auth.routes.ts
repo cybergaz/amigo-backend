@@ -212,7 +212,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       cookie["access_token"].set({
         value: login_res.data.access_token,
         ...cookieConfig,
-        maxAge: 60 * 60 * 24,
+        maxAge: 60 * 60 * 24 * 7,
       });
       console.log(`[SERVER]   Set Tokens to Cookies (${isMobileApp(userAgent) ? 'Mobile' : 'Web'}) : ${new Date().toLocaleString()}`);
     }
