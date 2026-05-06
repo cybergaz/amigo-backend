@@ -4,6 +4,7 @@ import { call_model } from '@/models/call.model';
 import { user_model } from '@/models/user.model';
 import { eq, and, sql } from 'drizzle-orm';
 import { CallEndReasonsType, CallStatusType } from '@/types/call.types';
+import FCMService from '@/services/fcm.service';
 
 /**
  * Stream Video integration.
@@ -193,6 +194,10 @@ export class StreamCallService {
             startedAt,
             endedAt: new Date(event?.created_at ?? Date.now()),
           });
+          // Dismiss the killed-state ringing notification on whichever side
+          // didn't initiate the reject. We push to BOTH sides because the
+          // event itself doesn't tell us which device was killed.
+          await this.broadcastDismissCallFcm(cid, [createdById, calleeId]);
           return true;
 
         case 'call.missed':
@@ -205,6 +210,10 @@ export class StreamCallService {
             startedAt,
             endedAt: new Date(event?.created_at ?? Date.now()),
           });
+          // Tell the callee's killed-state device to drop the ringing
+          // notification — Stream's own ring timeout (~30s) doesn't fire a
+          // dismiss FCM on its own.
+          await this.broadcastDismissCallFcm(cid, [calleeId]);
           return true;
 
         case 'call.ended':
@@ -230,6 +239,13 @@ export class StreamCallService {
             endedAt: sessionEnd,
             durationSeconds: duration,
           });
+          // The "caller cancels before callee picks up" case lands here as
+          // call.ended. Without this push the callee's killed device keeps
+          // the ringing notification alive until Stream's own ring timeout
+          // fires call.missed (~20-30 s) — exactly the symptom users
+          // reported. We push to both ends so whichever side was killed
+          // gets the dismiss too.
+          await this.broadcastDismissCallFcm(cid, [createdById, calleeId]);
           return true;
         }
 
@@ -239,6 +255,74 @@ export class StreamCallService {
     } catch (err) {
       console.error('[STREAM] Error handling webhook event:', err);
       return false;
+    }
+  }
+
+  /**
+   * Reject a Stream call on behalf of [userId]. Used by the cold-state
+   * decline path: the killed-app native BroadcastReceiver hits our
+   * `/call/stream/decline-cold` endpoint when the user taps Decline, and
+   * we re-sign a short-lived JWT for them and call Stream's reject API.
+   * Without this, the caller's "ringing…" UI stays up until Stream's own
+   * ring timeout (~20-30s) fires call.missed.
+   *
+   * The cid is the full Stream call CID (e.g. "default:<uuid>"). API base
+   * is the standard hosted endpoint; if you self-host, change it here.
+   */
+  static async rejectCallAsUser(cid: string, userId: string): Promise<void> {
+    if (!this.isConfigured()) {
+      throw new Error('Stream Video is not configured');
+    }
+    const [callType, callId] = cid.includes(':') ? cid.split(':') : ['default', cid];
+    const userToken = this.createUserToken(userId, 60 * 5); // 5-minute token, single use
+    const url = `https://video.stream-io-api.com/api/v2/video/call/${encodeURIComponent(callType)}/${encodeURIComponent(callId)}/reject?api_key=${encodeURIComponent(STREAM_API_KEY)}&user_id=${encodeURIComponent(userId)}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': userToken,
+        'stream-auth-type': 'jwt',
+      },
+      body: '{}',
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      console.error(`[STREAM] rejectCallAsUser failed: ${res.status} ${txt}`);
+      throw new Error(`Stream reject API ${res.status}`);
+    }
+    console.log(`[STREAM] ✓ rejectCallAsUser cid=${cid} user=${userId}`);
+  }
+
+  /**
+   * Push a Stream-flavoured `call.ended` FCM to the given users. Our Flutter
+   * background handler (`handleStreamVideoBackgroundPush`) recognises
+   * `sender: 'stream.video'` + `type: 'call.ended'` and calls
+   * `pushNotificationManager.endCallByCid` to dismiss any stuck ringing
+   * notification.
+   *
+   * Stream itself only sends FCM for `call.ring` and `call.missed`; the
+   * cancel/decline cases are coordinator-side WS events that never reach a
+   * killed device. This method is the bridge.
+   */
+  private static async broadcastDismissCallFcm(cid: string, userIds: string[]): Promise<void> {
+    if (userIds.length === 0) return;
+    try {
+      await FCMService.send_notification({
+        type: 'call',
+        fcm_mode: 'data-only',
+        user_ids: userIds,
+        // The `data` map is spread AFTER `type: payload.type` in the FCM
+        // builder, so our `type: 'call.ended'` here overrides the outer
+        // 'call' on the wire — which is what the Flutter handler matches
+        // on. Same trick for `sender`, which gates `isStreamVideoPush`.
+        data: {
+          sender: 'stream.video',
+          type: 'call.ended',
+          call_cid: cid,
+        },
+      });
+    } catch (err) {
+      console.error('[STREAM] broadcastDismissCallFcm failed:', err);
     }
   }
 

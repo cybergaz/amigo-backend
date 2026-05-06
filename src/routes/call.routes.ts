@@ -15,25 +15,64 @@ const call_routes = new Elysia({ prefix: "/call" })
   // Configure this URL in the Stream dashboard:
   //   https://<your-domain>/api/call/stream/webhook
   // and set STREAM_WEBHOOK_SECRET to the value Stream shows you.
-  .post("/stream/webhook", async ({ set, body, request, headers }) => {
-    try {
-      const rawBody = typeof body === 'string' ? body : JSON.stringify(body);
-      const signature = headers["x-signature"] || headers["x-webhook-signature"];
+  //
+  // `parse: 'text'` is critical: Stream signs the webhook with HMAC-SHA256
+  // over the EXACT request bytes. If we let Elysia auto-parse the JSON
+  // and re-stringify it (the previous behaviour), key ordering and
+  // whitespace differ from Stream's payload, the HMAC mismatches, and we
+  // 401 every webhook delivery. With `parse: 'text'` Elysia hands us the
+  // raw body string straight from the request.
+  .post(
+    "/stream/webhook",
+    async ({ set, body, headers }) => {
+      try {
+        const rawBody = typeof body === 'string' ? body : JSON.stringify(body);
+        const signature = headers["x-signature"] || headers["x-webhook-signature"];
 
-      if (!StreamCallService.verifyWebhookSignature(rawBody, signature as string | undefined)) {
-        set.status = 401;
-        return { success: false, message: "Invalid webhook signature" };
+        if (!StreamCallService.verifyWebhookSignature(rawBody, signature as string | undefined)) {
+          set.status = 401;
+          return { success: false, message: "Invalid webhook signature" };
+        }
+
+        const event = JSON.parse(rawBody);
+        await StreamCallService.handleWebhookEvent(event);
+
+        set.status = 200;
+        return { success: true };
+      } catch (err) {
+        console.error('[CALL ROUTES] Stream webhook error:', err);
+        set.status = 500;
+        return { success: false, message: "Webhook processing error" };
       }
+    },
+    { parse: 'text' }
+  )
 
-      const event = typeof body === 'string' ? JSON.parse(body) : body;
-      await StreamCallService.handleWebhookEvent(event);
-
+  // ---- Cold-state Stream-call decline (unauthenticated; auth is the JWT) ----
+  // When a user taps the Decline button on an incoming-call notification while
+  // the app is in killed state, no Flutter isolate is alive to invoke
+  // `call.reject()` against Stream's coordinator — so the caller stays in
+  // a ringing limbo until Stream's own ring timeout fires (~20-30s) and the
+  // call ends as "missed" rather than "declined". This endpoint bridges
+  // that gap: the native Kotlin BroadcastReceiver fires a fire-and-forget
+  // POST here with the call cid + the user's Stream JWT (cached in
+  // SharedPreferences at last token-fetch). We re-sign a short-lived JWT
+  // for the same user (we have the API secret) and call Stream's reject API
+  // server-side, no cookie auth required.
+  .post("/stream/decline-cold", async ({ set, body }) => {
+    try {
+      const { call_cid, user_id } = (body || {}) as { call_cid?: string; user_id?: string };
+      if (!call_cid || !user_id) {
+        set.status = 400;
+        return { success: false, message: "call_cid and user_id are required" };
+      }
+      await StreamCallService.rejectCallAsUser(call_cid, user_id);
       set.status = 200;
       return { success: true };
     } catch (err) {
-      console.error('[CALL ROUTES] Stream webhook error:', err);
+      console.error('[CALL ROUTES] Stream cold decline error:', err);
       set.status = 500;
-      return { success: false, message: "Webhook processing error" };
+      return { success: false, message: "Cold decline failed" };
     }
   })
 
