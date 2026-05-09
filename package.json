@@ -4,7 +4,8 @@
   "scripts": {
     "dev": "bun run --watch src/server.ts",
     "db:genpush": "drizzle-kit generate && drizzle-kit push",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "version:set": "bun run scripts/set-app-version.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.891.0",

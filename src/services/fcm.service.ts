@@ -109,6 +109,7 @@ export class FCMService {
 
             const msg_id = await admin.messaging().send(message);
             console.log(`[FCM] ✅ Sent to user ${user_id}: ${msg_id}`);
+            console.log(`[FCM] with FCM token ${fcm_token}`);
             return true;
           } catch (error: any) {
             // Handle invalid token errors
@@ -136,6 +137,7 @@ export class FCMService {
 
   // Update user's FCM token (updates all 3 tiers)
   async update_user_fcm_token(userId: string, fcmToken: string): Promise<ResultType> {
+    console.log("update_user_fcm_token : ", { userId, fcmToken });
     try {
       await store_fcm_token(userId, fcmToken);
 
