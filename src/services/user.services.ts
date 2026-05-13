@@ -11,8 +11,10 @@ import {
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
 import { eq, and, inArray, isNull, ne, sql, or, ilike } from "drizzle-orm";
 import { store_fcm_token } from "@/cache-management/fcm-token.cache";
-import { remove_member, invalidate_user_conversations } from "@/cache-management/conv.cache";
+import { remove_member, get_conversation_members, get_user_conversations, invalidate_user_conversations } from "@/cache-management/conv.cache";
 import { polling_connections, socket_connections } from "@/sockets/socket.server";
+import { broadcast_message } from "@/sockets/socket.handlers";
+import type { UserUpdatePayload } from "@/types/socket.types";
 
 type CreateUserParams = {
   name: string;
@@ -185,6 +187,14 @@ const update_user_details = async (id: string, body: UpdateUserType) => {
       await store_fcm_token(id, body.fcm_token || null);
     }
 
+    // Capture pre-update profile pic so we can include it in the WS broadcast
+    // — clients use it as the cache key to evict the old asset.
+    let previous_profile_pic: string | null | undefined;
+    if (body.profile_pic !== undefined) {
+      const existing = await find_user_by_id(id);
+      previous_profile_pic = existing.success ? (existing.data?.profile_pic ?? null) : undefined;
+    }
+
     const user_details = await db
       .update(user_model)
       .set(body)
@@ -198,6 +208,19 @@ const update_user_details = async (id: string, body: UpdateUserType) => {
         message: "No Such User",
         data: null,
       };
+    }
+
+    // Broadcast a user:update only when something visible to peers changed
+    // (name or profile pic). Other fields like fcm_token / location are
+    // private and don't need a fanout.
+    if (body.name !== undefined || body.profile_pic !== undefined) {
+      // fire-and-forget — don't fail the route if fanout misses
+      broadcast_user_update({
+        user_id: id,
+        name: body.name,
+        profile_pic: body.profile_pic,
+        previous_profile_pic,
+      }).catch((err) => console.error("[USER:UPDATE] broadcast failed:", err));
     }
 
     return {
@@ -214,6 +237,49 @@ const update_user_details = async (id: string, body: UpdateUserType) => {
       data: null,
     };
   }
+};
+
+// Broadcast a user:update to every distinct peer that shares a conversation
+// with this user. Self is excluded — the updater already has the latest data
+// from their own API response.
+const broadcast_user_update = async (args: {
+  user_id: string;
+  name?: string;
+  profile_pic?: string | null;
+  previous_profile_pic?: string | null;
+}) => {
+  const conv_ids = Array.from(await get_user_conversations(args.user_id));
+  if (conv_ids.length === 0) return;
+
+  const peer_ids = new Set<string>();
+  await Promise.all(
+    conv_ids.map(async (conv_id) => {
+      const members = await get_conversation_members(conv_id);
+      for (const member_id of members) {
+        if (member_id !== args.user_id) peer_ids.add(member_id);
+      }
+    })
+  );
+
+  if (peer_ids.size === 0) return;
+
+  const payload: UserUpdatePayload = {
+    user_id: args.user_id,
+    name: args.name,
+    profile_pic: args.profile_pic,
+    previous_profile_pic: args.previous_profile_pic ?? null,
+    updated_at: new Date(),
+  };
+
+  await broadcast_message({
+    to: "users",
+    user_ids: Array.from(peer_ids),
+    message: {
+      type: "user:update",
+      payload,
+      ws_timestamp: new Date(),
+    },
+  });
 };
 
 const batch_update_users_details = async (ids: string[], body: UpdateUserType) => {
@@ -540,6 +606,13 @@ const update_profile_image = async (id: string, file: File) => {
       .update(user_model)
       .set({ profile_pic: uploadResult.url })
       .where(eq(user_model.id, id));
+
+    // Notify peers so they can refresh cached PFPs in their UI.
+    broadcast_user_update({
+      user_id: id,
+      profile_pic: uploadResult.url ?? null,
+      previous_profile_pic: currentUser.data?.profile_pic ?? null,
+    }).catch((err) => console.error("[USER:UPDATE] broadcast failed:", err));
 
     return {
       success: true,

@@ -44,7 +44,8 @@ type WSMessage = {
   | MessageReactPayload
   | CallPayload
   | MiscPayload
-  | ConversationActionPayload;
+  | ConversationActionPayload
+  | UserUpdatePayload;
   // | SyncMessagesPayload
   // | MessageDeliveredPayload;
   ws_timestamp?: Date;
@@ -62,7 +63,8 @@ interface VitalWSMessage {
   | DeleteMessagePayload
   | MessagePinPayload
   | MessageForwardPayload
-  | ConversationActionPayload;
+  | ConversationActionPayload
+  | UserUpdatePayload;
   // | MessageDeliveredPayload;
   ws_timestamp?: Date;
 }
@@ -235,6 +237,19 @@ type ConversationActionPayload = {
   // actor_pfp?: string;
 };
 
+// Broadcast when a user updates their own profile (name and/or profile pic).
+// Sent to every other user that shares a conversation with them so clients
+// can refresh local user rows and evict stale CachedNetworkImage entries.
+type UserUpdatePayload = {
+  user_id: string;
+  name?: string;
+  profile_pic?: string | null;
+  // Previous profile pic URL — included so clients can evict the old asset
+  // from the on-disk image cache (keyed by URL).
+  previous_profile_pic?: string | null;
+  updated_at: Date;
+};
+
 // type SyncMessagesPayload = {
 //   messages: ChatMessagePayload[];
 //   sync_timestamp: Date;
@@ -284,6 +299,7 @@ const WS_MESSAGE_EVENTS_CONST = [
   'socket:pong',
   'socket:error',
   'auth:force_logout',
+  'user:update',
 ] as const;
 
 const VITAL_WS_EVENTS_CONST = [
@@ -298,6 +314,7 @@ const VITAL_WS_EVENTS_CONST = [
   'message:forward',
   'message:delete',
   'message:react',
+  'user:update',
 ] as const;
 
 const ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD = ['socket:ping', 'socket:pong', 'socket:health_check'] as const;
@@ -335,6 +352,7 @@ export type {
   CallPayload,
   ConnectionStatusType,
   ConversationActionPayload,
+  UserUpdatePayload,
   // SyncMessageItem,
   // SyncMessagesPayload,
   // MessageDeliveredPayload,

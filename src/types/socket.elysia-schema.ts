@@ -164,6 +164,15 @@ const ConversationActionPayloadSchema = t.Object({
   action_at: FlexDate(),
 });
 
+// UserUpdatePayload schema — sent when a user updates their own name/profile pic
+const UserUpdatePayloadSchema = t.Object({
+  user_id: t.String(),
+  name: t.Optional(t.String()),
+  profile_pic: t.Optional(t.Union([t.String(), t.Null()])),
+  previous_profile_pic: t.Optional(t.Union([t.String(), t.Null()])),
+  updated_at: FlexDate(),
+});
+
 // // MessageDeliveredPayload schema - for delivery receipts from FCM messages
 // const MessageDeliveredPayloadSchema = t.Object({
 //   message_id: t.String(),
@@ -201,6 +210,7 @@ const WSPayloadSchema = t.Union([
   MessageForwardPayloadSchema,
   MessageReactPayloadSchema,
   ConversationActionPayloadSchema,
+  UserUpdatePayloadSchema,
   // MessageDeliveredPayloadSchema,
   // PingMessageSchema,
   // PongMessageSchema,
@@ -224,6 +234,7 @@ const VitalWSPayloadSchema = t.Union([
   MessageForwardPayloadSchema,
   MessageReactPayloadSchema,
   ConversationActionPayloadSchema,
+  UserUpdatePayloadSchema,
   // MessageDeliveredPayloadSchema,
 ]);
 
@@ -249,6 +260,7 @@ export {
   MessageForwardPayloadSchema,
   MessageReactPayloadSchema,
   ConversationActionPayloadSchema,
+  UserUpdatePayloadSchema,
   // MessageDeliveredPayloadSchema,
   // PingMessageSchema,
   // PongMessageSchema,
