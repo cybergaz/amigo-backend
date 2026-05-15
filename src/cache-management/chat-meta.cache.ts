@@ -5,7 +5,9 @@ import { MessageType } from "@/types/chat.types";
 // Redis hash: chat_meta:{chat_id}
 // Stores the last-message display data so the chat list never needs to
 // JOIN messages or do N+1 queries.
-// Fields: id, body, type, sender_id, sender_name, sent_at
+// Fields: id, body, type, sender_id, sent_at, attachments
+// `attachments` is JSON-stringified on write and parsed on read because
+// Redis hash values are strings.
 // TTL: none (evicted only when chat is deleted)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -16,9 +18,34 @@ type ChatMetaFields = {
   sender_id: string;
   // sender_name: string;
   sent_at: string; // ISO timestamp
+  attachments?: unknown; // [{url, mime, size, key, thumbnail}] — null/missing for text
 };
 
 const chat_meta_key = (chat_id: string) => `chat_meta:${chat_id}`;
+
+/**
+ * Parse the raw hgetall response into a ChatMetaFields, decoding the
+ * attachments JSON. Returns null if the row is empty.
+ */
+const parse_chat_meta_row = (raw: Record<string, string> | null | undefined): ChatMetaFields | null => {
+  if (!raw || !raw.id) return null;
+  let attachments: unknown = null;
+  if (raw.attachments) {
+    try {
+      attachments = JSON.parse(raw.attachments);
+    } catch {
+      attachments = null;
+    }
+  }
+  return {
+    id: raw.id,
+    body: raw.body ?? "",
+    type: raw.type as MessageType,
+    sender_id: raw.sender_id,
+    sent_at: raw.sent_at,
+    attachments,
+  };
+};
 
 /**
  * Update the last-message display data for a chat.
@@ -33,6 +60,7 @@ const update_chat_meta = async (chat_id: string, msg: ChatMetaFields): Promise<v
       sender_id: msg.sender_id,
       // sender_name: msg.sender_name ?? "",
       sent_at: msg.sent_at,
+      attachments: msg.attachments != null ? JSON.stringify(msg.attachments) : "",
     });
   } catch (err) {
     console.error(`[CACHE] update_chat_meta failed for chat ${chat_id}:`, err);
@@ -45,8 +73,7 @@ const update_chat_meta = async (chat_id: string, msg: ChatMetaFields): Promise<v
 const get_chat_meta = async (chat_id: string): Promise<ChatMetaFields | null> => {
   try {
     const data = await redis.hgetall(chat_meta_key(chat_id));
-    if (!data || !data.id) return null;
-    return data as ChatMetaFields;
+    return parse_chat_meta_row(data as Record<string, string>);
   } catch (err) {
     console.error(`[CACHE] get_chat_meta failed for chat ${chat_id}:`, err);
     return null;
@@ -70,10 +97,10 @@ const get_chat_metas = async (chat_ids: string[]): Promise<Map<string, ChatMetaF
 
     for (let i = 0; i < chat_ids.length; i++) {
       const [err, data] = replies![i];
-      if (err || !data || !(data as any).id) {
+      if (err) {
         result.set(chat_ids[i], null);
       } else {
-        result.set(chat_ids[i], data as ChatMetaFields);
+        result.set(chat_ids[i], parse_chat_meta_row(data as Record<string, string>));
       }
     }
   } catch (err) {

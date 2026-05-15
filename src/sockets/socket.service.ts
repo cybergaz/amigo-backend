@@ -307,6 +307,7 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
           if (typeof raw === "string" && raw.length > 0) return raw;
           return now.toISOString();
         })(),
+        attachments: payload.attachments ?? null,
         // sender_name: payload.sender_name ?? "",
       });
 
@@ -582,6 +583,7 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
           type: last_msg.type,
           sender_id: last_msg.sender_id ?? payload.forwarder_id,
           sent_at: last_msg.sent_at?.toISOString() ?? new Date().toISOString(),
+          attachments: last_msg.attachments ?? null,
           // sender_name: payload.sender_name ?? "",
         });
 
