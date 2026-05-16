@@ -12,6 +12,9 @@ const chat_model = pgTable("chats", {
   pinned_msg_id: uuid(),
   last_msg_id: uuid(),
   last_msg_at: timestamp({ withTimezone: true }),
+  // Disappearing-messages: null = off. When set, every newly-inserted message
+  // in this chat gets expires_at = sent_at + N seconds stamped at insert time.
+  disappearing_after_sec: integer(),
   created_at: timestamp({ withTimezone: true }).defaultNow().notNull(),
   deleted_at: timestamp({ withTimezone: true }),
   // dm_key: varchar({ length: 64 }).unique(),

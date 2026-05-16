@@ -249,6 +249,10 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       ...payload,
       id: store_msg_result.new_id ?? payload.id, // update message ID if it was changed during retry
       replied_to_message,
+      // Surface the server-stamped expires_at (null when chat has disappearing
+      // off) so recipients can filter expired-but-not-yet-deleted messages in
+      // the view layer. Server sweeper remains the authoritative deleter.
+      expires_at: store_msg_result.data?.expires_at ?? null,
     };
 
     // broadcast to the chat recipients about the new message
@@ -410,8 +414,8 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
 
 const handle_message_status_ack = async (payload: MessageStatusAckPayload, user_id: string, timestamp?: Date | string): Promise<ResultType> => {
   try {
-    const total_msgs = payload.acks?.reduce((s, g) => s + (g.msg_ids?.length ?? 0), 0) ?? 0;
-    console.log(`[STATUS-ACK] from=${user_id}, chats=${payload.acks?.length ?? 0}, msgs=${total_msgs}`);
+    // const total_msgs = payload.acks?.reduce((s, g) => s + (g.msg_ids?.length ?? 0), 0) ?? 0;
+    // console.log(`[STATUS-ACK] from=${user_id}, chats=${payload.acks?.length ?? 0}, msgs=${total_msgs}`);
 
     const recipient_id = user_id ?? payload.recipient_id;
     const ack_at = payload.at instanceof Date ? payload.at : (typeof payload.at === 'string' ? new Date(payload.at) : new Date());

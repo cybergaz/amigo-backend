@@ -30,6 +30,10 @@ const ChatMessagePayloadSchema = t.Object({
   attachments: t.Optional(t.Any()),
   replied_to: t.Optional(t.String()),
   sent_at: FlexDate(),
+  // Server-stamped on outbound broadcasts when the chat has disappearing
+  // messages enabled. Inbound sends from clients omit this — the server
+  // computes it from chats.disappearing_after_sec at insert time.
+  expires_at: t.Optional(t.Union([FlexDate(), t.Null()])),
   // sender_name: t.Optional(t.String()),
   // conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
 });
@@ -173,6 +177,14 @@ const UserUpdatePayloadSchema = t.Object({
   updated_at: FlexDate(),
 });
 
+// ConversationDisappearingPayload schema
+const ConversationDisappearingPayloadSchema = t.Object({
+  conv_id: t.String(),
+  actor_id: t.String(),
+  duration_sec: t.Union([t.Number(), t.Null()]),
+  changed_at: FlexDate(),
+});
+
 // // MessageDeliveredPayload schema - for delivery receipts from FCM messages
 // const MessageDeliveredPayloadSchema = t.Object({
 //   message_id: t.String(),
@@ -211,6 +223,7 @@ const WSPayloadSchema = t.Union([
   MessageReactPayloadSchema,
   ConversationActionPayloadSchema,
   UserUpdatePayloadSchema,
+  ConversationDisappearingPayloadSchema,
   // MessageDeliveredPayloadSchema,
   // PingMessageSchema,
   // PongMessageSchema,
@@ -235,6 +248,7 @@ const VitalWSPayloadSchema = t.Union([
   MessageReactPayloadSchema,
   ConversationActionPayloadSchema,
   UserUpdatePayloadSchema,
+  ConversationDisappearingPayloadSchema,
   // MessageDeliveredPayloadSchema,
 ]);
 
@@ -261,6 +275,7 @@ export {
   MessageReactPayloadSchema,
   ConversationActionPayloadSchema,
   UserUpdatePayloadSchema,
+  ConversationDisappearingPayloadSchema,
   // MessageDeliveredPayloadSchema,
   // PingMessageSchema,
   // PongMessageSchema,

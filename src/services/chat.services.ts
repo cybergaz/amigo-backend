@@ -199,6 +199,11 @@ const get_chat_list = async (user_id: string, type: string) => {
         lastMsgId: chat_model.last_msg_id,
         lastMsgAt: chat_model.last_msg_at,
         createrId: chat_model.creater_id,
+        // Disappearing-messages duration (null = off). Shipped on every
+        // chat-list payload so a fresh-login client can hydrate its local DB
+        // and the input-border / avatar-badge UI without needing a separate
+        // round-trip per chat.
+        disappearingAfterSec: chat_model.disappearing_after_sec,
 
         role: chat_member_model.role,
         joinedAt: chat_member_model.joined_at,
@@ -408,6 +413,93 @@ const revive_chat = async (conversation_id: string) => {
   }
 };
 
+// Shared fan-out for a batch of message ids that have already been
+// soft-deleted at the DB level. Broadcasts message:delete to the chat,
+// enqueues FCM for offline members, and repoints chat_model.last_msg_id /
+// pinned_msg_id if any of the deleted ids matched.
+//
+// Callers:
+//   - soft_delete_message (user-initiated): passes actor_id so the broadcast
+//     excludes the sender (their UI already updated optimistically).
+//   - disappearing sweeper (server-initiated): passes actor_id = null so
+//     every chat member receives the event.
+const broadcast_deletion = async (
+  chat_id: string,
+  message_ids: string[],
+  actor_id: string | null,
+): Promise<void> => {
+  if (message_ids.length === 0) return;
+
+  const payload: DeleteMessagePayload = {
+    sender_id: actor_id ?? "",
+    conv_id: chat_id,
+    message_ids,
+  };
+  const ws_msg: WSMessage = {
+    type: "message:delete",
+    payload,
+    ws_timestamp: new Date(),
+  };
+
+  // 1. WS broadcast to everyone connected in the conversation
+  await broadcast_message({
+    to: "conversation",
+    conv_id: chat_id,
+    message: ws_msg,
+    exclude_user_ids: actor_id ? [actor_id] : [],
+  });
+
+  // 2. FCM / missed-ws enqueue for offline + polling members. queue_message_fcm
+  //    is the existing path that also writes into missed_ws_messages, so this
+  //    same call covers the "user comes back later via long-poll" case.
+  const members = await get_conversation_members(chat_id);
+  for (const member_id of members) {
+    await queue_message_fcm(member_id, ws_msg);
+  }
+
+  // 3. Repoint last_msg_id and pinned_msg_id if any of the deleted rows was
+  //    the pointed-to message. Done in one round-trip select.
+  const [conversation] = await db
+    .select({
+      id: chat_model.id,
+      last_msg_id: chat_model.last_msg_id,
+      last_msg_at: chat_model.last_msg_at,
+      pinned_msg_id: chat_model.pinned_msg_id,
+    })
+    .from(chat_model)
+    .where(eq(chat_model.id, chat_id))
+    .limit(1);
+
+  if (!conversation) return;
+
+  const deleted_set = new Set(message_ids);
+  const last_msg_hit = conversation.last_msg_id && deleted_set.has(conversation.last_msg_id);
+  const pinned_hit = conversation.pinned_msg_id && deleted_set.has(conversation.pinned_msg_id);
+
+  const updates: DBUpdateConversationType = {};
+
+  if (last_msg_hit) {
+    const [next] = await db
+      .select({ id: message_model.id, sent_at: message_model.sent_at })
+      .from(message_model)
+      .where(and(
+        eq(message_model.chat_id, chat_id),
+        isNull(message_model.deleted_at),
+      ))
+      .orderBy(desc(message_model.created_at))
+      .limit(1);
+    updates.last_msg_id = next ? next.id : null;
+    updates.last_msg_at = next ? next.sent_at : conversation.last_msg_at;
+  }
+  if (pinned_hit) {
+    updates.pinned_msg_id = null;
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await db.update(chat_model).set(updates).where(eq(chat_model.id, chat_id));
+  }
+};
+
 const soft_delete_message = async (message_ids: string[], user_id: string, is_admin_or_staff?: boolean) => {
   try {
     // First, get the messages to retrieve chat_id and check if they exist
@@ -455,67 +547,14 @@ const soft_delete_message = async (message_ids: string[], user_id: string, is_ad
       };
     }
 
-    // Broadcast delete event to each conversation
+    // Fan out per conversation. broadcast_deletion handles WS + FCM +
+    // last_msg/pinned repoint identically for user-initiated and sweeper-
+    // initiated deletes — see its docs.
     for (const conversationId of conversationIds) {
-      const messagesInConversation = messagesToDelete.filter(m => m.chat_id === conversationId);
-
-      // Broadcast delete event
-      const message_payload: DeleteMessagePayload = {
-        sender_id: user_id,
-        conv_id: conversationId,
-        message_ids: messagesInConversation.map(m => m.id),
-      };
-      // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-      await broadcast_message({
-        to: "conversation",
-        conv_id: conversationId,
-        message: {
-          type: "message:delete",
-          payload: message_payload,
-          ws_timestamp: new Date()
-        },
-        exclude_user_ids: [user_id]
-      });
-
-      const members = await get_conversation_members(conversationId);
-      const delete_ws_message: WSMessage = {
-        type: "message:delete",
-        payload: message_payload,
-        ws_timestamp: new Date()
-      };
-      for (const user_id of Array.from(members)) {
-        await queue_message_fcm(user_id, delete_ws_message);
-      }
-
-      // Check if any deleted message was the last_message and update if needed
-      const [conversation] = await db
-        .select()
-        .from(chat_model)
-        .where(eq(chat_model.id, conversationId))
-        .limit(1);
-
-      if (conversation && conversation.last_msg_id && messagesInConversation.some(m => m.id === conversation.last_msg_id)) {
-        // The deleted message was the last_message — find the new last message
-        const [newLastMessage] = await db
-          .select()
-          .from(message_model)
-          .where(
-            and(
-              eq(message_model.chat_id, conversationId),
-              isNull(message_model.deleted_at)
-            )
-          )
-          .orderBy(desc(message_model.created_at))
-          .limit(1);
-
-        await db
-          .update(chat_model)
-          .set({
-            last_msg_id: newLastMessage ? newLastMessage.id : null,
-            last_msg_at: newLastMessage ? newLastMessage.sent_at : conversation.last_msg_at
-          })
-          .where(eq(chat_model.id, conversationId));
-      }
+      const ids_in_conv = messagesToDelete
+        .filter(m => m.chat_id === conversationId)
+        .map(m => m.id);
+      await broadcast_deletion(conversationId, ids_in_conv, user_id);
     }
 
     return {
@@ -1287,6 +1326,7 @@ export {
   soft_delete_chat,
   revive_chat,
   soft_delete_message,
+  broadcast_deletion,
   delete_message_for_me,
   hard_delete_message,
   get_conversation_history,

@@ -22,6 +22,35 @@ import { ResultType } from "@/types/core.types";
 import { ChatMessagePayload, MessagePinPayload, MessageReactPayload, } from "@/types/socket.types";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { randomUUIDv7 } from "bun";
+import {
+  get_disappearing_after_sec,
+  set_disappearing_after_sec,
+} from "@/cache-management/chat-meta.cache";
+
+// Resolve the disappearing-messages duration for a chat with read-through
+// caching on chat_meta. Returns null = disappearing off. Never throws — a
+// failure here must NEVER break the send path; in that case we just don't
+// stamp expires_at and the message becomes a normal (non-disappearing) one.
+const resolve_disappearing_after_sec = async (chat_id: string): Promise<number | null> => {
+  try {
+    const cached = await get_disappearing_after_sec(chat_id);
+    if (cached !== undefined) return cached;
+
+    // Miss — hit DB and hydrate the cache for future sends.
+    const [row] = await db
+      .select({ d: chat_model.disappearing_after_sec })
+      .from(chat_model)
+      .where(eq(chat_model.id, chat_id))
+      .limit(1);
+    const value = row?.d ?? null;
+    // Fire-and-forget hydration so the send path doesn't await Redis on miss.
+    set_disappearing_after_sec(chat_id, value);
+    return value;
+  } catch (err) {
+    console.error(`[message] resolve_disappearing_after_sec failed (${chat_id}):`, err);
+    return null;
+  }
+};
 
 // Helper function to verify user membership in conversation
 const verify_user_membership = async (conversation_id: string, user_id: string) => {
@@ -51,6 +80,15 @@ const get_user_info = async (user_id: string) => {
 
 const store_message = async (payload: ChatMessagePayload, custom_msg_id?: string): Promise<ResultType<DBInsertMessageType>> => {
   try {
+    // Compute the disappearing-messages deadline before insert. Sent_at on the
+    // wire is the client-stamped time; we add the chat's configured duration
+    // to keep expiry deterministic per-message even if the setting changes
+    // mid-conversation. duration null = no expiry stamped.
+    const sent_at_date = new Date(payload.sent_at);
+    const duration_sec = await resolve_disappearing_after_sec(payload.conv_id);
+    const expires_at: Date | null = duration_sec != null
+      ? new Date(sent_at_date.getTime() + duration_sec * 1000)
+      : null;
 
     const [new_message] = await db
       .insert(message_model)
@@ -62,7 +100,8 @@ const store_message = async (payload: ChatMessagePayload, custom_msg_id?: string
         type: payload.msg_type,
         body: payload.body,
         attachments: payload.attachments,
-        sent_at: new Date(payload.sent_at),
+        sent_at: sent_at_date,
+        expires_at,
       }).returning();
 
     if (!new_message) {

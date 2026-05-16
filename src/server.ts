@@ -17,6 +17,7 @@ import { chat_poll_routes } from "./routes/chat-poll.routes";
 import { message_routes } from "./routes/message.routes";
 import { start_receipts_flush } from "./cache-management/receipt-flush";
 import { start_message_status_flush } from "./cache-management/message-status-flush";
+import { start_disappearing_sweeper } from "./cache-management/disappearing-sweeper";
 const SERVER_PORT = parseInt(process.env.SERVER_PORT || "5000");
 if (!SERVER_PORT || isNaN(SERVER_PORT)) {
   throw new Error("SERVER_PORT environment variable is not set or invalid");
@@ -76,12 +77,14 @@ console.log(
 
 const receipts_flush_stop = start_receipts_flush();
 const message_status_flush_stop = start_message_status_flush();
+const disappearing_sweeper_stop = start_disappearing_sweeper();
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully');
   receipts_flush_stop();
   message_status_flush_stop();
+  disappearing_sweeper_stop();
   process.exit(0);
 });
 
@@ -89,5 +92,6 @@ process.on('SIGINT', () => {
   console.log('SIGINT received, shutting down gracefully');
   receipts_flush_stop();
   message_status_flush_stop();
+  disappearing_sweeper_stop();
   process.exit(0);
 });

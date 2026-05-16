@@ -21,6 +21,10 @@ type ChatMetaFields = {
   attachments?: unknown; // [{url, mime, size, key, thumbnail}] — null/missing for text
 };
 
+// Cached chats.disappearing_after_sec. Separate field on the same hash so
+// updating the last-message fields doesn't clobber the setting and vice versa.
+const DISAPPEARING_FIELD = "disappearing_after_sec";
+
 const chat_meta_key = (chat_id: string) => `chat_meta:${chat_id}`;
 
 /**
@@ -77,6 +81,33 @@ const get_chat_meta = async (chat_id: string): Promise<ChatMetaFields | null> =>
   } catch (err) {
     console.error(`[CACHE] get_chat_meta failed for chat ${chat_id}:`, err);
     return null;
+  }
+};
+
+// Read the cached disappearing-messages duration for a chat. Returns null when
+// the chat hasn't been touched yet (caller falls back to a DB read + hydrate)
+// or when disappearing is explicitly off (stored as the literal string "0").
+const get_disappearing_after_sec = async (chat_id: string): Promise<number | null | undefined> => {
+  try {
+    const raw = await redis.hget(chat_meta_key(chat_id), DISAPPEARING_FIELD);
+    if (raw == null) return undefined; // miss — caller hydrates
+    if (raw === "" || raw === "0") return null;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  } catch (err) {
+    console.error(`[CACHE] get_disappearing_after_sec failed (${chat_id}):`, err);
+    return undefined;
+  }
+};
+
+// Write the disappearing-messages duration into the chat_meta hash. Passing
+// null clears the setting. Used by the settings endpoint after the DB update
+// and by the send path to hydrate the cache lazily on first miss.
+const set_disappearing_after_sec = async (chat_id: string, duration_sec: number | null): Promise<void> => {
+  try {
+    await redis.hset(chat_meta_key(chat_id), DISAPPEARING_FIELD, duration_sec == null ? "0" : String(duration_sec));
+  } catch (err) {
+    console.error(`[CACHE] set_disappearing_after_sec failed (${chat_id}):`, err);
   }
 };
 
@@ -197,6 +228,8 @@ export {
   update_chat_meta,
   get_chat_meta,
   get_chat_metas,
+  get_disappearing_after_sec,
+  set_disappearing_after_sec,
   increment_unread,
   batch_increment_unread,
   reset_unread,

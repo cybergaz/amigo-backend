@@ -47,7 +47,11 @@ const broadcast_message = async (data: BroadcastData) => {
   }
 
   // sent to both specific users and conversation members (if both conv_id & user_ids are provided)
-  let recipients_list = Array.from(new Set([...members, ...(data.user_ids ? data.user_ids : [])]));
+  // Filter out falsy ids defensively — callers sometimes coerce a nullable
+  // sender_id to "" before passing it in (system messages have sender_id=NULL),
+  // and "" downstream lands in the uuid-typed missed_ws_messages.user_id and
+  // crashes the worker.
+  let recipients_list = Array.from(new Set([...members, ...(data.user_ids ? data.user_ids : [])])).filter(Boolean);
   // if (data.user_ids) {
   //   recipients_list = recipients_list.concat(data.user_ids);
   // }
@@ -62,6 +66,8 @@ const broadcast_message = async (data: BroadcastData) => {
   const serialized_payload = JSON.stringify(data.message);
 
   // Separate online and offline users across all transport types
+  // console.log("recipients_list : ", recipients_list);
+  // console.log("data : ", data);
   await Promise.all(recipients_list.map(async user_id => {
     if (data.exclude_user_ids && data.exclude_user_ids.includes(user_id)) {
       return; // Skip excluded users

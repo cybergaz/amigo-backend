@@ -26,7 +26,7 @@ async function flush(user_id: string): Promise<void> {
 
   if (batch.messages.length === 0) return;
 
-  console.log(`[FCM-BATCH] Flushing ${batch.messages.length} messages to user ${user_id}`);
+  // console.log(`[FCM-BATCH] Flushing ${batch.messages.length} messages to user ${user_id}`);
   await FCMService.send_notification({
     type: 'ws-message',
     fcm_mode: 'data-only',
@@ -42,7 +42,7 @@ async function flush(user_id: string): Promise<void> {
  * In the size-overflow case the overflowing message starts the next batch.
  */
 export async function queue_message_fcm(user_id: string, ws_message: WSMessage): Promise<void> {
-  console.log(`[FCM-BATCH] Queuing ${ws_message.type} for offline user ${user_id}`);
+  // console.log(`[FCM-BATCH] Queuing ${ws_message.type} for offline user ${user_id}`);
   let batch = batches.get(user_id);
 
   if (!batch) {

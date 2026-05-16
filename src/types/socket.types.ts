@@ -45,7 +45,8 @@ type WSMessage = {
   | CallPayload
   | MiscPayload
   | ConversationActionPayload
-  | UserUpdatePayload;
+  | UserUpdatePayload
+  | ConversationDisappearingPayload;
   // | SyncMessagesPayload
   // | MessageDeliveredPayload;
   ws_timestamp?: Date;
@@ -64,7 +65,8 @@ interface VitalWSMessage {
   | MessagePinPayload
   | MessageForwardPayload
   | ConversationActionPayload
-  | UserUpdatePayload;
+  | UserUpdatePayload
+  | ConversationDisappearingPayload;
   // | MessageDeliveredPayload;
   ws_timestamp?: Date;
 }
@@ -103,6 +105,11 @@ type ChatMessagePayload = {
     sent_at: Date | null;
   } | null;
   sent_at: Date;
+  // Set by the server on message:new broadcast when the chat has disappearing
+  // messages enabled. Clients use this to filter expired-but-not-yet-deleted
+  // rows from the view; the server sweeper is what actually soft-deletes the
+  // row and broadcasts message:delete.
+  expires_at?: Date | string | null;
 };
 
 type MessageSentAckPayload = {
@@ -237,6 +244,16 @@ type ConversationActionPayload = {
   // actor_pfp?: string;
 };
 
+// Broadcast when a user changes the disappearing-messages duration on a chat.
+// duration_sec = null clears the setting (off). Already-sent messages are not
+// retroactively touched — only future messages get expires_at stamped.
+type ConversationDisappearingPayload = {
+  conv_id: string;
+  actor_id: string;
+  duration_sec: number | null;
+  changed_at: Date | string;
+};
+
 // Broadcast when a user updates their own profile (name and/or profile pic).
 // Sent to every other user that shares a conversation with them so clients
 // can refresh local user rows and evict stale CachedNetworkImage entries.
@@ -279,6 +296,7 @@ const WS_MESSAGE_EVENTS_CONST = [
   'message:forward',
   'message:delete',
   'message:react',
+  'conversation:disappearing',
   // 'message:sync',  // Sync missed messages on reconnection
   // 'message:delivered',  // Delivery receipt from FCM messages
   'call:init',
@@ -314,6 +332,7 @@ const VITAL_WS_EVENTS_CONST = [
   'message:forward',
   'message:delete',
   'message:react',
+  'conversation:disappearing',
   'user:update',
 ] as const;
 
@@ -353,6 +372,7 @@ export type {
   ConnectionStatusType,
   ConversationActionPayload,
   UserUpdatePayload,
+  ConversationDisappearingPayload,
   // SyncMessageItem,
   // SyncMessagesPayload,
   // MessageDeliveredPayload,

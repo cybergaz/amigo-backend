@@ -46,8 +46,8 @@ export class FCMService {
       const token_map = await fetch_fcm_tokens(payload.user_ids);
 
       const with_tokens = Array.from(token_map.entries()).filter(([_, t]) => t !== null).length;
-      const without_tokens = payload.user_ids.length - with_tokens;
-      console.log(`[FCM] send_notification: ${with_tokens} with token, ${without_tokens} without token (type=${payload.type})`);
+      // const without_tokens = payload.user_ids.length - with_tokens;
+      // console.log(`[FCM] send_notification: ${with_tokens} with token, ${without_tokens} without token (type=${payload.type})`);
 
       // Filter out users without tokens and send notifications
       const send_promises = Array.from(token_map.entries())
@@ -108,8 +108,8 @@ export class FCMService {
             };
 
             const msg_id = await admin.messaging().send(message);
-            console.log(`[FCM] ✅ Sent to user ${user_id}: ${msg_id}`);
-            console.log(`[FCM] with FCM token ${fcm_token}`);
+            // console.log(`[FCM] ✅ Sent to user ${user_id}: ${msg_id}`);
+            // console.log(`[FCM] with FCM token ${fcm_token}`);
             return true;
           } catch (error: any) {
             // Handle invalid token errors
@@ -137,7 +137,7 @@ export class FCMService {
 
   // Update user's FCM token (updates all 3 tiers)
   async update_user_fcm_token(userId: string, fcmToken: string): Promise<ResultType> {
-    console.log("update_user_fcm_token : ", { userId, fcmToken });
+    // console.log("update_user_fcm_token : ", { userId, fcmToken });
     try {
       await store_fcm_token(userId, fcmToken);
 

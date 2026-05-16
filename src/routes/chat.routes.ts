@@ -2,6 +2,7 @@ import { Elysia, t } from "elysia";
 import { app_middleware } from "@/middleware";
 import { get_chat_list, get_chat_members, get_conversation_history, get_message_statuses, get_messages_around, soft_delete_chat, soft_delete_message } from "@/services/chat.services";
 import { dm_delete_status } from "@/services/chat-dm.service";
+import { set_chat_disappearing } from "@/services/disappearing.service";
 
 const chat_routes = new Elysia({ prefix: "/chat" })
   .state({ id: "", role: "" })
@@ -122,6 +123,22 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     params: t.Object({
       conversation_id: t.String()
     })
+  })
+
+  // Set/clear disappearing-messages duration for a chat. duration_sec=null
+  // turns the feature off. See disappearing.service.ts:ALLOWED_DURATIONS for
+  // accepted values (currently 24h / 7d / 90d, matching WhatsApp).
+  .post("/disappearing/:conversation_id", async ({ set, store, params, body }) => {
+    const result = await set_chat_disappearing(
+      params.conversation_id,
+      store.id,
+      body.duration_sec,
+    );
+    set.status = result.code;
+    return result;
+  }, {
+    params: t.Object({ conversation_id: t.String() }),
+    body: t.Object({ duration_sec: t.Union([t.Number(), t.Null()]) }),
   });
 
 export default chat_routes;

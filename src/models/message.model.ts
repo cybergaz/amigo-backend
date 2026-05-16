@@ -14,6 +14,10 @@ const message_model = pgTable("messages", {
   attachments: jsonb(),              // [{url, mime, size, key, thumbnail}]
   replied_to: uuid(),
   sent_at: timestamp({ withTimezone: true }),
+  // Disappearing-messages: null = never expire. Stamped at insert time as
+  // sent_at + chats.disappearing_after_sec when the chat has it enabled.
+  // The sweeper worker uses idx_messages_expires_at to find rows to delete.
+  expires_at: timestamp({ withTimezone: true }),
   created_at: timestamp({ withTimezone: true }).defaultNow(),
   deleted_at: timestamp({ withTimezone: true }),
   // status: varchar({ enum: MESSAGE_STATUS_CONSTS }).default("sent").notNull(), // sent, delivered, read

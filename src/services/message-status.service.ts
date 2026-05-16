@@ -250,7 +250,7 @@ const mark_message_delivered = async (
       };
     }
 
-    const sender_id = message.sender_id ?? "";
+    const sender_id = message.sender_id;
     const now = new Date();
 
     const res = await update_message_status({
@@ -278,15 +278,22 @@ const mark_message_delivered = async (
       }]
     };
 
-    await broadcast_message({
-      to: "users",
-      user_ids: [sender_id],
-      message: {
-        type: "message:status:ack",
-        payload: ack_payload,
-        ws_timestamp: new Date()
-      },
-    });
+    // System messages (e.g. "X set disappearing messages to 24 hours") have
+    // sender_id = NULL — there's no original sender to notify, so skip the
+    // status-ack broadcast. Without this guard, broadcast_message would queue
+    // a missed_ws_messages row with user_id = "" and Postgres rejects the
+    // empty string as an invalid uuid.
+    if (sender_id) {
+      await broadcast_message({
+        to: "users",
+        user_ids: [sender_id],
+        message: {
+          type: "message:status:ack",
+          payload: ack_payload,
+          ws_timestamp: new Date()
+        },
+      });
+    }
 
     // Remove from polling cache — the pending entry is keyed by its own UUIDv7,
     // not by message_id. We can't look it up by message_id, so skip this.
