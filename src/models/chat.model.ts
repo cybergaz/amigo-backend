@@ -1,5 +1,5 @@
 import { CHAT_TYPE_CONSTS, CHAT_ROLE_CONST } from "@/types/chat.types";
-import { pgTable, bigint, varchar, timestamp, boolean, jsonb, integer, bigserial, uuid, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, bigint, varchar, timestamp, boolean, jsonb, integer, bigserial, uuid, index, uniqueIndex, text } from "drizzle-orm/pg-core";
 import { user_model } from "./user.model";
 import { desc, InferInsertModel, InferSelectModel, isNull } from "drizzle-orm";
 import { message_model } from "./message.model";
@@ -9,6 +9,9 @@ const chat_model = pgTable("chats", {
   creater_id: uuid().references(() => user_model.id, { onDelete: 'set null' }),
   type: varchar({ enum: CHAT_TYPE_CONSTS }).notNull(), // "dm", "group", "community_group"
   title: varchar({ length: 255 }),
+  // S3 URL of the group avatar. Null for DMs (clients fall back to the peer's
+  // users.profile_pic). Mutable by group admins via /chat/group/update-group-profile-image.
+  profile_pic: text(),
   pinned_msg_id: uuid(),
   last_msg_id: uuid(),
   last_msg_at: timestamp({ withTimezone: true }),

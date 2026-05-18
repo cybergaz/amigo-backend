@@ -23,6 +23,7 @@ import { randomUUIDv7 } from "bun";
 const build_conversation_action_message = (
   action: ConversationActionPayload["action"],
   members: MembersType[],
+  details?: { title?: string | null; profile_pic?: string | null; profile_pic_changed?: boolean },
 ) => {
   const names = members.map((m) => m.user_name).filter(Boolean);
   const target = names.length ? names.join(", ") : "Member";
@@ -38,6 +39,18 @@ const build_conversation_action_message = (
       return `${target} demoted to member`;
     case "chat_delete":
       return "This group was deleted";
+    case "chat_details:update": {
+      const renamed = details?.title !== undefined && details?.title !== null;
+      const iconChanged = details?.profile_pic_changed === true;
+      if (renamed && iconChanged) {
+        return `Group renamed to "${details!.title}" and icon updated`;
+      }
+      if (renamed) return `Group renamed to "${details!.title}"`;
+      if (iconChanged) {
+        return details!.profile_pic ? "Group icon updated" : "Group icon removed";
+      }
+      return "Group details updated";
+    }
     default:
       return target;
   }
@@ -51,8 +64,18 @@ const broadcast_conversation_action = async (data: {
   actor_id?: string;
   actor_name?: string;
   actor_pfp?: string;
+  // Only meaningful for `chat_details:update`.
+  title?: string | null;
+  profile_pic?: string | null;
+  previous_profile_pic?: string | null;
+  // True when the pfp actually changed (incl. cleared). Distinguishes "no
+  // pfp change in this update" (undefined) from "cleared to null".
+  profile_pic_changed?: boolean;
 }) => {
-  if (!data.members.length) return;
+  // Member-action events require at least one member in the list (otherwise
+  // there's nothing to announce). chat_details:update is the exception — it
+  // describes the chat itself, not a member.
+  if (data.action !== "chat_details:update" && !data.members.length) return;
 
   const action_at = new Date();
   const payload: ConversationActionPayload = {
@@ -64,8 +87,20 @@ const broadcast_conversation_action = async (data: {
     actor_id: data.actor_id,
     // actor_name: data.actor_name,
     // actor_pfp: data.actor_pfp,
-    message: build_conversation_action_message(data.action, data.members),
+    message: build_conversation_action_message(data.action, data.members, {
+      title: data.title,
+      profile_pic: data.profile_pic,
+      profile_pic_changed: data.profile_pic_changed,
+    }),
     action_at,
+    ...(data.title !== undefined ? { title: data.title } : {}),
+    ...(data.profile_pic_changed
+      ? {
+        profile_pic: data.profile_pic ?? null,
+        previous_profile_pic: data.previous_profile_pic ?? null,
+        profile_pic_changed: true,
+      }
+      : {}),
   };
 
   // For chat_delete the chat row is already gone, so the conversation member
@@ -196,6 +231,7 @@ const get_chat_list = async (user_id: string, type: string) => {
         conversationId: chat_model.id,
         type: chat_model.type,
         title: chat_model.title,
+        profilePic: chat_model.profile_pic,
         lastMsgId: chat_model.last_msg_id,
         lastMsgAt: chat_model.last_msg_at,
         createrId: chat_model.creater_id,

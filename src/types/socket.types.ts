@@ -229,7 +229,12 @@ type ConversationActionType =
   | 'member_removed'
   | 'member_promoted'
   | 'member_demoted'
-  | 'chat_delete';
+  | 'chat_delete'
+  // Group title or profile picture changed by an admin. Members carries no
+  // entries for this action — title / profile_pic / previous_profile_pic
+  // describe the change. Routed through conversation:action so it inherits
+  // the existing vital-event storage path for offline-replay.
+  | 'chat_details:update';
 
 type ConversationActionPayload = {
   event_id: string;
@@ -240,6 +245,18 @@ type ConversationActionPayload = {
   actor_id?: string;
   message: string;
   action_at: Date;
+  // chat_details:update fields. Only set when at least one of title /
+  // profile_pic changed. profile_pic == null with profile_pic_changed = true
+  // means the avatar was cleared.
+  title?: string | null;
+  profile_pic?: string | null;
+  // Previous profile pic URL — clients use it as the cache key to evict the
+  // old image from on-disk CachedNetworkImage cache.
+  previous_profile_pic?: string | null;
+  // Explicit "the pfp column was touched" flag. Needed because both
+  // profile_pic == null (cleared) and field-absent (title-only update) would
+  // otherwise collapse to the same wire shape.
+  profile_pic_changed?: boolean;
   // actor_name?: string;
   // actor_pfp?: string;
 };

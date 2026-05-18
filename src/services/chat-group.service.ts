@@ -14,6 +14,28 @@ import { NewConversationPayload, MembersType } from "@/types/socket.types";
 import { get_user_details } from "./user.services";
 import { broadcast_conversation_action } from "./chat.services";
 import { add_members, remove_member as cache_remove_member } from "@/cache-management/conv.cache";
+import {
+  upload_image_to_s3,
+  delete_image_from_s3,
+  generate_profile_image_key,
+} from "@/services/s3.service";
+
+// Returns true if the user is an active admin of the chat. Used to gate
+// admin-only mutations (title / pfp updates).
+const is_chat_admin = async (chat_id: string, user_id: string) => {
+  const [row] = await db
+    .select({ role: chat_member_model.role })
+    .from(chat_member_model)
+    .where(
+      and(
+        eq(chat_member_model.chat_id, chat_id),
+        eq(chat_member_model.user_id, user_id),
+        isNull(chat_member_model.removed_at),
+      )
+    )
+    .limit(1);
+  return row?.role === "admin";
+};
 
 const create_group = async (
   creater_id: string,
@@ -109,6 +131,7 @@ const get_group_info = async (conversation_id: string) => {
         conversation_id: chat_model.id,
         type: chat_model.type,
         title: chat_model.title,
+        profile_pic: chat_model.profile_pic,
         lastMessageAt: chat_model.last_msg_at,
 
         createrId: user_model.id,
@@ -705,9 +728,18 @@ const demote_to_member = async (
 
 const update_group_title = async (
   conversation_id: string,
-  title: string
+  title: string,
+  actor_id: string,
 ) => {
   try {
+    if (!(await is_chat_admin(conversation_id, actor_id))) {
+      return {
+        success: false,
+        code: 403,
+        message: "Only group admins can update the group title",
+      };
+    }
+
     const [chat] = await db
       .update(chat_model)
       .set({ title })
@@ -722,6 +754,18 @@ const update_group_title = async (
       };
     }
 
+    // Fan out to all members so creators *and* peers see the new title in
+    // their local DB + UI. Routed through conversation:action so the event
+    // is durably stored for any member offline at the moment.
+    await broadcast_conversation_action({
+      conv_id: conversation_id,
+      conv_type: (chat.type as ChatType) || "group",
+      action: "chat_details:update",
+      members: [],
+      actor_id,
+      title,
+    });
+
     return {
       success: true,
       code: 200,
@@ -729,10 +773,118 @@ const update_group_title = async (
       data: chat,
     };
   } catch (error) {
+    console.error("update_group_title error:", error);
     return {
       success: false,
       code: 500,
       message: "ERROR : update_group_title",
+    };
+  }
+};
+
+const update_group_profile_pic = async (
+  conversation_id: string,
+  actor_id: string,
+  file: File,
+) => {
+  try {
+    if (!(await is_chat_admin(conversation_id, actor_id))) {
+      return {
+        success: false,
+        code: 403,
+        message: "Only group admins can update the group profile picture",
+      };
+    }
+
+    // File validation mirrors update_profile_image — keep client expectations
+    // identical for both endpoints.
+    const allowedTypes = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
+    if (!allowedTypes.includes(file.type)) {
+      return {
+        success: false,
+        code: 400,
+        message: "Invalid file type. Only JPEG, PNG, and WebP images are allowed.",
+      };
+    }
+    const maxSize = 5 * 1024 * 1024; // 5MB
+    if (file.size > maxSize) {
+      return {
+        success: false,
+        code: 400,
+        message: "File size too large. Maximum size is 5MB.",
+      };
+    }
+
+    const [existing] = await db
+      .select({
+        id: chat_model.id,
+        type: chat_model.type,
+        profile_pic: chat_model.profile_pic,
+      })
+      .from(chat_model)
+      .where(eq(chat_model.id, conversation_id))
+      .limit(1);
+
+    if (!existing) {
+      return { success: false, code: 404, message: "Group not found" };
+    }
+
+    // Keyed by chat id so old uploads land in a deterministic prefix and
+    // multiple admins editing don't collide. Reuse the PROFILE_IMAGES folder
+    // — it's already public-readable and CDN-pathed identically.
+    const imageKey = generate_profile_image_key(`group_${conversation_id}`, file.name);
+    const upload = await upload_image_to_s3(file, imageKey);
+    if (!upload.success || !upload.url) {
+      return {
+        success: false,
+        code: 500,
+        message: upload.error || "Failed to upload image",
+      };
+    }
+
+    const previous_profile_pic = existing.profile_pic ?? null;
+
+    await db
+      .update(chat_model)
+      .set({ profile_pic: upload.url })
+      .where(eq(chat_model.id, conversation_id));
+
+    // Best-effort old-image cleanup. The S3 key is everything after the
+    // bucket host — extract by stripping the bucket URL prefix instead of
+    // assuming "profile-images/x/y" structure.
+    if (previous_profile_pic) {
+      try {
+        const url = new URL(previous_profile_pic);
+        const oldKey = url.pathname.replace(/^\//, "");
+        if (oldKey) await delete_image_from_s3(oldKey);
+      } catch (err) {
+        console.error("[CHAT_DETAILS] previous pfp cleanup failed:", err);
+      }
+    }
+
+    await broadcast_conversation_action({
+      conv_id: conversation_id,
+      conv_type: (existing.type as ChatType) || "group",
+      action: "chat_details:update",
+      members: [],
+      actor_id,
+      profile_pic: upload.url,
+      previous_profile_pic,
+      profile_pic_changed: true,
+    });
+
+    return {
+      success: true,
+      code: 200,
+      message: "Group profile picture updated successfully",
+      data: { profile_pic: upload.url },
+    };
+  } catch (error) {
+    console.error("update_group_profile_pic error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : update_group_profile_pic",
     };
   }
 };
@@ -745,5 +897,7 @@ export {
   promote_to_admin,
   demote_to_member,
   update_group_title,
-  get_group_admin_info
+  update_group_profile_pic,
+  get_group_admin_info,
+  is_chat_admin,
 };

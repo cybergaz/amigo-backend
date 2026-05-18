@@ -29,6 +29,13 @@
       "when": 1778850944475,
       "tag": "0003_old_shocker",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1779102567005,
+      "tag": "0004_add_chat_profile_pic",
+      "breakpoints": true
     }
   ]
 }

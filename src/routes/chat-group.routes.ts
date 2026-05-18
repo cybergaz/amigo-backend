@@ -1,6 +1,6 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
-import { add_new_member, create_group, demote_to_member, get_group_info, promote_to_admin, remove_member, update_group_title } from "@/services/chat-group.service";
+import { add_new_member, create_group, demote_to_member, get_group_info, promote_to_admin, remove_member, update_group_profile_pic, update_group_title } from "@/services/chat-group.service";
 
 export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
   .state({ id: "", role: "" })
@@ -100,12 +100,30 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
   })
 
   .put("/update-group-title", async ({ set, store, body }) => {
-    const title_result = await update_group_title(body.conversation_id, body.title);
+    const title_result = await update_group_title(body.conversation_id, body.title, store.id);
     set.status = title_result.code;
     return title_result;
   }, {
     body: t.Object({
       conversation_id: t.String(),
       title: t.String()
+    })
+  })
+
+  .post("/update-group-profile-image", async ({ set, store, body }) => {
+    if (!body.image) {
+      set.status = 400;
+      return { success: false, message: "No image file provided" };
+    }
+    const result = await update_group_profile_pic(body.conversation_id, store.id, body.image);
+    set.status = result.code;
+    return result;
+  }, {
+    body: t.Object({
+      conversation_id: t.String(),
+      image: t.File({
+        type: ["image/jpeg", "image/jpg", "image/png", "image/webp"],
+        maxSize: 5 * 1024 * 1024, // 5MB
+      }),
     })
   })
