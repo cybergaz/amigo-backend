@@ -15,6 +15,7 @@ import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { update_conversation } from "@/services/chat.services";
 import FCMService from "@/services/fcm.service";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
+import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
 import { ChatType } from "@/types/chat.types";
 import { CALL_TIMEOUT_MS, CallService, active_calls, register_missed_call_notifier } from "@/services/call.service";
 import { call_model } from "@/models/call.model";
@@ -384,14 +385,18 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
     //   last_msg_at: new Date()
     // });
 
-    // 6. Queue FCM for offline users
+    // 6. Queue FCM for offline users. Muted recipients still get the FCM
+    //    (their app needs the message to land in local DB) but with a
+    //    silent flag so the app skips painting a local notification. A
+    //    single Redis ZRANGEBYSCORE per chat regardless of group size.
     const fcm_ws_message: WSMessage = {
       type: "message:new",
       payload: updated_message_payload,
       ws_timestamp: new Date()
     };
+    const muted = await get_muted_user_ids(payload.conv_id);
     for (const user_id of sent_result.offline) {
-      queue_message_fcm(user_id, fcm_ws_message);
+      queue_message_fcm(user_id, fcm_ws_message, { silent: muted.has(user_id) });
     }
 
     return {

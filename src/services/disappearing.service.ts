@@ -7,6 +7,7 @@ import { randomUUIDv7 } from "bun";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
 import { get_conversation_members } from "@/cache-management/conv.cache";
+import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
 import {
   set_disappearing_after_sec,
   update_chat_meta,
@@ -171,12 +172,18 @@ const set_chat_disappearing = async (
   });
 
   // FCM/missed-ws fan-out for offline + polling members. Mirrors the pattern
-  // used in broadcast_deletion / handle_message_new for vital events.
-  const members = await get_conversation_members(chat_id);
+  // used in broadcast_deletion / handle_message_new for vital events. Muted
+  // members get silent FCMs so they still receive the events but don't see a
+  // local notification — chat settings updates shouldn't ping a muted chat.
+  const [members, muted] = await Promise.all([
+    get_conversation_members(chat_id),
+    get_muted_user_ids(chat_id),
+  ]);
   for (const member_id of members) {
     if (member_id === actor_id) continue; // No need to notify the actor of their own change — they already know!
-    await queue_message_fcm(member_id, new_msg_ws);
-    await queue_message_fcm(member_id, setting_ws);
+    const silent = muted.has(member_id);
+    await queue_message_fcm(member_id, new_msg_ws, { silent });
+    await queue_message_fcm(member_id, setting_ws, { silent });
   }
 
   return { success: true, code: 200, message: "Disappearing setting updated" };

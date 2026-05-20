@@ -15,6 +15,7 @@ import { ConversationActionPayload, DeleteMessagePayload, MembersType, WSMessage
 import FCMService from "./fcm.service";
 import { queue_message_fcm } from "./fcm-batch.service";
 import { get_conversation_members } from "@/cache-management/conv.cache";
+import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
 import { get_chat_metas, get_all_unread } from "@/cache-management/chat-meta.cache";
 import { get_message_statuses_bulk } from "@/cache-management/message.cache";
 import { generate_unique_id } from "@/utils/general.utils";
@@ -246,6 +247,9 @@ const get_chat_list = async (user_id: string, type: string) => {
         // For deleted DMs, expose the soft-delete timestamp so the UI can
         // show "deleted X ago". Null for active chats.
         deletedAt: chat_member_model.removed_at,
+        // Per-user mute end time. Null when not muted. Far-future timestamp
+        // represents "forever" (see mute.service.ts MUTED_FOREVER).
+        mutedUntil: chat_member_model.muted_until,
 
         // DM peer info (null for groups)
         userId: user_model.id,
@@ -488,9 +492,14 @@ const broadcast_deletion = async (
   // 2. FCM / missed-ws enqueue for offline + polling members. queue_message_fcm
   //    is the existing path that also writes into missed_ws_messages, so this
   //    same call covers the "user comes back later via long-poll" case.
-  const members = await get_conversation_members(chat_id);
+  //    Muted members get the FCM with silent=true so their app processes
+  //    the deletion without painting a notification.
+  const [members, muted] = await Promise.all([
+    get_conversation_members(chat_id),
+    get_muted_user_ids(chat_id),
+  ]);
   for (const member_id of members) {
-    await queue_message_fcm(member_id, ws_msg);
+    await queue_message_fcm(member_id, ws_msg, { silent: muted.has(member_id) });
   }
 
   // 3. Repoint last_msg_id and pinned_msg_id if any of the deleted rows was
@@ -1326,6 +1335,7 @@ const get_chat_members = async (conversation_id: string, user_id: string) => {
         removed_at: chat_member_model.removed_at,
         last_read_msg_id: chat_member_model.last_read_msg_id,
         last_delivered_msg_id: chat_member_model.last_delivered_msg_id,
+        muted_until: chat_member_model.muted_until,
         name: user_model.name,
         phone: user_model.phone,
         profile_pic: user_model.profile_pic,

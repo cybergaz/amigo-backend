@@ -1,0 +1,1 @@
+ALTER TABLE "chat_members" ADD COLUMN "muted_until" timestamp with time zone;

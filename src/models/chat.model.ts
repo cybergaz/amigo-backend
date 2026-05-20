@@ -36,7 +36,12 @@ const chat_member_model = pgTable("chat_members", {
   last_delivered_msg_id: uuid(),
   joined_at: timestamp({ withTimezone: true }).defaultNow(),
   removed_at: timestamp({ withTimezone: true }),
-  // deleted: boolean().default(false).notNull(), -- use removed_at instead 
+  // Per-user mute. NULL = not muted. A timestamp in the future = muted until
+  // then ("forever" = far-future date written by the API). A timestamp in the
+  // past is treated as not muted (lets us avoid a cron sweep — the send-path
+  // ZRANGEBYSCORE filters by score > now()).
+  muted_until: timestamp({ withTimezone: true }),
+  // deleted: boolean().default(false).notNull(), -- use removed_at instead
   // unread_count: integer().default(0),
 }, (table) => [
   uniqueIndex("uniq_chat_members_active").on(table.chat_id, table.user_id).where(isNull(table.removed_at)),

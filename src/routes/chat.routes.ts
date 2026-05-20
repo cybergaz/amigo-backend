@@ -3,6 +3,7 @@ import { app_middleware } from "@/middleware";
 import { get_chat_list, get_chat_members, get_conversation_history, get_message_statuses, get_messages_around, soft_delete_chat, soft_delete_message } from "@/services/chat.services";
 import { dm_delete_status } from "@/services/chat-dm.service";
 import { set_chat_disappearing } from "@/services/disappearing.service";
+import { set_user_chat_mute, clear_user_chat_mute } from "@/services/mute.service";
 
 const chat_routes = new Elysia({ prefix: "/chat" })
   .state({ id: "", role: "" })
@@ -139,6 +140,33 @@ const chat_routes = new Elysia({ prefix: "/chat" })
   }, {
     params: t.Object({ conversation_id: t.String() }),
     body: t.Object({ duration_sec: t.Union([t.Number(), t.Null()]) }),
+  })
+
+  // Mute a chat for the calling user. `until` is an ISO timestamp; null
+  // means "forever" (stored as a far-future epoch in muted_until). Notifications
+  // (the local-notification painting in the app) get suppressed for muted
+  // recipients via a `silent` flag on the FCM data payload — messages still
+  // arrive and still land in the local DB.
+  .post("/mute/:conversation_id", async ({ set, store, params, body }) => {
+    const until = body.until ? new Date(body.until) : null;
+    if (body.until && isNaN(until!.getTime())) {
+      set.status = 400;
+      return { success: false, code: 400, message: "Invalid until timestamp" };
+    }
+    const result = await set_user_chat_mute(params.conversation_id, store.id, until);
+    set.status = result.code;
+    return result;
+  }, {
+    params: t.Object({ conversation_id: t.String() }),
+    body: t.Object({ until: t.Union([t.String(), t.Null()]) }),
+  })
+
+  .post("/unmute/:conversation_id", async ({ set, store, params }) => {
+    const result = await clear_user_chat_mute(params.conversation_id, store.id);
+    set.status = result.code;
+    return result;
+  }, {
+    params: t.Object({ conversation_id: t.String() }),
   });
 
 export default chat_routes;

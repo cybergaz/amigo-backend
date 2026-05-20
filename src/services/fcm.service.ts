@@ -27,6 +27,11 @@ interface FCMPayload {
   ws_message?: WSMessage;   // single — used for calls
   ws_messages?: WSMessage[]; // batched — used for chat messages
   data?: Record<string, any>;
+  // When true, the FCM data payload carries `silent: '1'` so the app
+  // processes the message but suppresses local-notification painting — the
+  // muted-chat path. Implies fcm_mode='data-only' (chat-message FCMs already
+  // are; this is only meaningful for them).
+  silent?: boolean;
 }
 
 export class FCMService {
@@ -75,6 +80,10 @@ export class FCMService {
                 ...(payload.ws_messages
                   ? { ws_messages: JSON.stringify(payload.ws_messages) }
                   : {}),
+                // Muted-chat marker. App-side FCM handler reads this and
+                // skips local-notification painting while still processing
+                // the ws_messages into the local DB.
+                ...(payload.silent ? { silent: '1' } : {}),
               },
               android: {
                 priority: 'high',
