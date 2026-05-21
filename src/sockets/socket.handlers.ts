@@ -3,7 +3,7 @@ import { ElysiaWS } from "elysia/dist/ws";
 import { get_conversation_members, get_user_conversations } from "@/cache-management/conv.cache";
 import { socket_connections, handlePongResponse, polling_connections } from "./socket.server";
 import { is_allowed_event, store_pending_message } from "@/cache-management/polling.cache";
-import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_connection_status, handle_message_forward, handle_message_new, handle_conv_join, handle_message_status_ack, } from "./socket.service";
+import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_connection_status, handle_message_forward, handle_message_new, handle_conv_join, handle_conv_mark_read, handle_message_status_ack, } from "./socket.service";
 import { pin_message, unpin_message } from "@/services/message.services";
 import { mark_message_delivered } from "@/services/message-status.service";
 import { batch_mark_status } from "@/cache-management/message.cache";
@@ -134,143 +134,6 @@ const broadcast_message = async (data: BroadcastData) => {
   };
 };
 
-// Get all connected users (optimized with parallel fetching)
-// const get_connected_users = async (user_id: string): Promise<Set<string>> => {
-//   // Get user's conversations (cached)
-//   const conversations = await get_user_conversations(user_id);
-//
-//   if (conversations.size === 0) {
-//     return new Set<string>();
-//   }
-//
-//   // Fetch members from all conversations in parallel
-//   const memberPromises = Array.from(conversations).map(conv_id =>
-//     get_conversation_members(conv_id)
-//   );
-//
-//   const all_members = await Promise.all(memberPromises);
-//
-//   // Combine and deduplicate
-//   const connected_users = new Set<string>();
-//   all_members.forEach(members => {
-//     members.forEach(member_id => {
-//       if (member_id !== user_id) {
-//         connected_users.add(member_id);
-//       }
-//     });
-//   });
-//
-//   return connected_users;
-// };
-
-// const handle_join_conversation = async ({
-//   conv_id,
-//   user_id,
-// }: {
-//   conv_id: string,
-//   user_id: string,
-//   // is_active_in_conv: boolean
-// }) => {
-//   try {
-//     // Reset unread count in Redis (fire-and-forget)
-//     reset_unread(user_id, conv_id);
-//
-//     // Get the latest message in this conversation to update last_read_msg_id
-//     const [latest_message] = await db
-//       .select({ id: message_model.id })
-//       .from(message_model)
-//       .where(
-//         and(
-//           eq(message_model.chat_id, conv_id),
-//         )
-//       )
-//       .orderBy(desc(message_model.sent_at))
-//       .limit(1);
-//
-//     if (latest_message) {
-//       // Only update last_read_message_id if user wasn't already active in this conversation
-//       // This prevents resetting read receipts when user comes back to the same conversation
-//       // if (!is_active_in_conv) {
-//       await db
-//         .update(chat_member_model)
-//         .set({
-//           last_read_msg_id: latest_message.id,
-//         })
-//         .where(
-//           and(
-//             eq(chat_member_model.chat_id, conv_id),
-//             eq(chat_member_model.user_id, user_id)
-//           )
-//         );
-//       // }
-//     }
-//
-//     // Capture unread messages BEFORE marking them read, so we can push real read receipts to senders
-//     const unread_messages = await db
-//       .select({ message_id: message_info_model.message_id, sender_id: message_model.sender_id })
-//       .from(message_info_model)
-//       .innerJoin(message_model, eq(message_info_model.message_id, message_model.id))
-//       .where(
-//         and(
-//           eq(message_info_model.chat_id, conv_id),
-//           eq(message_info_model.user_id, user_id),
-//           isNull(message_info_model.read_at),
-//           ne(message_model.sender_id, user_id),
-//         )
-//       );
-//
-//     // update message_status to set read_at for all messages in this conversation for this user
-//     await db
-//       .update(message_info_model)
-//       .set({ read_at: new Date() })
-//       .where(
-//         and(
-//           eq(message_info_model.chat_id, conv_id),
-//           eq(message_info_model.user_id, user_id),
-//           isNull(message_info_model.read_at),
-//         )
-//       );
-//
-//     // DM status tracking is now handled via message_info_model (read_at/delivered_at)
-//     // No per-message `status` column exists anymore.
-//
-//     // Push real read receipts to senders so they can correct optimistic pre-fills
-//     // Group messages by sender and push message:ack with read_by=[user_id] to each unique sender
-//     if (unread_messages.length > 0) {
-//       const now = new Date();
-//       // Group latest message ID per sender (client marks all earlier messages read on single ack)
-//       const latest_per_sender = new Map<string, string>();
-//       for (const row of unread_messages) {
-//         if (row.sender_id) latest_per_sender.set(row.sender_id, row.message_id);
-//       }
-//
-//       for (const [sender_id, message_id] of latest_per_sender) {
-//         const ack_payload: ChatMessageAckPayload = {
-//           id: message_id,
-//           conv_id,
-//           sender_id,
-//           delivered_at: now,
-//           read_by: [user_id],
-//           delivered_to: [],
-//         };
-//         await broadcast_message({
-//           to: "users",
-//           user_ids: [sender_id],
-//           message: {
-//             type: "message:ack",
-//             payload: ack_payload,
-//             ws_timestamp: now,
-//           },
-//         });
-//       }
-//     }
-//
-//   }
-//   catch (error) {
-//     console.error("[WS] Error in handle_join_conversation:", error);
-//   }
-// };
-
 const socket_message_handler = async (
   user_details: {
     user_id?: string,
@@ -350,6 +213,31 @@ const socket_message_handler = async (
                 payload: {
                   code: result.code || 500,
                   message: result.message || "Error handling conversation join/leave",
+                  error: result.error
+                },
+                ws_timestamp: new Date()
+              }
+            });
+          }
+          break;
+        }
+
+
+      // ----------------------------------------------------
+      case 'conversation:mark_read':
+        // --------------------------------------------------
+        {
+          const result = await handle_conv_mark_read(message.payload as ConvJoinPayload, message.ws_timestamp);
+          if (!result.success) {
+            // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            await broadcast_message({
+              to: "users",
+              user_ids: [user_id],
+              message: {
+                type: "socket:error",
+                payload: {
+                  code: result.code || 500,
+                  message: result.message || "Error handling conversation mark-read",
                   error: result.error
                 },
                 ws_timestamp: new Date()

@@ -162,6 +162,101 @@ const handle_conv_join = async (payload: ConvJoinPayload, timestamp?: Date | str
 };
 
 
+// User explicitly tapped "Mark as read" on a chat list row. Same DB effect
+// as handle_conv_join (mark every message <= last_read_msg_id as read for
+// this user + broadcast updated read receipts to the original senders), but
+// we deliberately skip the `active_conv_id` pin on the socket connection —
+// the user isn't entering the conversation, only flushing its unread state.
+const handle_conv_mark_read = async (payload: ConvJoinPayload, timestamp?: Date | string): Promise<ResultType> => {
+  try {
+    if (!payload.last_read_msg_id) {
+      return { success: true, code: 200, message: "No messages to mark as read" };
+    }
+    const now = new Date();
+    const effective_ts: Date =
+      timestamp instanceof Date
+        ? timestamp
+        : typeof timestamp === "string"
+          ? new Date(timestamp)
+          : now;
+
+    // Snapshot previous cursor BEFORE overwriting so we only broadcast to
+    // senders within the newly-acked window.
+    const prev_receipt = await get_receipt(payload.user_id, payload.conv_id);
+    const prev_read_msg_id = prev_receipt.last_read_msg_id;
+
+    set_last_read(
+      payload.user_id,
+      payload.conv_id,
+      payload.last_read_msg_id,
+      effective_ts,
+    );
+
+    reset_unread(payload.user_id, payload.conv_id);
+
+    mark_read_upto(payload.user_id, payload.conv_id, payload.last_read_msg_id, effective_ts, prev_read_msg_id);
+
+    // Find distinct senders in the unread window (prev_cursor, new_cursor].
+    const lower_bound = prev_read_msg_id
+      ? sql`${message_model.sent_at} > (SELECT ${message_model.sent_at} FROM ${message_model} WHERE ${message_model.id} = ${prev_read_msg_id} LIMIT 1)`
+      : sql`TRUE`;
+
+    const unread_senders = await db
+      .selectDistinct({ sender_id: message_model.sender_id })
+      .from(message_model)
+      .where(
+        and(
+          eq(message_model.chat_id, payload.conv_id),
+          sql`${message_model.sent_at} <= (SELECT ${message_model.sent_at} FROM ${message_model} WHERE ${message_model.id} = ${payload.last_read_msg_id} LIMIT 1)`,
+          lower_bound,
+          sql`${message_model.sender_id} IS NOT NULL AND ${message_model.sender_id} <> ${payload.user_id}::uuid`,
+          isNull(message_model.deleted_at),
+        )
+      );
+
+    const sender_ids = unread_senders
+      .map(r => r.sender_id)
+      .filter((id): id is string => id !== null);
+
+    if (sender_ids.length > 0) {
+      // Reuse the existing `conversation:join` broadcast contract so each
+      // sender's app updates tick marks via its existing handler — no new
+      // client-side handler needed.
+      const conversation_join_payload: ConvJoinPayload = {
+        user_id: payload.user_id,
+        conv_id: payload.conv_id,
+        last_read_msg_id: payload.last_read_msg_id,
+      };
+
+      await broadcast_message({
+        to: "users",
+        user_ids: sender_ids,
+        message: {
+          type: "conversation:join",
+          payload: conversation_join_payload,
+          ws_timestamp: now,
+        },
+      });
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "Conversation marked as read successfully"
+    };
+  }
+  catch (error) {
+    console.error('[WS] Error handling conversation:mark_read:', error);
+    return {
+      success: false,
+      code: 500,
+      message: "Error handling conversation:mark_read",
+      error: error as any
+    };
+  }
+};
+
+
 // When a DM message arrives, the recipient may have previously "deleted for
 // me" the chat — chat_members.removed_at is set, the conv member cache no
 // longer includes them, and their local DB has no chat row at all. The
@@ -1174,6 +1269,7 @@ const handle_call_hold = async (payload: CallPayload, user_id: string): Promise<
 export {
   handle_connection_status,
   handle_conv_join,
+  handle_conv_mark_read,
   handle_message_new,
   handle_message_status_ack,
   handle_message_forward,

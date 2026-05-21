@@ -303,6 +303,7 @@ const WS_MESSAGE_EVENTS_CONST = [
   'connection:status',
   'conversation:join',
   // 'conversation:leave',
+  'conversation:mark_read',
   'conversation:new',
   'conversation:typing',
   'conversation:action',
@@ -340,6 +341,7 @@ const WS_MESSAGE_EVENTS_CONST = [
 const VITAL_WS_EVENTS_CONST = [
   'conversation:join',
   // 'conversation:leave',
+  'conversation:mark_read',
   'conversation:new',
   'conversation:action',
   'message:new',
