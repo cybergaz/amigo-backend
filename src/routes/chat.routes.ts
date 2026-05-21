@@ -1,7 +1,6 @@
 import { Elysia, t } from "elysia";
 import { app_middleware } from "@/middleware";
 import { get_chat_list, get_chat_members, get_conversation_history, get_message_statuses, get_messages_around, soft_delete_chat, soft_delete_message } from "@/services/chat.services";
-import { dm_delete_status } from "@/services/chat-dm.service";
 import { set_chat_disappearing } from "@/services/disappearing.service";
 import { set_user_chat_mute, clear_user_chat_mute } from "@/services/mute.service";
 
@@ -108,16 +107,6 @@ const chat_routes = new Elysia({ prefix: "/chat" })
 
   .delete("/soft-delete-chat/:conversation_id", async ({ set, store, params }) => {
     const delete_result = await soft_delete_chat(params.conversation_id, store.id);
-    set.status = delete_result.code;
-    return delete_result;
-  }, {
-    params: t.Object({
-      conversation_id: t.String()
-    })
-  })
-
-  .post("/revive-chat/:conversation_id", async ({ set, store, params }) => {
-    const delete_result = await dm_delete_status(params.conversation_id, store.id, false);
     set.status = delete_result.code;
     return delete_result;
   }, {

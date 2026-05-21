@@ -7,6 +7,7 @@ import {
 import { message_model, message_info_model } from "@/models/message.model";
 import { user_model } from "@/models/user.model";
 import {
+  ChatRoleType,
   ChatType,
 } from "@/types/chat.types";
 import { and, arrayContains, asc, desc, eq, gt, lt, inArray, isNotNull, isNull, ne, not, or, sql } from "drizzle-orm";
@@ -94,7 +95,9 @@ const broadcast_conversation_action = async (data: {
       profile_pic_changed: data.profile_pic_changed,
     }),
     action_at,
-    ...(data.title !== undefined ? { title: data.title } : {}),
+    ...(data.title !== undefined || data.action === "chat_delete"
+      ? { title: data.title ?? null }
+      : {}),
     ...(data.profile_pic_changed
       ? {
         profile_pic: data.profile_pic ?? null,
@@ -360,6 +363,83 @@ const update_conversation = async (conv_data: DBUpdateConversationType) => {
 
 const soft_delete_chat = async (conversation_id: string, user_id: string) => {
   try {
+    // Verify the chat exists and is a group. DMs use chat_members.removed_at
+    // for per-user hiding (see dm_delete_status) — they must never hit this
+    // path, which would wipe the chat for both parties.
+    const [chat_row] = await db
+      .select({ id: chat_model.id, type: chat_model.type, deleted_at: chat_model.deleted_at })
+      .from(chat_model)
+      .where(eq(chat_model.id, conversation_id))
+      .limit(1);
+
+    if (!chat_row) {
+      return {
+        success: false,
+        code: 404,
+        message: "Conversation not found",
+        data: { conversation_id, deleted: false },
+      };
+    }
+
+    if (chat_row.type === "dm") {
+      return {
+        success: false,
+        code: 400,
+        message: "Use /chat/dm/soft-delete-dm for DM deletion",
+      };
+    }
+
+    if (chat_row.deleted_at) {
+      return {
+        success: false,
+        code: 400,
+        message: "Conversation is already deleted",
+        data: { conversation_id, deleted: true },
+      };
+    }
+
+    // Only an active admin of the group can soft-delete it.
+    const [requester] = await db
+      .select({ role: chat_member_model.role })
+      .from(chat_member_model)
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at),
+        )
+      )
+      .limit(1);
+
+    if (requester?.role !== "admin") {
+      return {
+        success: false,
+        code: 403,
+        message: "Only group admins can delete the group",
+      };
+    }
+
+    // Snapshot members + actor BEFORE the soft-delete so the broadcast can
+    // address all current participants — chat_members rows themselves aren't
+    // cascaded away, but the chat row going inactive should fan the
+    // chat_delete event out to everyone for local-DB purge.
+    const members = await db
+      .select({
+        user_id: chat_member_model.user_id,
+        user_name: user_model.name,
+        user_pfp: user_model.profile_pic,
+        role: chat_member_model.role,
+        joined_at: chat_member_model.joined_at,
+      })
+      .from(chat_member_model)
+      .innerJoin(user_model, eq(user_model.id, chat_member_model.user_id))
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          isNull(chat_member_model.removed_at),
+        )
+      );
+
     const [conversation] = await db
       .update(chat_model)
       .set({ deleted_at: new Date() })
@@ -373,6 +453,44 @@ const soft_delete_chat = async (conversation_id: string, user_id: string) => {
         message: "Conversation not found",
         data: { conversation_id, deleted: false },
       };
+    }
+
+    // Fan out the delete to every former member so clients can purge the
+    // chat + members + messages from local SQLite without waiting for the
+    // next get-chat-list reconcile. Fire-and-forget: a broadcast failure
+    // must not roll back the soft-delete (the chat-list endpoint already
+    // filters deleted_at-not-null rows, so reconcile will eventually catch
+    // up). broadcast_conversation_action handles chat_delete via direct-
+    // to-users send and missed_ws_messages persistence for offline members.
+    if (members.length > 0) {
+      const [actor] = await db
+        .select({ name: user_model.name, profile_pic: user_model.profile_pic })
+        .from(user_model)
+        .where(eq(user_model.id, user_id))
+        .limit(1);
+
+      const member_payload: MembersType[] = members
+        .filter((m): m is typeof m & { user_id: string } => m.user_id !== null)
+        .map(m => ({
+          user_id: m.user_id,
+          user_name: m.user_name,
+          user_pfp: m.user_pfp ?? undefined,
+          role: m.role as ChatRoleType,
+          joined_at: m.joined_at ?? new Date(),
+        }));
+      // Carry title + actor info on the wire — the client purges the chat
+      // row from local DB on chat_delete, so it can't recover these later
+      // for the snackbar.
+      broadcast_conversation_action({
+        conv_id: conversation_id,
+        conv_type: chat_row.type as ChatType,
+        action: "chat_delete",
+        members: member_payload,
+        actor_id: user_id,
+        actor_name: actor?.name,
+        actor_pfp: actor?.profile_pic ?? undefined,
+        title: conversation.title,
+      }).catch(err => console.error("[chat_delete] broadcast failed:", err));
     }
 
     return {

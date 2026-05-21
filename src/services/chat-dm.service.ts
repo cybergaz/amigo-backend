@@ -1,14 +1,21 @@
 import db from "@/config/db";
 import { chat_model, chat_member_model } from "@/models/chat.model";
+import { message_model, message_info_model } from "@/models/message.model";
 import { user_model } from "@/models/user.model";
-import { and, eq, exists, isNull } from "drizzle-orm";
+import { and, eq, exists, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { NewConversationPayload } from "@/types/socket.types";
-import { add_members } from "@/cache-management/conv.cache";
+import { add_members, remove_member } from "@/cache-management/conv.cache";
 
 const create_dm = async (sender_id: string, receiver_id: string) => {
   try {
-    // Find existing DM between these two users via EXISTS subqueries (dm_key column removed)
+    // Find ANY existing DM between these two users — ignoring removed_at on
+    // either side. The DM model in the new "delete-for-me" world is: if a
+    // chat row exists with both parties as members (even if one party has
+    // removed_at set), the chat continues to exist and the deleting party
+    // is "revived" on next interaction. Creating a new chat_id every time
+    // someone re-DMs a person they previously deleted would orphan the
+    // shared message history.
     const existingChat = await db
       .select({ id: chat_model.id })
       .from(chat_model)
@@ -21,7 +28,6 @@ const create_dm = async (sender_id: string, receiver_id: string) => {
               and(
                 eq(chat_member_model.chat_id, chat_model.id),
                 eq(chat_member_model.user_id, sender_id),
-                isNull(chat_member_model.removed_at)
               )
             )
           ),
@@ -30,7 +36,6 @@ const create_dm = async (sender_id: string, receiver_id: string) => {
               and(
                 eq(chat_member_model.chat_id, chat_model.id),
                 eq(chat_member_model.user_id, receiver_id),
-                isNull(chat_member_model.removed_at)
               )
             )
           )
@@ -39,11 +44,28 @@ const create_dm = async (sender_id: string, receiver_id: string) => {
       .limit(1);
 
     if (existingChat.length > 0) {
+      const conv_id = existingChat[0].id;
+      // If either side had hidden the chat (removed_at set), revive their
+      // membership so message:new broadcasts include them again. dm_delete_status
+      // is the single-side revive; here we cover both for completeness.
+      await db
+        .update(chat_member_model)
+        .set({ removed_at: null })
+        .where(
+          and(
+            eq(chat_member_model.chat_id, conv_id),
+            isNotNull(chat_member_model.removed_at),
+          )
+        );
+      // Re-hydrate the conversation member cache to include both parties so
+      // the very next message:new broadcast fans out to both. add_members
+      // is idempotent and also invalidates the LRU + publishes pub/sub.
+      await add_members([sender_id, receiver_id], conv_id);
       return {
         success: true,
         code: 200,
         data: {
-          id: existingChat[0].id,
+          id: conv_id,
           existing: true
         },
       };
@@ -148,6 +170,34 @@ const dm_delete_status = async (conversation_id: string, user_id: string, status
         message: "Conversation not found",
         data: { conversation_id, deleted: false },
       };
+    }
+
+    if (status) {
+      // Evict the deleted user from the conversation member cache so subsequent
+      // message:new broadcasts on this DM don't fan out to them. Revival on the
+      // next inbound message (see handle_message_new in socket.service) will
+      // re-add them before the broadcast.
+      await remove_member(user_id, conversation_id);
+
+      // Tombstone every existing message in this chat as "deleted for me" for
+      // this user. After revival (peer sends a new message), get_conversation_history
+      // and get_messages_around already filter out rows with message_info.deleted_at
+      // IS NOT NULL for the requester — so the user can never pull pre-deletion
+      // history back from the server. Single INSERT...SELECT, fast even for
+      // long-running DMs. ON CONFLICT handles rows that already have a
+      // message_info entry (delivery receipts, prior reactions, etc.) by
+      // stamping deleted_at on them. messages.deleted_at IS NULL guard keeps
+      // us from re-resurrecting globally deleted messages into the tombstone
+      // set — they're already invisible to everyone.
+      await db.execute(sql`
+        INSERT INTO ${message_info_model} (chat_id, message_id, user_id, deleted_at)
+        SELECT ${message_model.chat_id}, ${message_model.id}, ${user_id}, NOW()
+        FROM ${message_model}
+        WHERE ${message_model.chat_id} = ${conversation_id}
+          AND ${message_model.deleted_at} IS NULL
+        ON CONFLICT (message_id, user_id)
+        DO UPDATE SET deleted_at = NOW()
+      `);
     }
 
     return {

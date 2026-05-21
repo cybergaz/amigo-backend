@@ -1,17 +1,17 @@
 import { ResultType } from "@/types/core.types";
-import { CallPayload, ChatMessagePayload, ConnectionStatusPayload, MessageForwardPayload, WSMessageEventsType, WSMessage, ConvJoinPayload, MessageSentAckPayload, MessageStatusAckPayload, } from "@/types/socket.types";
+import { CallPayload, ChatMessagePayload, ConnectionStatusPayload, MessageForwardPayload, NewConversationPayload, WSMessageEventsType, WSMessage, ConvJoinPayload, MessageSentAckPayload, MessageStatusAckPayload, } from "@/types/socket.types";
 import { broadcast_message, is_user_online, } from "./socket.handlers";
 // import { update_user_connection_status } from "@/services/user.services";
 import { socket_connections } from "./socket.server";
 import { forward_messages, store_message_with_retry } from "@/services/message.services";
 import { batch_insert_message_status, mark_read_upto } from "@/services/message-status.service";
-import { get_conversation_members } from "@/cache-management/conv.cache";
+import { add_members, get_conversation_members } from "@/cache-management/conv.cache";
 import { update_chat_meta, batch_increment_unread, reset_unread } from "@/cache-management/chat-meta.cache";
 import db from "@/config/db";
-import { chat_member_model } from "@/models/chat.model";
+import { chat_model, chat_member_model } from "@/models/chat.model";
 import { message_model } from "@/models/message.model";
 import { user_model } from "@/models/user.model";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import { update_conversation } from "@/services/chat.services";
 import FCMService from "@/services/fcm.service";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
@@ -162,6 +162,111 @@ const handle_conv_join = async (payload: ConvJoinPayload, timestamp?: Date | str
 };
 
 
+// When a DM message arrives, the recipient may have previously "deleted for
+// me" the chat — chat_members.removed_at is set, the conv member cache no
+// longer includes them, and their local DB has no chat row at all. The
+// inbound message is the trigger to revive: clear removed_at, re-hydrate
+// the cache, and emit conversation:new to the affected user so their
+// client inserts the chat + chat_member + peer-user rows into local SQLite
+// before the message:new lands. WS messages on a single connection are
+// FIFO-ordered, and missed_ws_messages preserves order on offline replay,
+// so the chat row will exist by the time the message:new is processed.
+//
+// Group chats don't have a per-user hide concept — they're either deleted
+// for everyone (chat_delete) or you're an active member. This whole path
+// is a no-op for non-DM messages.
+const revive_hidden_dm_members = async (conv_id: string, sender_id: string): Promise<void> => {
+  try {
+    // Look up chat type + sender info in parallel — both are needed only
+    // when revival is required, but the type check is cheap and short-circuits.
+    const [chat_row] = await db
+      .select({ id: chat_model.id, type: chat_model.type })
+      .from(chat_model)
+      .where(eq(chat_model.id, conv_id))
+      .limit(1);
+    if (!chat_row || chat_row.type !== "dm") return;
+
+    // Find members with removed_at set. For DMs this is at most one row
+    // (only the receiver could have hidden the chat — the sender obviously
+    // hasn't, since they're sending into it). Index: chat_members has a
+    // unique index on (chat_id, user_id) WHERE removed_at IS NULL; this
+    // query is by chat_id which is selective enough on its own.
+    const hidden = await db
+      .select({
+        user_id: chat_member_model.user_id,
+      })
+      .from(chat_member_model)
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conv_id),
+          isNotNull(chat_member_model.removed_at),
+        )
+      );
+
+    const hidden_user_ids = hidden
+      .map(h => h.user_id)
+      .filter((id): id is string => id !== null);
+    if (hidden_user_ids.length === 0) return;
+
+    // Clear removed_at for all hidden members in one statement.
+    await db
+      .update(chat_member_model)
+      .set({ removed_at: null })
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conv_id),
+          inArray(chat_member_model.user_id, hidden_user_ids),
+        )
+      );
+
+    // Sender info drives the conversation:new payload (peer view from the
+    // revived user's POV).
+    const [sender] = await db
+      .select({
+        id: user_model.id,
+        name: user_model.name,
+        phone: user_model.phone,
+        profile_pic: user_model.profile_pic,
+      })
+      .from(user_model)
+      .where(eq(user_model.id, sender_id))
+      .limit(1);
+    if (!sender) return;
+
+    // Re-hydrate the conversation member cache so the message:new broadcast
+    // that follows fans out to the revived user(s). add_members is idempotent.
+    await add_members([sender_id, ...hidden_user_ids], conv_id);
+
+    const now = new Date();
+    for (const revived_user_id of hidden_user_ids) {
+      const payload: NewConversationPayload = {
+        conv_id,
+        conv_type: "dm",
+        creater_id: sender.id,
+        creater_name: sender.name,
+        creater_phone: sender.phone || "",
+        creater_pfp: sender.profile_pic || undefined,
+        joined_at: now,
+      };
+      // Direct-to-user so the revived recipient gets it even though their
+      // cache entry was just (re-)added. broadcast_message also persists
+      // into missed_ws_messages for offline users, preserving ordering
+      // with the message:new event that follows.
+      await broadcast_message({
+        to: "users",
+        user_ids: [revived_user_id],
+        message: {
+          type: "conversation:new",
+          payload,
+          ws_timestamp: now,
+        },
+      });
+    }
+  } catch (err) {
+    console.error("[message:new] revive_hidden_dm_members failed:", err);
+  }
+};
+
 const handle_message_new = async (payload: ChatMessagePayload, user_name: string): Promise<ResultType> => {
   try {
     //
@@ -255,6 +360,14 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       // the view layer. Server sweeper remains the authoritative deleter.
       expires_at: store_msg_result.data?.expires_at ?? null,
     };
+
+    // Before fanning out the message: if the recipient previously hid this DM
+    // (chat_members.removed_at), revive their membership and emit a
+    // conversation:new event so their client recreates the local chat row
+    // before message:new is processed. Awaited so the conversation:new
+    // arrives on the WS wire ahead of message:new — order matters on the
+    // recipient side. Group chats short-circuit inside the helper.
+    await revive_hidden_dm_members(payload.conv_id, payload.sender_id);
 
     // broadcast to the chat recipients about the new message
     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
