@@ -10,7 +10,7 @@ import { eq, sql } from "drizzle-orm";
 import { community_model } from "@/models/community.model";
 import { update_signup_request_status, get_all_signup_requests } from "@/services/auth.service";
 import { force_declare_group_creater, get_all_conversations_admin, get_conversation_history_admin, get_conversation_members_admin, hard_delete_chat } from "@/services/chat-admin.service";
-import { add_new_member, remove_member } from "@/services/chat-group.service";
+import { add_new_member, remove_member, bulk_add_members_to_groups, bulk_remove_members_from_groups } from "@/services/chat-group.service";
 import { hard_delete_message, revive_chat } from "@/services/chat.services";
 
 const admin_routes = new Elysia({ prefix: "/admin" })
@@ -649,6 +649,67 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     body: t.Object({
       conversation_id: t.String(),
       user_id: t.String()
+    })
+  })
+
+  // Bulk-add the same set of users to every group in `conversation_ids` in
+  // one request. Powers the sub-admin "manage groups" flow on mobile where
+  // the actor first picks users, then picks target groups. Per-group
+  // already-active users are silently skipped (handled by `add_new_member`).
+  .post("/chat-management/bulk-add-members-to-groups", async ({ set, store, body }) => {
+    try {
+      const result = await bulk_add_members_to_groups(
+        body.conversation_ids,
+        body.user_ids,
+        store.id,
+        body.role || "member",
+      );
+      set.status = result.code;
+      return result;
+    } catch (error) {
+      set.status = 500;
+      return {
+        success: false,
+        code: 500,
+        message: "Internal server error",
+        data: null,
+      };
+    }
+  }, {
+    body: t.Object({
+      conversation_ids: t.Array(t.String()),
+      user_ids: t.Array(t.String()),
+      role: t.Optional(t.Union([t.Literal("admin"), t.Literal("member")])),
+    })
+  })
+
+  // Bulk-remove the cross-product of (conversation_ids × user_ids) — users
+  // who aren't currently active members of a given group are silently
+  // skipped (one batched UPDATE, no per-pair queries). One
+  // `conversation:action` (member_removed) broadcast fans out per affected
+  // group so member lists update live for everyone in the chat.
+  .delete("/chat-management/bulk-remove-members-from-groups", async ({ set, store, body }) => {
+    try {
+      const result = await bulk_remove_members_from_groups(
+        body.conversation_ids,
+        body.user_ids,
+        store.id,
+      );
+      set.status = result.code;
+      return result;
+    } catch (error) {
+      set.status = 500;
+      return {
+        success: false,
+        code: 500,
+        message: "Internal server error",
+        data: null,
+      };
+    }
+  }, {
+    body: t.Object({
+      conversation_ids: t.Array(t.String()),
+      user_ids: t.Array(t.String()),
     })
   })
 

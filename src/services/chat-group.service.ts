@@ -889,6 +889,227 @@ const update_group_profile_pic = async (
   }
 };
 
+// ---------------------------------------------------------------------------
+// Bulk multi-group operations powering the sub-admin "manage groups" flow
+// on mobile. The actor picks users first, then a set of target groups; we
+// apply add/remove across every (group, user) pair and broadcast one
+// `conversation:action` event per group so existing client wiring updates
+// member lists live.
+// ---------------------------------------------------------------------------
+
+// Apply the same set of `user_ids` to every group in `conversation_ids` as
+// new members. Iterates `add_new_member` per group — that helper already
+// batches inserts/revivals across the user_ids array and silently no-ops on
+// users that are already active in the group, so we don't need to dedupe
+// here. Per-group cost is one round-trip, so a sub-admin pushing 20 users
+// into 5 groups is 5 round-trips (not 100).
+const bulk_add_members_to_groups = async (
+  conversation_ids: string[],
+  user_ids: string[],
+  actor_id?: string,
+  role: ChatRoleType = "member",
+) => {
+  if (conversation_ids.length === 0 || user_ids.length === 0) {
+    return {
+      success: false,
+      code: 400,
+      message: "Missing conversation_ids or user_ids",
+      data: null,
+    };
+  }
+
+  const results: Array<{
+    conversation_id: string;
+    added: string[];
+    existing: string[];
+    revived: string[];
+    invalid: string[];
+    success: boolean;
+    message?: string;
+  }> = [];
+
+  for (const conv_id of conversation_ids) {
+    const r = await add_new_member(conv_id, user_ids, role, actor_id);
+    const data = (r.data || {}) as {
+      inserted?: Array<{ user_id?: string | null }>;
+      existing?: string[];
+      revived?: string[];
+      invalid?: string[];
+    };
+    const inserted_ids = (data.inserted || [])
+      .map((row) => row.user_id || "")
+      .filter(Boolean);
+    const revived_ids = data.revived || [];
+    const added_ids = inserted_ids.filter((id) => !revived_ids.includes(id));
+
+    results.push({
+      conversation_id: conv_id,
+      added: added_ids,
+      existing: data.existing || [],
+      revived: revived_ids,
+      invalid: data.invalid || [],
+      success: r.success,
+      message: r.success ? undefined : r.message,
+    });
+  }
+
+  return {
+    success: results.some((r) => r.success),
+    code: 200,
+    message: "Bulk add processed",
+    data: { results },
+  };
+};
+
+// Mark every active (chat_id, user_id) row that matches the cross-product
+// of inputs as removed in ONE batched UPDATE, then fan out the standard
+// `conversation:action` (member_removed) event per affected group. Users
+// who aren't in a given group simply don't match the WHERE clause — no
+// error, no per-pair query.
+const bulk_remove_members_from_groups = async (
+  conversation_ids: string[],
+  user_ids: string[],
+  actor_id?: string,
+) => {
+  if (conversation_ids.length === 0 || user_ids.length === 0) {
+    return {
+      success: false,
+      code: 400,
+      message: "Missing conversation_ids or user_ids",
+      data: null,
+    };
+  }
+
+  try {
+    // 1. One batched UPDATE returning every (chat_id, user_id, role, joined_at)
+    //    that was actually active and got soft-deleted. Anything not in the
+    //    group silently fails to match — desired behaviour per spec.
+    const removed_rows = await db
+      .update(chat_member_model)
+      .set({ removed_at: new Date() })
+      .where(
+        and(
+          inArray(chat_member_model.chat_id, conversation_ids),
+          inArray(chat_member_model.user_id, user_ids),
+          isNull(chat_member_model.removed_at),
+        )
+      )
+      .returning({
+        chat_id: chat_member_model.chat_id,
+        user_id: chat_member_model.user_id,
+        role: chat_member_model.role,
+        joined_at: chat_member_model.joined_at,
+      });
+
+    if (removed_rows.length === 0) {
+      return {
+        success: true,
+        code: 200,
+        message: "No members were removed (none of the selected users were in any of the selected groups)",
+        data: {
+          results: conversation_ids.map((c) => ({
+            conversation_id: c,
+            removed: [] as string[],
+          })),
+          total_removed: 0,
+        },
+      };
+    }
+
+    // 2. Hydrate user name/pfp once for all distinct affected users so the
+    //    per-group broadcast payloads don't re-query.
+    const distinct_user_ids = Array.from(
+      new Set(removed_rows.map((r) => r.user_id).filter(Boolean) as string[])
+    );
+    const users_meta = await db
+      .select({
+        id: user_model.id,
+        name: user_model.name,
+        profile_pic: user_model.profile_pic,
+      })
+      .from(user_model)
+      .where(inArray(user_model.id, distinct_user_ids));
+    const user_meta_by_id = new Map(users_meta.map((u) => [u.id, u]));
+
+    // 3. Group affected rows by chat for broadcast + cache invalidation.
+    const by_chat = new Map<string, typeof removed_rows>();
+    for (const row of removed_rows) {
+      if (!row.chat_id) continue;
+      const list = by_chat.get(row.chat_id) ?? [];
+      list.push(row);
+      by_chat.set(row.chat_id, list);
+    }
+
+    // 4. Look up each affected group's chat type (group / community_group)
+    //    so the broadcast payload's conv_type is accurate, in one query.
+    const affected_chat_ids = Array.from(by_chat.keys());
+    const chats = await db
+      .select({ id: chat_model.id, type: chat_model.type })
+      .from(chat_model)
+      .where(inArray(chat_model.id, affected_chat_ids));
+    const type_by_chat = new Map(chats.map((c) => [c.id, c.type]));
+
+    const actor = actor_id ? await get_user_details(actor_id) : null;
+
+    // 5. Cache invalidation + WS broadcast in parallel, per group.
+    await Promise.all(
+      Array.from(by_chat.entries()).map(async ([chat_id, rows]) => {
+        // Drop each removed user from the conversation member LRU set so
+        // future broadcasts and presence lookups don't re-fan to them.
+        await Promise.all(
+          rows
+            .filter((r) => r.user_id)
+            .map((r) => cache_remove_member(r.user_id!, chat_id))
+        );
+
+        const members_for_action: MembersType[] = rows
+          .filter((r) => r.user_id)
+          .map((r) => {
+            const meta = user_meta_by_id.get(r.user_id!);
+            return {
+              user_id: r.user_id!,
+              user_name: meta?.name || "Member",
+              user_pfp: meta?.profile_pic || undefined,
+              role: r.role as ChatRoleType,
+              joined_at: r.joined_at ? new Date(r.joined_at) : new Date(),
+            };
+          });
+
+        await broadcast_conversation_action({
+          conv_id: chat_id,
+          conv_type: (type_by_chat.get(chat_id) as ChatType) || "group",
+          action: "member_removed",
+          members: members_for_action,
+          actor_id,
+          actor_name: actor?.data?.name,
+          actor_pfp: actor?.data?.profile_pic || undefined,
+        });
+      })
+    );
+
+    const results = conversation_ids.map((conv_id) => ({
+      conversation_id: conv_id,
+      removed: (by_chat.get(conv_id) ?? [])
+        .map((r) => r.user_id)
+        .filter(Boolean) as string[],
+    }));
+
+    return {
+      success: true,
+      code: 200,
+      message: "Bulk remove processed",
+      data: { results, total_removed: removed_rows.length },
+    };
+  } catch (error) {
+    console.error("bulk_remove_members_from_groups error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : bulk_remove_members_from_groups",
+    };
+  }
+};
+
 export {
   get_group_info,
   create_group,
@@ -900,4 +1121,6 @@ export {
   update_group_profile_pic,
   get_group_admin_info,
   is_chat_admin,
+  bulk_add_members_to_groups,
+  bulk_remove_members_from_groups,
 };

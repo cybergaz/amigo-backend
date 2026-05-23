@@ -168,12 +168,14 @@ const ConversationActionPayloadSchema = t.Object({
   action_at: FlexDate(),
 });
 
-// UserUpdatePayload schema — sent when a user updates their own name/profile pic
+// UserUpdatePayload schema — sent when a user updates their own name/profile
+// pic, or when a super-admin changes the user's app-level role.
 const UserUpdatePayloadSchema = t.Object({
   user_id: t.String(),
   name: t.Optional(t.String()),
   profile_pic: t.Optional(t.Union([t.String(), t.Null()])),
   previous_profile_pic: t.Optional(t.Union([t.String(), t.Null()])),
+  role: t.Optional(t.String()),
   updated_at: FlexDate(),
 });
 

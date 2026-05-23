@@ -240,40 +240,46 @@ const update_user_details = async (id: string, body: UpdateUserType) => {
 };
 
 // Broadcast a user:update to every distinct peer that shares a conversation
-// with this user. Self is excluded — the updater already has the latest data
-// from their own API response.
+// with this user. Self is excluded by default — the updater already has the
+// latest data from their own API response. Set `include_self` for cases like
+// role changes pushed from the admin panel, where the target user themselves
+// needs the new role on their device without having to log out.
 const broadcast_user_update = async (args: {
   user_id: string;
   name?: string;
   profile_pic?: string | null;
   previous_profile_pic?: string | null;
+  role?: string;
+  include_self?: boolean;
 }) => {
   const conv_ids = Array.from(await get_user_conversations(args.user_id));
-  if (conv_ids.length === 0) return;
 
-  const peer_ids = new Set<string>();
+  const recipient_ids = new Set<string>();
   await Promise.all(
     conv_ids.map(async (conv_id) => {
       const members = await get_conversation_members(conv_id);
       for (const member_id of members) {
-        if (member_id !== args.user_id) peer_ids.add(member_id);
+        if (member_id !== args.user_id) recipient_ids.add(member_id);
       }
     })
   );
 
-  if (peer_ids.size === 0) return;
+  if (args.include_self) recipient_ids.add(args.user_id);
+
+  if (recipient_ids.size === 0) return;
 
   const payload: UserUpdatePayload = {
     user_id: args.user_id,
     name: args.name,
     profile_pic: args.profile_pic,
     previous_profile_pic: args.previous_profile_pic ?? null,
+    role: args.role,
     updated_at: new Date(),
   };
 
   await broadcast_message({
     to: "users",
-    user_ids: Array.from(peer_ids),
+    user_ids: Array.from(recipient_ids),
     message: {
       type: "user:update",
       payload,
@@ -496,6 +502,16 @@ const update_user_role = async (id: string, role: RoleType) => {
       .update(user_model)
       .set({ role })
       .where(eq(user_model.id, id));
+
+    // Push the new role to the target user (self) AND all peers via the vital
+    // `user:update` channel so role-gated UI updates without a re-login. The
+    // event is already in VITAL_WS_EVENTS_CONST, so offline users will pick it
+    // up via the polling/missed-message cache on their next reconnect.
+    broadcast_user_update({
+      user_id: id,
+      role,
+      include_self: true,
+    }).catch((err) => console.error("[USER:UPDATE] role broadcast failed:", err));
 
     return {
       success: true,

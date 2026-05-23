@@ -271,9 +271,12 @@ type ConversationDisappearingPayload = {
   changed_at: Date | string;
 };
 
-// Broadcast when a user updates their own profile (name and/or profile pic).
+// Broadcast when a user updates their own profile (name and/or profile pic),
+// OR when a super-admin changes the user's app-level role from the dashboard.
 // Sent to every other user that shares a conversation with them so clients
 // can refresh local user rows and evict stale CachedNetworkImage entries.
+// Also sent to the target user themselves on role changes so they can apply
+// the new permissions without logging out.
 type UserUpdatePayload = {
   user_id: string;
   name?: string;
@@ -281,6 +284,9 @@ type UserUpdatePayload = {
   // Previous profile pic URL — included so clients can evict the old asset
   // from the on-disk image cache (keyed by URL).
   previous_profile_pic?: string | null;
+  // App-level role: "user" | "admin" | "sub_admin" | "staff". Included only
+  // on role-change broadcasts; absent on regular name/pfp updates.
+  role?: string;
   updated_at: Date;
 };
 
