@@ -17,6 +17,7 @@ import FCMService from "@/services/fcm.service";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
 import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
 import { ChatType } from "@/types/chat.types";
+import type { CallEndReasonsType } from "@/types/call.types";
 import { CALL_TIMEOUT_MS, CallService, active_calls, register_missed_call_notifier } from "@/services/call.service";
 import { call_model } from "@/models/call.model";
 import { get_user_peers } from "@/cache-management/user-peer.cache";
@@ -1101,38 +1102,52 @@ const handle_call_accept = async (payload: CallPayload, user_id: string): Promis
   }
 };
 
+/**
+ * Maps a client-supplied teardown reason string onto our internal
+ * {@link CallEndReasonsType} enum.
+ *
+ * The Stream-backed client (`StreamCallService.endCall` / `declineCall`)
+ * sends `caller_cancelled` / `user_declined` / `user_hangup`, none of
+ * which are members of the enum. The in-house WebRTC client passes the
+ * canonical names through unchanged.
+ */
+const map_call_terminate_reason = (
+  supplied: string | undefined,
+  is_caller_terminating: boolean,
+): CallEndReasonsType => {
+  switch (supplied) {
+    case 'busy':
+    case 'timeout':
+    case 'declined':
+    case 'abandoned':
+    case 'caller_hungup':
+    case 'callee_hungup':
+    case 'network_error':
+      return supplied;
+    case 'caller_cancelled':
+      return 'abandoned';
+    case 'user_declined':
+      return 'declined';
+    case 'user_hangup':
+      return is_caller_terminating ? 'caller_hungup' : 'callee_hungup';
+    default:
+      return is_caller_terminating ? 'caller_hungup' : 'callee_hungup';
+  }
+};
+
 const handle_call_termination = async (
   payload: CallPayload,
   ws_event_type: WSMessageEventsType,
   user_id: string,
-  // reason: CallEndReasonsType
 ): Promise<ResultType> => {
   try {
     if (!payload.call_id) {
-      // console.error("call_id missing in call:decline payload")
       return {
         success: false,
         code: 400,
         message: "call_id missing in call termination payload"
       };
     }
-
-    // Get active call BEFORE declining (it will be removed after)
-    const active_call = CallService.get_user_active_call(user_id);
-    const reason =
-      active_call
-        ? active_call.answered_at
-          ? active_call.caller_id === user_id
-            ? "caller_hungup"
-            : "callee_hungup"
-          : (new Date().getTime() - active_call.started_at.getTime()) > CALL_TIMEOUT_MS
-            ? "timeout"
-            : active_call.caller_id === user_id
-              ? "abandoned"
-              : "declined"
-        : "network_error";
-
-    const result = await CallService.terminate_call(payload.call_id, user_id, reason);
 
     const call_decline_payload: CallPayload = {
       call_id: payload.call_id,
@@ -1141,21 +1156,76 @@ const handle_call_termination = async (
       timestamp: new Date(),
     };
 
-    if (result.success) {
-      // Determine caller and callee from active_call or payload
-      // const caller_id = active_call?.caller_id || payload.caller_id;
-      // const callee_id = active_call?.callee_id || payload.callee_id;
-      // const other_user = caller_id === user_id ? callee_id : caller_id;
-      // const is_caller_declining = user_id === caller_id;
+    // Branch on which backend tracks this call. The in-house WebRTC path
+    // populates `active_calls` from `handle_call_init`; Stream-coordinated
+    // calls bypass that entirely (Stream's coordinator owns the lifecycle).
+    // Without this split, Stream `call:terminate` events 404 inside
+    // `CallService.terminate_call` and the other party never gets the
+    // relay broadcast — leaving the callee ringing.
+    const is_legacy_call = active_calls.has(payload.call_id);
 
-      // Build the termination payload once
+    let reason: CallEndReasonsType;
+    let status: string | undefined;
+    let terminate_error: { code?: number; message?: string; error?: any } | null = null;
+
+    if (is_legacy_call) {
+      // ── In-house WebRTC backend ─────────────────────────────────────────
+      const active_call = CallService.get_user_active_call(user_id);
+      reason =
+        active_call
+          ? active_call.answered_at
+            ? active_call.caller_id === user_id
+              ? "caller_hungup"
+              : "callee_hungup"
+            : (new Date().getTime() - active_call.started_at.getTime()) > CALL_TIMEOUT_MS
+              ? "timeout"
+              : active_call.caller_id === user_id
+                ? "abandoned"
+                : "declined"
+          : "network_error";
+
+      const result = await CallService.terminate_call(payload.call_id, user_id, reason);
+      if (result.success) {
+        status = result.data?.status;
+      } else {
+        terminate_error = {
+          code: result.code,
+          message: result.message,
+          error: result.error,
+        };
+      }
+    } else {
+      // ── Stream-coordinated call ─────────────────────────────────────────
+      // No DB row to update — `call_model` is only populated by the WebRTC
+      // init path. We just need to gate on participation, then fan out
+      // the relay so the other party's client can clear UI state and
+      // (when offline) get an FCM nudge for the missed-call row.
+      if (user_id !== payload.caller_id && user_id !== payload.callee_id) {
+        terminate_error = {
+          code: 401,
+          message: "You are not a participant of this call",
+        };
+        reason = "network_error"; // unused — we fan out an error, not a terminate
+      } else {
+        const is_caller = user_id === payload.caller_id;
+        reason = map_call_terminate_reason(
+          payload.data?.reason as string | undefined,
+          is_caller,
+        );
+        // Mirror `CallService.terminate_call`'s status derivation: caller
+        // terminating an unanswered ring → ended (cancelled); callee → declined.
+        status = is_caller ? "ended" : "declined";
+      }
+    }
+
+    if (!terminate_error) {
       const terminate_message_payload = {
         ...call_decline_payload,
         data: {
           success: true,
           terminated_by: user_id,
-          status: result.data?.status,
-          reason: reason,
+          status,
+          reason,
         },
       };
 
@@ -1171,8 +1241,7 @@ const handle_call_termination = async (
               payload: terminate_message_payload,
             },
           });
-        }
-        else {
+        } else {
           await FCMService.send_notification({
             type: "call",
             fcm_mode: "data-only",
@@ -1180,7 +1249,7 @@ const handle_call_termination = async (
             ws_message: {
               type: ws_event_type,
               payload: terminate_message_payload,
-            }
+            },
           });
         }
       }
@@ -1193,11 +1262,7 @@ const handle_call_termination = async (
           type: "call:error",
           payload: {
             ...call_decline_payload,
-            error: {
-              code: result.code,
-              message: result.message,
-              error: result.error
-            },
+            error: terminate_error,
           },
         },
       });
