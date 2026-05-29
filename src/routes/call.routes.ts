@@ -332,20 +332,52 @@ const call_routes = new Elysia({ prefix: "/call" })
   })
 
   // Pre-flight gate for outgoing Stream calls. Mirrors WebRTC `initiate_call`:
-  // confirms callee exists and has `call_access` enabled. The actual call is
-  // created on the client via `call.getOrCreate({ ringing: true })`.
-  .post("/stream/precheck", async ({ set, body }) => {
+  // confirms callee exists, has `call_access`, and neither side is already
+  // engaged on another Stream call. The actual call is created on the client
+  // via `call.getOrCreate({ ringing: true })`.
+  //
+  // Response shape on failure carries a stable `code` so the client can
+  // pick the right UX (busy → telephony busy tone, call_access → toast,
+  // etc.) without parsing English strings.
+  .post("/stream/precheck", async ({ set, body, store }) => {
     try {
       const { callee_id } = body as { callee_id: string };
       if (!callee_id) {
         set.status = 400;
-        return { success: false, message: "callee_id is required" };
+        return { success: false, code: "bad_request", message: "callee_id is required" };
+      }
+
+      // Self-busy: caller already has an active call. Usually prevented by
+      // UI (chat row's call button is hidden while a call is up), but we
+      // gate here too in case the UI race-condition slips through (e.g.
+      // user taps call right as another incoming starts ringing).
+      const selfBusy = StreamCallService.isUserBusy(store.id);
+      if (selfBusy) {
+        set.status = 409;
+        return {
+          success: false,
+          code: "self_busy",
+          message: "You're already on a call",
+          data: { call_cid: selfBusy },
+        };
+      }
+
+      // Callee-busy: drives the telephony-style busy tone on the caller's
+      // device. 409 Conflict is the closest HTTP analogue.
+      const calleeBusy = StreamCallService.isUserBusy(callee_id);
+      if (calleeBusy) {
+        set.status = 409;
+        return {
+          success: false,
+          code: "busy",
+          message: "Recipient is on another call",
+        };
       }
 
       const result = await StreamCallService.assertCalleeReachable(callee_id);
       if (!result.ok) {
         set.status = result.code;
-        return { success: false, message: result.message };
+        return { success: false, code: "unreachable", message: result.message };
       }
 
       set.status = 200;
@@ -353,7 +385,7 @@ const call_routes = new Elysia({ prefix: "/call" })
     } catch (err) {
       console.error('[CALL ROUTES] Stream precheck error:', err);
       set.status = 500;
-      return { success: false, message: "Internal server error" };
+      return { success: false, code: "server_error", message: "Internal server error" };
     }
   }, {
     body: t.Object({ callee_id: t.String() }),

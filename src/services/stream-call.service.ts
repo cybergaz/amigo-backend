@@ -29,6 +29,49 @@ const STREAM_WEBHOOK_SECRET = process.env.STREAM_WEBHOOK_SECRET || '';
 const STREAM_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7;
 
 export class StreamCallService {
+  /**
+   * In-memory busy registry: `userId → cid` of the call the user is
+   * currently engaged in (ringing / answered / connected). Populated from
+   * the Stream webhook handler — `call.ring` marks both caller and callee
+   * busy, terminal events clear them. Read by [assertCalleeReachable] /
+   * [isUserBusy] to gate new outgoing calls.
+   *
+   * Trade-offs:
+   *  - Process-local. If the backend has multiple instances behind a load
+   *    balancer, the registry won't be consistent across them. For
+   *    single-node deployments (current setup) this is fine; if that
+   *    changes, promote to Redis with the same set/clear semantics.
+   *  - Webhook-driven. There's a window between `getOrCreate({ringing:true})`
+   *    on the client and the `call.ring` webhook arriving where a second
+   *    call could slip through. Mitigated by the client-side auto-reject
+   *    safety net (StreamCallService.dart subscribes to incoming calls and
+   *    rejects with CallRejectReason.busy() if it already has an active
+   *    call).
+   */
+  private static busyByUser = new Map<string, string>();
+
+  static markUserBusy(userId: string, cid: string): void {
+    if (!userId || !cid) return;
+    this.busyByUser.set(userId, cid);
+    console.log(`[STREAM] busy+ user=${userId} cid=${cid}`);
+  }
+
+  /** Only clears if the user is busy on THIS specific cid — avoids
+   * races where a stale terminal event for an older call would otherwise
+   * unmark a newer in-progress one. */
+  static clearUserBusy(userId: string, cid: string): void {
+    if (!userId || !cid) return;
+    if (this.busyByUser.get(userId) === cid) {
+      this.busyByUser.delete(userId);
+      console.log(`[STREAM] busy- user=${userId} cid=${cid}`);
+    }
+  }
+
+  /** Returns the cid the user is currently engaged on, or null. */
+  static isUserBusy(userId: string): string | null {
+    if (!userId) return null;
+    return this.busyByUser.get(userId) ?? null;
+  }
 
   static isConfigured(): boolean {
     return Boolean(STREAM_API_KEY && STREAM_API_SECRET);
@@ -171,6 +214,11 @@ export class StreamCallService {
             status: 'ringing',
             startedAt,
           });
+          // Mark BOTH sides busy from the moment the ring starts — even an
+          // unanswered ring blocks a second call from the caller's side and
+          // displays "busy" to any third party who tries to dial the callee.
+          this.markUserBusy(createdById, cid);
+          this.markUserBusy(calleeId, cid);
           return true;
 
         case 'call.accepted':
@@ -182,6 +230,10 @@ export class StreamCallService {
             startedAt,
             answeredAt: new Date(event?.created_at ?? Date.now()),
           });
+          // Refresh both — accept may arrive before ring if the caller and
+          // callee come up out of order during a coordinator hiccup.
+          this.markUserBusy(createdById, cid);
+          this.markUserBusy(calleeId, cid);
           return true;
 
         case 'call.rejected':
@@ -198,6 +250,8 @@ export class StreamCallService {
           // didn't initiate the reject. We push to BOTH sides because the
           // event itself doesn't tell us which device was killed.
           await this.broadcastDismissCallFcm(cid, [createdById, calleeId]);
+          this.clearUserBusy(createdById, cid);
+          this.clearUserBusy(calleeId, cid);
           return true;
 
         case 'call.missed':
@@ -214,6 +268,8 @@ export class StreamCallService {
           // notification — Stream's own ring timeout (~30s) doesn't fire a
           // dismiss FCM on its own.
           await this.broadcastDismissCallFcm(cid, [calleeId]);
+          this.clearUserBusy(createdById, cid);
+          this.clearUserBusy(calleeId, cid);
           return true;
 
         case 'call.ended':
@@ -246,6 +302,8 @@ export class StreamCallService {
           // reported. We push to both ends so whichever side was killed
           // gets the dismiss too.
           await this.broadcastDismissCallFcm(cid, [createdById, calleeId]);
+          this.clearUserBusy(createdById, cid);
+          this.clearUserBusy(calleeId, cid);
           return true;
         }
 
