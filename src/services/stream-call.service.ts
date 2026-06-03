@@ -28,6 +28,20 @@ const STREAM_WEBHOOK_SECRET = process.env.STREAM_WEBHOOK_SECRET || '';
 // 7-day token TTL (long-lived; the SDK refreshes on demand via tokenLoader).
 const STREAM_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7;
 
+/** A short-lived ghost-call rejoin window held in memory. `waiter_id` is the
+ * party still in the call (G); `dropped_id` is the party that vanished (L) and
+ * may rejoin until `expires_at` (epoch ms). `peer_*` describe the waiter, for
+ * L's UI. `timer` is the expiry handle. */
+type RejoinWindow = {
+  cid: string;
+  waiter_id: string;
+  dropped_id: string;
+  peer_name?: string;
+  peer_pfp?: string;
+  expires_at: number;
+  timer: ReturnType<typeof setTimeout>;
+};
+
 export class StreamCallService {
   /**
    * In-memory busy registry: `userId → cid` of the call the user is
@@ -71,6 +85,69 @@ export class StreamCallService {
   static isUserBusy(userId: string): string | null {
     if (!userId) return null;
     return this.busyByUser.get(userId) ?? null;
+  }
+
+  /**
+   * Ghost-call recovery: short-lived "rejoin window" registry.
+   *
+   * When one party (the "waiter", G) is still in a call but the other (the
+   * "dropped" user, L) vanished without a clean terminate, G's client opens a
+   * 10s window via `call:rejoin:open`. We hold it here so that L — even if its
+   * app was killed and reopened within the window — can discover the call is
+   * still rejoinable (via WS push, FCM, or the GET /stream/rejoinable query)
+   * and tap to rejoin. The window is keyed by cid; an `onExpire` callback fires
+   * if neither side resolves it in time.
+   *
+   * Same single-node / in-memory trade-off as [busyByUser] above — promote to
+   * Redis (with TTL) if the backend goes multi-node.
+   */
+  private static rejoinByCid = new Map<string, RejoinWindow>();
+
+  /** Open (or replace) a rejoin window for `cid`. Arms an expiry timer that
+   * deletes the entry and invokes `onExpire` if it isn't resolved first. */
+  static openRejoinWindow(
+    w: Omit<RejoinWindow, 'timer'>,
+    onExpire: (expired: RejoinWindow) => void,
+  ): void {
+    if (!w.cid || !w.dropped_id) return;
+    const prior = this.rejoinByCid.get(w.cid);
+    if (prior) clearTimeout(prior.timer);
+    const ms = Math.max(0, w.expires_at - Date.now());
+    const timer = setTimeout(() => {
+      const cur = this.rejoinByCid.get(w.cid);
+      this.rejoinByCid.delete(w.cid);
+      console.log(`[STREAM] rejoin window EXPIRED cid=${w.cid} dropped=${w.dropped_id}`);
+      if (cur) onExpire(cur);
+    }, ms);
+    const full: RejoinWindow = { ...w, timer };
+    this.rejoinByCid.set(w.cid, full);
+    console.log(`[STREAM] rejoin window OPEN cid=${w.cid} waiter=${w.waiter_id} dropped=${w.dropped_id} ms=${ms}`);
+  }
+
+  /** Resolve (close) the rejoin window for `cid`, cancelling its expiry timer.
+   * Returns the window that was closed, or null if none was open. */
+  static resolveRejoinWindow(cid: string): RejoinWindow | null {
+    if (!cid) return null;
+    const w = this.rejoinByCid.get(cid);
+    if (!w) return null;
+    clearTimeout(w.timer);
+    this.rejoinByCid.delete(cid);
+    console.log(`[STREAM] rejoin window RESOLVED cid=${cid}`);
+    return w;
+  }
+
+  /** Find the newest live rejoin window where `userId` is the dropped party —
+   * used by GET /stream/rejoinable so a reopened app can hydrate its dot. */
+  static getRejoinFor(userId: string): RejoinWindow | null {
+    if (!userId) return null;
+    const now = Date.now();
+    let best: RejoinWindow | null = null;
+    for (const w of this.rejoinByCid.values()) {
+      if (w.dropped_id === userId && w.expires_at > now) {
+        if (!best || w.expires_at > best.expires_at) best = w;
+      }
+    }
+    return best;
   }
 
   static isConfigured(): boolean {

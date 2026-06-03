@@ -291,6 +291,35 @@ const call_routes = new Elysia({ prefix: "/call" })
     }
   })
 
+  // ---- Ghost-call recovery: is there a call I can rejoin right now? ----
+  // L's client hits this on app open / resume to hydrate the rejoin dot for
+  // the killed-then-reopened-within-the-window case (where the WS/FCM push may
+  // have been missed). Returns the newest live rejoin window where the caller
+  // is the dropped party, or null.
+  .get("/stream/rejoinable", async ({ set, store }) => {
+    try {
+      const w = StreamCallService.getRejoinFor(store.id);
+      set.status = 200;
+      return {
+        success: true,
+        data: w
+          ? {
+              cid: w.cid,
+              peer_id: w.waiter_id,
+              peer_name: w.peer_name ?? null,
+              peer_pfp: w.peer_pfp ?? null,
+              expires_at: new Date(w.expires_at).toISOString(),
+            }
+          : null,
+        message: w ? "Rejoinable call found" : "No rejoinable call",
+      };
+    } catch (error) {
+      console.error('[CALL ROUTES] Error getting rejoinable call:', error);
+      set.status = 500;
+      return { success: false, message: "Internal server error" };
+    }
+  })
+
   // ---- Stream Video credentials ----
   // Returns api key + a freshly minted user token. The client should call this
   // when it needs to (re)connect to Stream, and use it as the SDK tokenLoader.

@@ -336,6 +336,12 @@ const WS_MESSAGE_EVENTS_CONST = [
   // 'call:decline',
   // 'call:end',
   'call:error',
+  // Ghost-call recovery / rejoin window:
+  'call:rejoin:open',         // client -> server: a party dropped, open window
+  'call:rejoin:available',    // server -> dropped party: you can rejoin this cid
+  'call:rejoin:resolved',     // client -> server: window resolved (rejoined|ended)
+  'call:rejoin:expired',      // server -> dropped party: window closed, clear dot
+  'call:rejoin:peer_dropped', // server -> waiter: peer dropped, show "Reconnecting"
   'socket:health_check',
   'socket:ping',
   'socket:pong',

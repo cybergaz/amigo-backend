@@ -3,7 +3,7 @@ import { ElysiaWS } from "elysia/dist/ws";
 import { get_conversation_members, get_user_conversations } from "@/cache-management/conv.cache";
 import { socket_connections, handlePongResponse, polling_connections } from "./socket.server";
 import { is_allowed_event, store_pending_message } from "@/cache-management/polling.cache";
-import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_connection_status, handle_message_forward, handle_message_new, handle_conv_join, handle_conv_mark_read, handle_message_status_ack, } from "./socket.service";
+import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_call_rejoin_open, handle_call_rejoin_resolved, handle_connection_status, handle_message_forward, handle_message_new, handle_conv_join, handle_conv_mark_read, handle_message_status_ack, } from "./socket.service";
 import { pin_message, unpin_message } from "@/services/message.services";
 import { mark_message_delivered } from "@/services/message-status.service";
 import { batch_mark_status } from "@/cache-management/message.cache";
@@ -492,6 +492,32 @@ const socket_message_handler = async (
                   code: result.code || 500,
                   message: result.message || "Error terminating call",
                   error: result.error
+                },
+                ws_timestamp: new Date()
+              }
+            });
+          }
+          break;
+        }
+
+      // ----------------------------------------------------
+      case 'call:rejoin:open':
+      case 'call:rejoin:resolved':
+        // --------------------------------------------------
+        {
+          const result = message.type === 'call:rejoin:open'
+            ? await handle_call_rejoin_open(message.payload as CallPayload, user_id)
+            : await handle_call_rejoin_resolved(message.payload as CallPayload, user_id);
+          if (!result.success) {
+            await broadcast_message({
+              to: "users",
+              user_ids: [user_id],
+              message: {
+                type: "socket:error",
+                payload: {
+                  code: result.code || 500,
+                  message: result.message || `Error handling ${message.type}`,
+                  error: result.error,
                 },
                 ws_timestamp: new Date()
               }
