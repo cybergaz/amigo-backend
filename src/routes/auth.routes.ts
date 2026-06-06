@@ -454,6 +454,14 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       // Remove FCM token from all 3 tiers (LRU, Redis, DB)
       await remove_fcm_token(info.data.id);
 
+      // Invalidate the stored refresh token so this session can no longer be
+      // refreshed after logout (server-side session kill, not just clearing the
+      // client cookies). Otherwise the logged-out token stays valid until expiry.
+      await db
+        .update(user_model)
+        .set({ refresh_token: null })
+        .where(eq(user_model.id, info.data.id));
+
       // Update online status in DB
       // await db
       //   .update(user_model)

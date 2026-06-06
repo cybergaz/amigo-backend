@@ -21,18 +21,25 @@ const hash_password = async (password: string): Promise<string> => {
 
 
 const generate_jwt = (id: string, role: string, time: StringValue = "1d") => {
+  // TESTING OVERRIDE: set ACCESS_TOKEN_TTL (e.g. "60s") in .env to force short
+  // access tokens regardless of call site, so token-refresh can be tested
+  // without waiting days. Leave unset in production.
+  const ttl = (process.env.ACCESS_TOKEN_TTL as StringValue) || time;
   return jwt.sign({
     id,
     role,
   },
     process.env.ACCESS_KEY || "heymama", {
-    expiresIn: time,
+    expiresIn: ttl,
   });
 };
 
 const generate_refresh_jwt = (id: string, role: string, time: StringValue = "7d") => {
+  // TESTING OVERRIDE: set REFRESH_TOKEN_TTL (e.g. "2m") in .env to test the
+  // refresh-expiry/clean-logout path quickly. Leave unset in production.
+  const ttl = (process.env.REFRESH_TOKEN_TTL as StringValue) || time;
   return jwt.sign({ id, role }, process.env.ACCESS_KEY || "heymama", {
-    expiresIn: time,
+    expiresIn: ttl,
   });
 };
 
