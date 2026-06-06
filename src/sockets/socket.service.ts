@@ -27,6 +27,18 @@ import { batch_mark_status } from "@/cache-management/message.cache";
 
 const handle_connection_status = async (payload: ConnectionStatusPayload): Promise<ResultType> => {
   try {
+    // Record the reported foreground/background state on the live connection so
+    // broadcast_message can route a backgrounded-but-WS-connected user to BOTH
+    // the WS frame and FCM. The flag only matters while a WS exists; if the
+    // socket has already gone there is nothing to flag (the user is offline and
+    // already FCM-eligible). 'offline'/'online' both clear the flag — an
+    // explicit offline means "stop pushing to a live socket", and a truly gone
+    // socket is handled by the close/heartbeat path, not this handler.
+    const connection = socket_connections.get(payload.sender_id);
+    if (connection) {
+      connection.is_background = payload.status === "background";
+    }
+
     const connected_users = await get_user_peers(payload.sender_id);
     const message_payload: ConnectionStatusPayload = {
       sender_id: payload.sender_id,
@@ -595,17 +607,20 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
     //   last_msg_at: new Date()
     // });
 
-    // 6. Queue FCM for offline users. Muted recipients still get the FCM
-    //    (their app needs the message to land in local DB) but with a
-    //    silent flag so the app skips painting a local notification. A
-    //    single Redis ZRANGEBYSCORE per chat regardless of group size.
+    // 6. Queue FCM for offline AND backgrounded users. Backgrounded users keep
+    //    a live WS (so they also received the frame above), but the OS may have
+    //    frozen the socket, so a push is the reliable delivery path — the client
+    //    dedupes the WS/FCM overlap by message id. Muted recipients still get
+    //    the FCM (their app needs the message to land in local DB) but with a
+    //    silent flag so the app skips painting a local notification. offline and
+    //    background are disjoint (background ⊂ online), so no double-queue.
     const fcm_ws_message: WSMessage = {
       type: "message:new",
       payload: updated_message_payload,
       ws_timestamp: new Date()
     };
     const muted = await get_muted_user_ids(payload.conv_id);
-    for (const user_id of sent_result.offline) {
+    for (const user_id of [...sent_result.offline, ...sent_result.background]) {
       queue_message_fcm(user_id, fcm_ws_message, { silent: muted.has(user_id) });
     }
 

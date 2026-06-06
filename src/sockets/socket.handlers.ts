@@ -60,6 +60,12 @@ const broadcast_message = async (data: BroadcastData) => {
   const online_users_id: Set<string> = new Set<string>();
   const offline_users_id: Set<string> = new Set<string>();
   const polling_users_id: Set<string> = new Set<string>();
+  // Subset of online_users_id whose client has reported it is backgrounded.
+  // These users still receive the live WS frame (they remain in online_users_id
+  // so presence/unread behaviour is unchanged), but they are ALSO eligible for
+  // an FCM push. Only handle_message_new consumes this set — every other caller
+  // ignores it, so non-message events (typing, acks, ...) are never pushed.
+  const background_users_id: Set<string> = new Set<string>();
 
   // console.log("all ws connections:", socket_connections)
 
@@ -81,8 +87,14 @@ const broadcast_message = async (data: BroadcastData) => {
     if (ws_connection && ws_connection.ws.readyState === 1) {
       // User is online via WebSocket
       online_users_id.add(user_id);
+      // Backgrounded clients keep a live WS (so we still send the frame below),
+      // but the OS may have frozen the socket, so they ALSO need a push. Flag
+      // them so handle_message_new queues FCM in addition to the WS frame.
+      if (ws_connection.is_background) {
+        background_users_id.add(user_id);
+      }
       // if (data.conv_id && ws_connection.active_conv_id === data.conv_id) {
-      //   // User is active in the conversation 
+      //   // User is active in the conversation
       //   active_in_conv.add(user_id);
       // }
 
@@ -130,6 +142,7 @@ const broadcast_message = async (data: BroadcastData) => {
     online: Array.from(online_users_id),
     offline: Array.from(offline_users_id),
     polling: Array.from(polling_users_id),
+    background: Array.from(background_users_id),
     // active_in_conv: Array.from(active_in_conv),
   };
 };

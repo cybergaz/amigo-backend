@@ -148,10 +148,13 @@ const web_socket_server = new Elysia({
           || request.headers.get('x-real-ip')
           || 'unknown';
 
-        // Add to active socket connections with new tracking fields
+        // Add to active socket connections with new tracking fields.
+        // A fresh connection always starts foreground (is_background:false); a
+        // reconnect therefore clears any prior background flag automatically.
         socket_connections.set(user_id, {
           ws,
           missed_pings: 0,
+          is_background: false,
           // connection_status: "online",
           // transport_type: "ws",
           // connected_at: new Date(),

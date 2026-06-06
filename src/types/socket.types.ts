@@ -16,6 +16,10 @@ interface UserConnection {
   ws: ElysiaWS;
   missed_pings: number;
   active_conv_id?: string;
+  // True when the client has reported it is backgrounded. The WS stays
+  // registered (so live frames are still delivered while the OS allows it),
+  // but the user is ALSO eligible for FCM push so messages reliably arrive.
+  is_background?: boolean;
 }
 
 interface PollingConnection {
@@ -71,7 +75,7 @@ interface VitalWSMessage {
   ws_timestamp?: Date;
 }
 
-const CONNECTION_STATUS_CONST = ['online', 'offline', 'stale'] as const;
+const CONNECTION_STATUS_CONST = ['online', 'offline', 'background'] as const;
 type ConnectionStatusType = typeof CONNECTION_STATUS_CONST[number];
 
 type ConnectionStatusPayload = {
