@@ -205,6 +205,47 @@ const enrich_with_replied_to = async <
 };
 
 
+// Fetch full pinned-message objects for a batch of message ids in one query.
+// The chat-list payload ships these alongside each conversation so the client
+// can render the pinned pill directly — a fresh-login (or long-offline) client
+// has no other way to resolve a pin whose target predates its local sync
+// window. Shape mirrors get_conversation_history so the client parses it with
+// the same MessageModel path. LEFT JOIN on the sender: an old pin can outlive a
+// deleted account (sender_id set null) and we still want to show the message.
+const get_pinned_message_map = async (pinned_ids: string[]) => {
+  const result = new Map<string, unknown>();
+  if (pinned_ids.length === 0) return result;
+
+  const rows = await db
+    .select({
+      id: message_model.id,
+      conversation_id: message_model.chat_id,
+      sender_id: message_model.sender_id,
+      type: message_model.type,
+      body: message_model.body,
+      attachments: message_model.attachments,
+      replied_to: message_model.replied_to,
+      sent_at: message_model.sent_at,
+      created_at: message_model.created_at,
+      deleted_at: message_model.deleted_at,
+      sender_name: user_model.name,
+      sender_profile_pic: user_model.profile_pic,
+    })
+    .from(message_model)
+    .leftJoin(user_model, eq(user_model.id, message_model.sender_id))
+    .where(
+      and(
+        inArray(message_model.id, pinned_ids),
+        isNull(message_model.deleted_at),
+      )
+    );
+
+  for (const row of rows) {
+    result.set(row.id, row);
+  }
+  return result;
+};
+
 const get_chat_list = async (user_id: string, type: string) => {
   try {
     // ── Single query: my memberships → chats, with DM peer via self-join ──
@@ -239,6 +280,11 @@ const get_chat_list = async (user_id: string, type: string) => {
         lastMsgId: chat_model.last_msg_id,
         lastMsgAt: chat_model.last_msg_at,
         createrId: chat_model.creater_id,
+        // Which message is pinned in this chat (null = none). Shipped so a
+        // fresh-login client knows a pin exists; the full message rides along
+        // in `pinnedMessage` (see enrichment below) so it renders even when the
+        // pinned message predates the client's synced history window.
+        pinnedMsgId: chat_model.pinned_msg_id,
         // Disappearing-messages duration (null = off). Shipped on every
         // chat-list payload so a fresh-login client can hydrate its local DB
         // and the input-border / avatar-badge UI without needing a separate
@@ -289,9 +335,15 @@ const get_chat_list = async (user_id: string, type: string) => {
 
     // ── Enrich from Redis: last message + unread counts ──────────────────
     const chat_ids = chats.map(c => c.conversationId);
-    const [chat_metas, unread_counts] = await Promise.all([
+    const pinned_ids = [
+      ...new Set(
+        chats.map(c => c.pinnedMsgId).filter((id): id is string => !!id)
+      ),
+    ];
+    const [chat_metas, unread_counts, pinned_messages] = await Promise.all([
       get_chat_metas(chat_ids),
       get_all_unread(user_id),
+      get_pinned_message_map(pinned_ids),
     ]);
 
     const enriched = chats.map(chat => {
@@ -308,6 +360,12 @@ const get_chat_list = async (user_id: string, type: string) => {
         lastSeen: chat.type === "dm" ? chat.lastSeen : null,
         // Redis enrichment
         lastMessage: meta ?? null,
+        // Full pinned message (body, sender, attachments) so the client renders
+        // the pinned pill without resolving the id against its local store —
+        // which fails for any pin older than its synced message window.
+        pinnedMessage: chat.pinnedMsgId
+          ? pinned_messages.get(chat.pinnedMsgId) ?? null
+          : null,
         unreadCount: unread,
       };
     });
