@@ -33,7 +33,11 @@ const media_routes = new Elysia({ prefix: "/media" })
     {
       body: t.Object({
         file: t.File({
-          maxSize: 500 * 1024 * 1024, // 500MB max (will be validated per file type)
+          // Coarse backstop at the largest per-type service limit (docs,
+          // 110MB — see get_file_size_limit in s3.service.ts, which does
+          // the real per-type validation). Note t.File maxSize validates
+          // after the body is received; it does not abort the transfer.
+          maxSize: 110 * 1024 * 1024,
         }),
       }),
     }
@@ -132,7 +136,10 @@ const media_routes = new Elysia({ prefix: "/media" })
       body: t.Object({
         file: t.File({
           type: get_allowed_file_types(S3_FOLDERS.VIDEOS),
-          maxSize: 500 * 1024 * 1024, // 500MB
+          // Keep in sync with get_file_size_limit (s3.service.ts). Note
+          // t.File maxSize validates after the body is received — it is
+          // not a transfer abort.
+          maxSize: 100 * 1024 * 1024, // 100MB
         }),
       }),
     }
