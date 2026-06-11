@@ -2,6 +2,7 @@ import { authenticate_jwt } from "@/middleware";
 import { WSMessageSchema } from "@/types/socket.elysia-schema";
 import Elysia, { t } from "elysia";
 import { broadcast_message, get_ws_data, set_ws_data, socket_message_handler } from "./socket.handlers";
+import { handle_user_disconnected_midcall } from "./socket.service";
 import { ConnectionStatusPayload, PollingConnection, UserConnection, WSMessage } from "@/types/socket.types";
 import { update_user_details } from "@/services/user.services";
 // import { sync_missed_messages } from "@/services/chat.services";
@@ -249,8 +250,16 @@ const web_socket_server = new Elysia({
       if (user_id) {
         socket_connections.delete(user_id);
 
-        // Delay offline broadcast by x to handle brief reconnects (e.g. WS restart)
-        // Only mark offline if the user hasn't reconnected in that window
+        // CALLS — INSTANT, no debounce. If this user was in a CONNECTED call,
+        // open the 30s rejoin window and tell the peer ("Reconnecting…") right
+        // now. We deliberately do NOT wait out OFFLINE_STATUS_BROADCAST_DELAY_MS
+        // here: a debounce would stack on top of itself and delay the peer's
+        // "Reconnecting" by 8s+. The 30s rejoin window is the only timer that
+        // governs a mid-call drop. No-op if the user wasn't in a connected call.
+        await handle_user_disconnected_midcall(user_id);
+
+        // PRESENCE (non-call) — keep the reconnect-grace debounce so a brief WS
+        // restart doesn't flap the user's online/offline status to peers.
         setTimeout(async () => {
           // If user has reconnected, a new entry will be in socket_connections
           if (socket_connections.has(user_id)) {

@@ -64,10 +64,44 @@ export class StreamCallService {
    */
   private static busyByUser = new Map<string, string>();
 
+  /**
+   * Cids that have reached the CONNECTED (answered) state — set from the
+   * `call.accepted` webhook, cleared on any terminal webhook. The backend uses
+   * this to distinguish a mid-call drop (recoverable → open a rejoin window)
+   * from a still-ringing drop (a cancel/miss, handled by Stream's own events).
+   * Same single-node / in-memory trade-off as [busyByUser].
+   */
+  private static connectedCids = new Set<string>();
+
   static markUserBusy(userId: string, cid: string): void {
     if (!userId || !cid) return;
     this.busyByUser.set(userId, cid);
     console.log(`[STREAM] busy+ user=${userId} cid=${cid}`);
+  }
+
+  /**
+   * Record that [a] and [b] are now in a CONNECTED call [cid]. Driven by the
+   * app's `call:connected` WS event (sent on first media connect) — NOT by
+   * Stream webhooks — so the in-call pairing is known even when Stream's cloud
+   * can't reach this backend (e.g. a private-IP / hotspot dev server, where
+   * webhooks never arrive). This is what lets the socket-close handler
+   * self-open a rejoin window: it needs to know the user was in a connected
+   * call and who the peer is.
+   */
+  static markCallConnected(a: string, b: string, cid: string): void {
+    if (!cid) return;
+    if (a) this.busyByUser.set(a, cid);
+    if (b) this.busyByUser.set(b, cid);
+    this.connectedCids.add(cid);
+    console.log(`[STREAM] call CONNECTED cid=${cid} parties=${a},${b}`);
+  }
+
+  /** Drop a connected call's busy + connected state for the given parties.
+   * Driven by `call:terminate` (clean hangup) and rejoin-window expiry. */
+  static clearCall(cid: string, userIds: string[]): void {
+    if (!cid) return;
+    for (const u of userIds) this.clearUserBusy(u, cid);
+    this.connectedCids.delete(cid);
   }
 
   /** Only clears if the user is busy on THIS specific cid — avoids
@@ -124,6 +158,16 @@ export class StreamCallService {
     console.log(`[STREAM] rejoin window OPEN cid=${w.cid} waiter=${w.waiter_id} dropped=${w.dropped_id} ms=${ms}`);
   }
 
+  /** Resolve a rejoin window ONLY if `userId` is its dropped party — i.e. the
+   * dropped user came back (sent `call:connected` again on rejoin/reconnect).
+   * Returns the closed window (so the caller can notify both parties it ended
+   * with outcome 'rejoined'), or null if there was no such window. */
+  static resolveRejoinWindowIfDropped(cid: string, userId: string): RejoinWindow | null {
+    const w = this.rejoinByCid.get(cid);
+    if (!w || w.dropped_id !== userId) return null;
+    return this.resolveRejoinWindow(cid);
+  }
+
   /** Resolve (close) the rejoin window for `cid`, cancelling its expiry timer.
    * Returns the window that was closed, or null if none was open. */
   static resolveRejoinWindow(cid: string): RejoinWindow | null {
@@ -134,6 +178,36 @@ export class StreamCallService {
     this.rejoinByCid.delete(cid);
     console.log(`[STREAM] rejoin window RESOLVED cid=${cid}`);
     return w;
+  }
+
+  /** True if a live rejoin window already exists for `cid` with this dropped
+   * party — lets the disconnect self-open stand down if a client already
+   * opened the window (avoids a duplicate open + duplicate fan-out). */
+  static hasRejoinWindow(cid: string, droppedId: string): boolean {
+    const w = this.rejoinByCid.get(cid);
+    return !!w && w.dropped_id === droppedId && w.expires_at > Date.now();
+  }
+
+  /**
+   * If `userId` is currently in a CONNECTED (answered) call, return that call's
+   * cid and the peer's id. Used by the socket-close handler to self-open a
+   * rejoin window WITHOUT depending on the dying client flushing a WS frame.
+   * Returns null if the user is idle or the call is only ringing (not yet
+   * answered) — a ringing drop is a cancel/miss, not a recoverable drop.
+   *
+   * The peer is derived from [busyByUser]: both parties are marked busy on the
+   * same cid for the call's lifetime, so the other busy user on this cid is the
+   * peer.
+   */
+  static getConnectedCallPeer(userId: string): { cid: string; peerId: string } | null {
+    if (!userId) return null;
+    const cid = this.busyByUser.get(userId);
+    if (!cid) return null;
+    if (!this.connectedCids.has(cid)) return null; // ringing, not connected
+    for (const [uid, c] of this.busyByUser) {
+      if (c === cid && uid !== userId) return { cid, peerId: uid };
+    }
+    return null;
   }
 
   /** Find the newest live rejoin window where `userId` is the dropped party —
@@ -311,6 +385,9 @@ export class StreamCallService {
           // callee come up out of order during a coordinator hiccup.
           this.markUserBusy(createdById, cid);
           this.markUserBusy(calleeId, cid);
+          // The call is now live — a subsequent disconnect of either party is a
+          // recoverable mid-call drop, so a rejoin window may be opened.
+          this.connectedCids.add(cid);
           return true;
 
         case 'call.rejected':
@@ -329,6 +406,7 @@ export class StreamCallService {
           await this.broadcastDismissCallFcm(cid, [createdById, calleeId]);
           this.clearUserBusy(createdById, cid);
           this.clearUserBusy(calleeId, cid);
+          this.connectedCids.delete(cid);
           return true;
 
         case 'call.missed':
@@ -347,6 +425,7 @@ export class StreamCallService {
           await this.broadcastDismissCallFcm(cid, [calleeId]);
           this.clearUserBusy(createdById, cid);
           this.clearUserBusy(calleeId, cid);
+          this.connectedCids.delete(cid);
           return true;
 
         case 'call.ended':
@@ -381,6 +460,7 @@ export class StreamCallService {
           await this.broadcastDismissCallFcm(cid, [createdById, calleeId]);
           this.clearUserBusy(createdById, cid);
           this.clearUserBusy(calleeId, cid);
+          this.connectedCids.delete(cid);
           return true;
         }
 

@@ -340,6 +340,7 @@ const WS_MESSAGE_EVENTS_CONST = [
   // 'call:decline',
   // 'call:end',
   'call:error',
+  'call:connected',           // client -> server: call reached CONNECTED (records in-call pairing)
   // Ghost-call recovery / rejoin window:
   'call:rejoin:open',         // client -> server: a party dropped, open window
   'call:rejoin:available',    // server -> dropped party: you can rejoin this cid

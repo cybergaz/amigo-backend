@@ -1231,6 +1231,13 @@ const handle_call_termination = async (
         // Mirror `CallService.terminate_call`'s status derivation: caller
         // terminating an unanswered ring → ended (cancelled); callee → declined.
         status = is_caller ? "ended" : "declined";
+        // Clean hangup → drop the in-call pairing so a subsequent socket close
+        // (e.g. the hanger-upper then kills the app) does NOT spuriously open a
+        // rejoin window. Webhook-independent (driven by this WS event), so it
+        // works even where Stream webhooks can't reach this backend. Also close
+        // any in-flight rejoin window for this call.
+        StreamCallService.clearCall(payload.call_id, [payload.caller_id, payload.callee_id]);
+        StreamCallService.resolveRejoinWindow(payload.call_id);
       }
     }
 
@@ -1371,6 +1378,186 @@ const fan_out_to_user = async (
 };
 
 /**
+ * The app reports that a Stream call reached the CONNECTED state (first media
+ * frame). We record the in-call pairing (both parties busy on the cid +
+ * connected) so the socket-close handler can self-open a rejoin window on a
+ * mid-call drop — WITHOUT depending on Stream webhooks (which can't reach a
+ * private-IP backend). Both parties send this; it's idempotent.
+ * `payload.data.peer_id` is the other participant.
+ */
+const handle_call_connected = async (payload: CallPayload, user_id: string): Promise<ResultType> => {
+  try {
+    const cid = payload.call_id;
+    if (!cid) return { success: false, code: 400, message: "call_id missing in call:connected" };
+    if (user_id !== payload.caller_id && user_id !== payload.callee_id) {
+      return { success: false, code: 401, message: "Not a participant of this call" };
+    }
+    const peer = (payload.data?.peer_id as string | undefined)
+      ?? (user_id === payload.caller_id ? payload.callee_id : payload.caller_id);
+    StreamCallService.markCallConnected(user_id, peer, cid);
+    // If THIS user was the dropped party of an open rejoin window, their fresh
+    // `call:connected` means they came back (rejoined the call, or their WS
+    // reconnected while still in it) → resolve the window so it does NOT expire
+    // and terminate the (now healthy) call, and tell both sides "reconnected".
+    const w = StreamCallService.resolveRejoinWindowIfDropped(cid, user_id);
+    if (w) {
+      console.log(`[WS] rejoin window RESOLVED by call:connected cid=${cid} dropped=${user_id}`);
+      await notify_rejoin_ended(w, "ended", "rejoined");
+    }
+    return { success: true, code: 200, message: "call connected recorded" };
+  } catch (error) {
+    console.error("[WS] Error handling call:connected:", error);
+    return { success: false, code: 500, message: "Failed to handle call:connected", error: error as any };
+  }
+};
+
+/** Look up a user's display name + avatar for the rejoin payloads. */
+const get_user_display = async (userId: string): Promise<{ name?: string; pfp?: string }> => {
+  try {
+    const [u] = await db
+      .select({ name: user_model.name, profile_pic: user_model.profile_pic })
+      .from(user_model)
+      .where(eq(user_model.id, userId))
+      .limit(1);
+    return { name: u?.name ?? undefined, pfp: u?.profile_pic ?? undefined };
+  } catch (e) {
+    console.error("[WS] get_user_display failed:", e);
+    return {};
+  }
+};
+
+/**
+ * Push the two rejoin notifications when a window OPENS. The WAITER (G) is
+ * notified FIRST so its "Reconnecting…" banner appears promptly, then the
+ * DROPPED party (L) is told it can rejoin. Each send is isolated in its own
+ * catch so a slow/failed FCM to one party can never suppress the other (the
+ * previous code awaited L's FCM before G's push, so a slow L-FCM dropped G's
+ * banner). Both go through fan_out_to_user, which falls back to FCM if the
+ * target's WS is momentarily down — so a brief WS reconnect on G no longer
+ * silently swallows the banner.
+ */
+const notify_rejoin_open = async (args: {
+  cid: string;
+  caller_id: string;
+  callee_id: string;
+  waiter_id: string;
+  dropped_id: string;
+  peer_name?: string;
+  peer_pfp?: string;
+  expires_at: number;
+}): Promise<void> => {
+  const expiresIso = new Date(args.expires_at).toISOString();
+  // WAITER (G) — show "Reconnecting…". peer_* in data describe the DROPPED party.
+  await fan_out_to_user(args.waiter_id, "call:rejoin:peer_dropped", {
+    call_id: args.cid,
+    caller_id: args.caller_id,
+    callee_id: args.callee_id,
+    data: { peer_id: args.dropped_id, expires_at: expiresIso },
+    timestamp: new Date(),
+  }).catch((e) => console.error("[WS] rejoin peer_dropped fan-out failed:", e));
+  // DROPPED party (L) — can rejoin. peer_* in data describe the WAITER.
+  await fan_out_to_user(args.dropped_id, "call:rejoin:available", {
+    call_id: args.cid,
+    caller_id: args.caller_id,
+    callee_id: args.callee_id,
+    data: {
+      peer_id: args.waiter_id,
+      peer_name: args.peer_name,
+      peer_pfp: args.peer_pfp,
+      expires_at: expiresIso,
+    },
+    timestamp: new Date(),
+  }).catch((e) => console.error("[WS] rejoin available fan-out failed:", e));
+};
+
+/**
+ * Push the close notification when a window ENDS (expired or resolved). Tells
+ * BOTH the dropped party (clear its rejoin dot) AND the waiter (clear its
+ * "Reconnecting…" banner from a server signal, not only its local timer).
+ */
+const notify_rejoin_ended = async (
+  w: { cid: string; dropped_id: string; waiter_id: string },
+  reason: string,
+  outcome?: string,
+): Promise<void> => {
+  const mk = (role: string) => ({
+    call_id: w.cid,
+    caller_id: w.dropped_id,
+    callee_id: w.waiter_id,
+    data: { reason, outcome, role },
+    timestamp: new Date(),
+  });
+  await fan_out_to_user(w.dropped_id, "call:rejoin:expired", mk("dropped")).catch(() => {});
+  await fan_out_to_user(w.waiter_id, "call:rejoin:expired", mk("waiter")).catch(() => {});
+};
+
+/**
+ * The 30s window elapsed with no rejoin → the SERVER terminates the call for
+ * BOTH parties. Sends `call:terminate` to each (the still-connected waiter G
+ * tears down its call screen via `_handleAmigoTerminate`; the dropped party L
+ * cleans up any stale state) and `call:rejoin:expired` (clears L's rejoin dot).
+ * Webhook-independent — everyone is informed and cleanup runs for both, as the
+ * single authoritative end-of-window action.
+ */
+const terminate_rejoin_window = async (w: { cid: string; dropped_id: string; waiter_id: string }): Promise<void> => {
+  StreamCallService.clearCall(w.cid, [w.dropped_id, w.waiter_id]);
+  const terminate = (): CallPayload => ({
+    call_id: w.cid,
+    caller_id: w.dropped_id,
+    callee_id: w.waiter_id,
+    data: { success: true, terminated_by: "server", status: "ended", reason: "rejoin_timeout" },
+    timestamp: new Date(),
+  });
+  await fan_out_to_user(w.waiter_id, "call:terminate", terminate()).catch(() => {});
+  await fan_out_to_user(w.dropped_id, "call:terminate", terminate()).catch(() => {});
+  // Also clear L's rejoin dot (in case L is sitting on the call-logs screen).
+  await notify_rejoin_ended(w, "expired");
+  console.log(`[WS] rejoin window TERMINATED (30s elapsed) cid=${w.cid} both=${w.dropped_id},${w.waiter_id}`);
+};
+
+/**
+ * Server-authoritative mid-call drop recovery. Called from the WS close handler
+ * when a user's socket goes away. If that user was in a CONNECTED call, the
+ * backend ITSELF opens the rejoin window and notifies both parties — with NO
+ * dependency on the dying client flushing a `call:rejoin:open` frame (which it
+ * usually can't before the OS reaps the process). This is the primary, reliable
+ * trigger; the client's leaver-open is now only a best-effort fast path.
+ */
+const handle_user_disconnected_midcall = async (user_id: string): Promise<void> => {
+  try {
+    const info = StreamCallService.getConnectedCallPeer(user_id);
+    if (!info) return; // idle or still-ringing → not a recoverable mid-call drop
+    const { cid, peerId } = info;
+    // A client may already have opened the window for this exact drop — don't
+    // double-open / double-fan.
+    if (StreamCallService.hasRejoinWindow(cid, user_id)) {
+      console.log(`[WS] midcall-drop: window already open cid=${cid} dropped=${user_id}`);
+      return;
+    }
+    const waiter = await get_user_display(peerId); // peer_* describe the waiter (G)
+    const window_ms = 30000;
+    const expires_at = Date.now() + window_ms;
+    StreamCallService.openRejoinWindow(
+      { cid, waiter_id: peerId, dropped_id: user_id, peer_name: waiter.name, peer_pfp: waiter.pfp, expires_at },
+      (expired) => void terminate_rejoin_window(expired),
+    );
+    console.log(`[WS] midcall-drop SELF-OPEN cid=${cid} dropped=${user_id} waiter=${peerId}`);
+    await notify_rejoin_open({
+      cid,
+      caller_id: user_id,
+      callee_id: peerId,
+      waiter_id: peerId,
+      dropped_id: user_id,
+      peer_name: waiter.name,
+      peer_pfp: waiter.pfp,
+      expires_at,
+    });
+  } catch (error) {
+    console.error("[WS] handle_user_disconnected_midcall error:", error);
+  }
+};
+
+/**
  * Ghost-call recovery — open a short rejoin window so the DROPPED party can
  * rejoin a still-recoverable call, and tell them (via WS or FCM) it's
  * rejoinable until it expires. Two initiators:
@@ -1405,58 +1592,30 @@ const handle_call_rejoin_open = async (payload: CallPayload, user_id: string): P
     const peer_name = payload.data?.peer_name as string | undefined;
     const peer_pfp = payload.data?.peer_pfp as string | undefined;
 
+    // A client-driven open for a drop the backend already self-opened (or the
+    // other party already opened) is a duplicate — stand down rather than reset
+    // expires_at and re-fan duplicate pushes.
+    if (StreamCallService.hasRejoinWindow(cid, dropped_id)) {
+      return { success: true, code: 200, message: "rejoin window already open" };
+    }
+
     StreamCallService.openRejoinWindow(
       { cid, waiter_id, dropped_id, peer_name, peer_pfp, expires_at },
-      (expired) => {
-        // Window elapsed with no resolution → clear the dot AND defensively
-        // clear busy for both parties so a never-returning peer can't leave
-        // them stuck "busy" past the window (bounds the busy-stuck window).
-        StreamCallService.clearUserBusy(expired.dropped_id, expired.cid);
-        StreamCallService.clearUserBusy(expired.waiter_id, expired.cid);
-        void fan_out_to_user(expired.dropped_id, "call:rejoin:expired", {
-          call_id: expired.cid,
-          caller_id: payload.caller_id,
-          callee_id: payload.callee_id,
-          data: { reason: "expired" },
-          timestamp: new Date(),
-        });
-      },
+      (expired) => void terminate_rejoin_window(expired),
     );
 
-    // Tell the dropped party it can rejoin — peer_* describe the WAITER.
-    await fan_out_to_user(dropped_id, "call:rejoin:available", {
-      call_id: cid,
+    // Notify both parties (waiter first; each isolated; FCM fallback). See
+    // notify_rejoin_open for why this replaced the await-L-FCM-then-WS-only-G.
+    await notify_rejoin_open({
+      cid,
       caller_id: payload.caller_id,
       callee_id: payload.callee_id,
-      data: {
-        peer_id: waiter_id,
-        peer_name,
-        peer_pfp,
-        expires_at: new Date(expires_at).toISOString(),
-      },
-      timestamp: new Date(),
+      waiter_id,
+      dropped_id,
+      peer_name,
+      peer_pfp,
+      expires_at,
     });
-
-    // Tell the still-connected WAITER to show "Reconnecting…" promptly — this
-    // doesn't depend on the SFU's (slow/unreliable) participant-left event
-    // reaching them. WS-only (if they're offline they aren't waiting anyway).
-    if (is_user_online(waiter_id)) {
-      await broadcast_message({
-        to: "users",
-        user_ids: [waiter_id],
-        message: {
-          type: "call:rejoin:peer_dropped",
-          payload: {
-            call_id: cid,
-            caller_id: payload.caller_id,
-            callee_id: payload.callee_id,
-            // peer_* here describe the DROPPED party (who the waiter is waiting on)
-            data: { peer_id: dropped_id, expires_at: new Date(expires_at).toISOString() },
-            timestamp: new Date(),
-          },
-        },
-      });
-    }
 
     return { success: true, code: 200, message: "rejoin window opened" };
   } catch (error) {
@@ -1478,13 +1637,10 @@ const handle_call_rejoin_resolved = async (payload: CallPayload, user_id: string
     }
     const w = StreamCallService.resolveRejoinWindow(cid);
     if (w) {
-      await fan_out_to_user(w.dropped_id, "call:rejoin:expired", {
-        call_id: cid,
-        caller_id: payload.caller_id,
-        callee_id: payload.callee_id,
-        data: { reason: "ended", outcome: payload.data?.outcome },
-        timestamp: new Date(),
-      });
+      // Notify BOTH: the dropped party clears its rejoin dot; the waiter clears
+      // its "Reconnecting…" banner (e.g. if its local SFU return-detection
+      // didn't fire). outcome distinguishes rejoined vs ended.
+      await notify_rejoin_ended(w, "ended", payload.data?.outcome as string | undefined);
     }
     return { success: true, code: 200, message: "rejoin window resolved" };
   } catch (error) {
@@ -1505,6 +1661,8 @@ export {
   handle_call_accept,
   handle_call_termination,
   handle_call_hold,
+  handle_call_connected,
   handle_call_rejoin_open,
   handle_call_rejoin_resolved,
+  handle_user_disconnected_midcall,
 };
