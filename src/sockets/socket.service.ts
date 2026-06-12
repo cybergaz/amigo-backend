@@ -464,6 +464,10 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       ...payload,
       id: store_msg_result.new_id ?? payload.id, // update message ID if it was changed during retry
       replied_to_message,
+      // Broadcast the stored sent_at, not the client claim — store_message
+      // clamps skewed client clocks to server time, and recipients must see
+      // the same value the DB holds.
+      sent_at: store_msg_result.data?.sent_at ?? payload.sent_at,
       // Surface the server-stamped expires_at (null when chat has disappearing
       // off) so recipients can filter expired-but-not-yet-deleted messages in
       // the view layer. Server sweeper remains the authoritative deleter.
@@ -498,6 +502,9 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       conv_id: payload.conv_id,
       is_sent: true,
       new_id: store_msg_result.new_id,
+      // Canonical stored sent_at — lets a sender with a skewed clock correct
+      // its local copy to what the server persisted and recipients received.
+      sent_at: store_msg_result.data?.sent_at ?? undefined,
       // delivered_to: sent_result.online,
       // read_by: sent_result.active_in_conv,
     };
@@ -526,7 +533,10 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
         body: payload.body ?? "",
         type: payload.msg_type,
         sender_id: payload.sender_id,
+        // Prefer the stored (clock-clamped) sent_at over the raw client claim.
         sent_at: (() => {
+          const stored = store_msg_result.data?.sent_at;
+          if (stored instanceof Date) return stored.toISOString();
           // WS wire sends sent_at as an ISO string, but the type claims Date.
           // Handle both safely without relying on TS's narrowing.
           const raw = payload.sent_at as unknown;

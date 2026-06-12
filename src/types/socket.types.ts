@@ -122,6 +122,10 @@ type MessageSentAckPayload = {
   is_sent: boolean;
   error_code?: number;
   new_id?: string;  // In case of message ID change due to retry or edit
+  // Canonical server-stored sent_at (client value clamped to server time).
+  // The sender applies it to its local row so its display matches what
+  // recipients see when the device clock was skewed.
+  sent_at?: Date;
 };
 
 type MessageStatusAckPayload = {

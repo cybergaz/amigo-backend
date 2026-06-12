@@ -17,7 +17,7 @@ const media_routes = new Elysia({ prefix: "/media" })
       const state_result = app_middleware({ cookie, headers });
 
       set.status = state_result.code;
-      if (!state_result.data) return state_result
+      if (!state_result.data) return state_result;
 
       store.id = state_result.data.id;
       store.role = state_result.data.role;
@@ -34,10 +34,10 @@ const media_routes = new Elysia({ prefix: "/media" })
       body: t.Object({
         file: t.File({
           // Coarse backstop at the largest per-type service limit (docs,
-          // 110MB — see get_file_size_limit in s3.service.ts, which does
+          // 1GB — see get_file_size_limit in s3.service.ts, which does
           // the real per-type validation). Note t.File maxSize validates
           // after the body is received; it does not abort the transfer.
-          maxSize: 110 * 1024 * 1024,
+          maxSize: 500 * 1024 * 1024,
         }),
       }),
     }
@@ -239,6 +239,6 @@ const media_routes = new Elysia({ prefix: "/media" })
         message: "Internal server error",
       };
     }
-  })
+  });
 
 export default media_routes;

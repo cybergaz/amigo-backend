@@ -75,7 +75,7 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
       updated_status = (await db
         .update(message_info_model)
         .set({
-          read_at: msg_status.delivered_at,
+          read_at: msg_status.read_at,
         }).where(
           and(
             eq(message_info_model.message_id, msg_status.message_id),

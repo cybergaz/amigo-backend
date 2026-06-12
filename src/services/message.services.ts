@@ -84,7 +84,18 @@ const store_message = async (payload: ChatMessagePayload, custom_msg_id?: string
     // wire is the client-stamped time; we add the chat's configured duration
     // to keep expiry deterministic per-message even if the setting changes
     // mid-conversation. duration null = no expiry stamped.
-    const sent_at_date = new Date(payload.sent_at);
+    //
+    // Client clocks can be skewed (users with a fast device clock were
+    // producing sent_at minutes in the future, shown verbatim to recipients).
+    // Server time is the authority for the upper bound: never store a future
+    // or unparseable sent_at. Past values are kept — offline-queued messages
+    // legitimately carry an older client stamp.
+    const now = new Date();
+    const client_sent_at = new Date(payload.sent_at);
+    const sent_at_date =
+      Number.isNaN(client_sent_at.getTime()) || client_sent_at > now
+        ? now
+        : client_sent_at;
     const duration_sec = await resolve_disappearing_after_sec(payload.conv_id);
     const expires_at: Date | null = duration_sec != null
       ? new Date(sent_at_date.getTime() + duration_sec * 1000)
