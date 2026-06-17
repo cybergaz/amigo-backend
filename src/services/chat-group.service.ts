@@ -13,7 +13,8 @@ import { broadcast_message } from "@/sockets/socket.handlers";
 import { NewConversationPayload, MembersType } from "@/types/socket.types";
 import { get_user_details } from "./user.services";
 import { broadcast_conversation_action } from "./chat.services";
-import { add_members, remove_member as cache_remove_member } from "@/cache-management/conv.cache";
+import { add_member, add_members, remove_member as cache_remove_member } from "@/cache-management/conv.cache";
+import { compute_group_caps, load_group_actor_context } from "./group-caps";
 import {
   upload_image_to_s3,
   delete_image_from_s3,
@@ -31,6 +32,7 @@ const is_chat_admin = async (chat_id: string, user_id: string) => {
         eq(chat_member_model.chat_id, chat_id),
         eq(chat_member_model.user_id, user_id),
         isNull(chat_member_model.removed_at),
+        eq(chat_member_model.status, "active"),
       )
     )
     .limit(1);
@@ -48,6 +50,7 @@ const create_group = async (
       .insert(chat_model)
       .values({
         creater_id,
+        owner_id: creater_id,
         type: "group",
         title,
       })
@@ -133,6 +136,9 @@ const get_group_info = async (conversation_id: string) => {
         title: chat_model.title,
         profile_pic: chat_model.profile_pic,
         lastMessageAt: chat_model.last_msg_at,
+        // Current owner — the client renders the "Owner" badge and gates
+        // delete/transfer off this, not creater_id.
+        ownerId: chat_model.owner_id,
 
         createrId: user_model.id,
         createrName: user_model.name,
@@ -178,7 +184,10 @@ const get_group_info = async (conversation_id: string) => {
       .where(
         and(
           eq(chat_member_model.chat_id, conversation_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          // Only active members appear in the roster; left/pending users are
+          // shells and must not show up in the group's member list.
+          eq(chat_member_model.status, "active")
         )
       )
       .orderBy(asc(chat_member_model.joined_at));
@@ -271,7 +280,8 @@ const get_group_members = async (conversation_id: string) => {
       .where(
         and(
           eq(chat_member_model.chat_id, conversation_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
         )
       );
 
@@ -315,14 +325,16 @@ const add_new_member = async (
       };
     }
 
-    // 2. Look up existing rows, distinguishing ACTIVE (removed_at IS NULL)
-    //    from previously-REMOVED (removed_at IS NOT NULL). Revived members
-    //    need an UPDATE to clear removed_at and reset joined_at/role, not
-    //    just a no-op skip.
+    // 2. Look up existing rows, distinguishing ACTIVE (removed_at IS NULL AND
+    //    status='active') from INACTIVE — either a hidden DM row (removed_at
+    //    set) or a group row whose member left / was kicked / has a pending
+    //    request (status != 'active', removed_at still NULL). Inactive rows
+    //    need an UPDATE to (re)activate, not a no-op skip.
     const existingRows = await db
       .select({
         user_id: chat_member_model.user_id,
         removed_at: chat_member_model.removed_at,
+        status: chat_member_model.status,
       })
       .from(chat_member_model)
       .where(
@@ -333,10 +345,10 @@ const add_new_member = async (
       );
 
     const activeIds: string[] = existingRows
-      .filter((r) => r.removed_at === null && r.user_id !== null)
+      .filter((r) => r.removed_at === null && r.status === "active" && r.user_id !== null)
       .map((r) => r.user_id as string);
     const removedIds: string[] = existingRows
-      .filter((r) => r.removed_at !== null && r.user_id !== null)
+      .filter((r) => !(r.removed_at === null && r.status === "active") && r.user_id !== null)
       .map((r) => r.user_id as string);
     const brandNewIds: string[] = validUserIds.filter(
       (id) => !activeIds.includes(id) && !removedIds.includes(id),
@@ -361,13 +373,16 @@ const add_new_member = async (
         .returning();
     }
 
-    // 4b. Revive removed rows: clear removed_at, reset joined_at & role,
-    //     clear any stale cursor fields so the user starts fresh.
+    // 4b. Revive inactive rows: clear removed_at, flip status back to active,
+    //     reset joined_at & role, clear any stale cursor fields so the user
+    //     starts fresh. Covers both hidden DMs and left/kicked/pending group
+    //     members being (re-)added by an admin.
     if (removedIds.length > 0) {
       const revived = await db
         .update(chat_member_model)
         .set({
           removed_at: null,
+          status: "active",
           joined_at: new Date(),
           role,
           last_read_msg_id: null,
@@ -519,20 +534,26 @@ const remove_member = async (
         and(
           eq(chat_member_model.chat_id, conversation_id),
           eq(chat_member_model.user_id, user_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
         )
       );
 
     const actor_details = actor_id ? await get_user_details(actor_id) : null;
 
+    // Kick == leave: we keep the row (removed_at stays NULL) and flip status to
+    // 'left' so the group survives in the kicked user's list as a read-only
+    // shell with an "ask to join" affordance. cache_remove_member drops them
+    // from the broadcast set so they immediately stop receiving messages.
     const result = await db
       .update(chat_member_model)
-      .set({ removed_at: new Date() })
+      .set({ status: "left" })
       .where(
         and(
           eq(chat_member_model.chat_id, conversation_id),
           eq(chat_member_model.user_id, user_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
         )
       )
       .returning();
@@ -608,7 +629,8 @@ const promote_to_admin = async (
         and(
           eq(chat_member_model.chat_id, conversation_id),
           eq(chat_member_model.user_id, user_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
         )
       )
       .returning();
@@ -678,7 +700,8 @@ const demote_to_member = async (
         and(
           eq(chat_member_model.chat_id, conversation_id),
           eq(chat_member_model.user_id, user_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
         )
       )
       .returning();
@@ -986,12 +1009,15 @@ const bulk_remove_members_from_groups = async (
     //    group silently fails to match — desired behaviour per spec.
     const removed_rows = await db
       .update(chat_member_model)
-      .set({ removed_at: new Date() })
+      // Kick == leave (see remove_member): flip active members to 'left',
+      // keeping the row so the group stays as a shell in their list.
+      .set({ status: "left" })
       .where(
         and(
           inArray(chat_member_model.chat_id, conversation_ids),
           inArray(chat_member_model.user_id, user_ids),
           isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active"),
         )
       )
       .returning({
@@ -1110,6 +1136,425 @@ const bulk_remove_members_from_groups = async (
   }
 };
 
+// Build a one-entry MembersType payload for a single user (used by the
+// member_left / owner_changed / join_request broadcasts).
+const member_payload_for = async (
+  user_id: string,
+  role: ChatRoleType = "member",
+): Promise<MembersType> => {
+  const details = await get_user_details(user_id);
+  return {
+    user_id,
+    user_name: details.data?.name || "Member",
+    user_pfp: details.data?.profile_pic || undefined,
+    role,
+    joined_at: new Date(),
+  };
+};
+
+// Leave a group. A plain member / staff / group-admin leaves freely and the
+// group stays in their list as a read-only shell. The OWNER must hand
+// ownership to another active member (new_owner_id) before leaving — we
+// transfer + promote the new owner, then mark the leaver 'left' in one flow.
+const leave_group = async (
+  conversation_id: string,
+  user_id: string,
+  new_owner_id?: string,
+) => {
+  try {
+    const ctx = await load_group_actor_context(conversation_id, user_id);
+    if (!ctx.exists || ctx.deletedAt) {
+      return { success: false, code: 404, message: "Group not found" };
+    }
+    if (ctx.type === "dm") {
+      return { success: false, code: 400, message: "Not a group conversation" };
+    }
+
+    const caps = compute_group_caps({
+      ownerId: ctx.ownerId,
+      myUserId: user_id,
+      myGroupRole: ctx.role,
+      myStatus: ctx.status,
+      globalRole: ctx.globalRole,
+    });
+
+    if (!caps.isActive) {
+      return { success: false, code: 400, message: "You are not an active member of this group" };
+    }
+
+    let new_owner_after: string | null = ctx.ownerId;
+
+    if (caps.isOwner) {
+      // Owner can't just leave — pick a successor first.
+      if (!new_owner_id) {
+        return {
+          success: false,
+          code: 400,
+          message: "Select a new owner before leaving the group",
+          data: { requires_new_owner: true },
+        };
+      }
+      if (new_owner_id === user_id) {
+        return { success: false, code: 400, message: "Choose a different member as the new owner" };
+      }
+      const [successor] = await db
+        .select({ user_id: chat_member_model.user_id })
+        .from(chat_member_model)
+        .where(
+          and(
+            eq(chat_member_model.chat_id, conversation_id),
+            eq(chat_member_model.user_id, new_owner_id),
+            isNull(chat_member_model.removed_at),
+            eq(chat_member_model.status, "active"),
+          ),
+        )
+        .limit(1);
+      if (!successor) {
+        return { success: false, code: 400, message: "New owner must be an active member of the group" };
+      }
+
+      // Transfer ownership + ensure the successor is an admin.
+      await db.update(chat_model).set({ owner_id: new_owner_id }).where(eq(chat_model.id, conversation_id));
+      await db
+        .update(chat_member_model)
+        .set({ role: "admin" })
+        .where(
+          and(
+            eq(chat_member_model.chat_id, conversation_id),
+            eq(chat_member_model.user_id, new_owner_id),
+            isNull(chat_member_model.removed_at),
+          ),
+        );
+      new_owner_after = new_owner_id;
+    }
+
+    // Mark the leaver 'left' (row kept so the group stays as a shell for them).
+    const [left_row] = await db
+      .update(chat_member_model)
+      .set({ status: "left" })
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active"),
+        ),
+      )
+      .returning();
+
+    if (!left_row) {
+      return { success: false, code: 404, message: "Membership not found" };
+    }
+
+    // Stop delivering broadcasts to the leaver.
+    await cache_remove_member(user_id, conversation_id);
+
+    const conv_type = (ctx.type as ChatType) || "group";
+
+    // owner_changed first so clients update ownership before the "X left" line.
+    if (caps.isOwner && new_owner_after) {
+      await broadcast_conversation_action({
+        conv_id: conversation_id,
+        conv_type,
+        action: "owner_changed",
+        members: [await member_payload_for(new_owner_after, "admin")],
+        actor_id: user_id,
+        owner_id: new_owner_after,
+      });
+    }
+
+    await broadcast_conversation_action({
+      conv_id: conversation_id,
+      conv_type,
+      action: "member_left",
+      members: [await member_payload_for(user_id, (ctx.role as ChatRoleType) || "member")],
+      actor_id: user_id,
+    });
+
+    return {
+      success: true,
+      code: 200,
+      message: "Left the group",
+      data: { conversation_id, owner_id: new_owner_after },
+    };
+  } catch (error) {
+    console.error("leave_group error:", error);
+    return { success: false, code: 500, message: "ERROR : leave_group" };
+  }
+};
+
+// Transfer group ownership to another active member without leaving. Owner /
+// master only. Promotes the new owner to admin.
+const transfer_ownership = async (
+  conversation_id: string,
+  actor_id: string,
+  new_owner_id: string,
+) => {
+  try {
+    const ctx = await load_group_actor_context(conversation_id, actor_id);
+    if (!ctx.exists || ctx.deletedAt) {
+      return { success: false, code: 404, message: "Group not found" };
+    }
+    if (ctx.type === "dm") {
+      return { success: false, code: 400, message: "Not a group conversation" };
+    }
+
+    const caps = compute_group_caps({
+      ownerId: ctx.ownerId,
+      myUserId: actor_id,
+      myGroupRole: ctx.role,
+      myStatus: ctx.status,
+      globalRole: ctx.globalRole,
+    });
+    if (!caps.canTransferOwnership) {
+      return { success: false, code: 403, message: "Only the owner can transfer ownership" };
+    }
+    if (new_owner_id === ctx.ownerId) {
+      return { success: false, code: 400, message: "That member is already the owner" };
+    }
+
+    const [successor] = await db
+      .select({ user_id: chat_member_model.user_id })
+      .from(chat_member_model)
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, new_owner_id),
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active"),
+        ),
+      )
+      .limit(1);
+    if (!successor) {
+      return { success: false, code: 400, message: "New owner must be an active member of the group" };
+    }
+
+    await db.update(chat_model).set({ owner_id: new_owner_id }).where(eq(chat_model.id, conversation_id));
+    await db
+      .update(chat_member_model)
+      .set({ role: "admin" })
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, new_owner_id),
+          isNull(chat_member_model.removed_at),
+        ),
+      );
+
+    await broadcast_conversation_action({
+      conv_id: conversation_id,
+      conv_type: (ctx.type as ChatType) || "group",
+      action: "owner_changed",
+      members: [await member_payload_for(new_owner_id, "admin")],
+      actor_id,
+      owner_id: new_owner_id,
+    });
+
+    return {
+      success: true,
+      code: 200,
+      message: "Ownership transferred",
+      data: { conversation_id, owner_id: new_owner_id },
+    };
+  } catch (error) {
+    console.error("transfer_ownership error:", error);
+    return { success: false, code: 500, message: "ERROR : transfer_ownership" };
+  }
+};
+
+// An ex-member (status 'left') asks to rejoin. Flips their row to 'pending'
+// and notifies the owner + app-level masters. Idempotent if already pending.
+const request_join = async (conversation_id: string, user_id: string) => {
+  try {
+    const ctx = await load_group_actor_context(conversation_id, user_id);
+    if (!ctx.exists || ctx.deletedAt) {
+      return { success: false, code: 404, message: "Group not found" };
+    }
+    if (ctx.type === "dm") {
+      return { success: false, code: 400, message: "Not a group conversation" };
+    }
+    if (ctx.status === "active") {
+      return { success: false, code: 400, message: "You are already a member of this group" };
+    }
+    if (ctx.status === "pending") {
+      return { success: true, code: 200, message: "Your request is already pending" };
+    }
+
+    if (ctx.status === "left") {
+      await db
+        .update(chat_member_model)
+        .set({ status: "pending", joined_at: new Date() })
+        .where(
+          and(
+            eq(chat_member_model.chat_id, conversation_id),
+            eq(chat_member_model.user_id, user_id),
+            isNull(chat_member_model.removed_at),
+          ),
+        );
+    } else {
+      // No prior membership row — supported for completeness though current
+      // flows only let ex-members request.
+      await db.insert(chat_member_model).values({
+        chat_id: conversation_id,
+        user_id,
+        role: "member",
+        status: "pending",
+      });
+    }
+
+    // Notify the owner + every app-level master so a "manage requests" badge
+    // can update live. The manage screen also re-fetches on open, so a missed
+    // WS here is non-fatal.
+    const masters = await db
+      .select({ id: user_model.id })
+      .from(user_model)
+      .where(inArray(user_model.role, ["admin", "sub_admin"]));
+    const recipients = Array.from(
+      new Set([...(ctx.ownerId ? [ctx.ownerId] : []), ...masters.map((m) => m.id)]),
+    ).filter((id) => id && id !== user_id) as string[];
+
+    if (recipients.length > 0) {
+      await broadcast_conversation_action({
+        conv_id: conversation_id,
+        conv_type: (ctx.type as ChatType) || "group",
+        action: "join_request:new",
+        members: [await member_payload_for(user_id)],
+        actor_id: user_id,
+        direct_user_ids: recipients,
+      });
+    }
+
+    return { success: true, code: 200, message: "Join request sent" };
+  } catch (error) {
+    console.error("request_join error:", error);
+    return { success: false, code: 500, message: "ERROR : request_join" };
+  }
+};
+
+// List pending join requests for a group. Owner / master only.
+const list_join_requests = async (conversation_id: string, actor_id: string) => {
+  try {
+    const ctx = await load_group_actor_context(conversation_id, actor_id);
+    if (!ctx.exists || ctx.deletedAt) {
+      return { success: false, code: 404, message: "Group not found" };
+    }
+    const caps = compute_group_caps({
+      ownerId: ctx.ownerId,
+      myUserId: actor_id,
+      myGroupRole: ctx.role,
+      myStatus: ctx.status,
+      globalRole: ctx.globalRole,
+    });
+    if (!caps.canManageJoinRequests) {
+      return { success: false, code: 403, message: "You can't manage join requests for this group" };
+    }
+
+    const requests = await db
+      .select({
+        user_id: user_model.id,
+        user_name: user_model.name,
+        user_pfp: user_model.profile_pic,
+        requested_at: chat_member_model.joined_at,
+      })
+      .from(chat_member_model)
+      .innerJoin(user_model, eq(user_model.id, chat_member_model.user_id))
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.status, "pending"),
+          isNull(chat_member_model.removed_at),
+        ),
+      )
+      .orderBy(asc(chat_member_model.joined_at));
+
+    return { success: true, code: 200, data: { requests } };
+  } catch (error) {
+    console.error("list_join_requests error:", error);
+    return { success: false, code: 500, message: "ERROR : list_join_requests" };
+  }
+};
+
+// Approve or reject a pending join request. Owner / master only. Approval
+// reuses add_new_member (revives the pending row to active + broadcasts
+// member_added / conversation:new). Rejection flips the row back to 'left'
+// and notifies the requester.
+const respond_join_request = async (
+  conversation_id: string,
+  actor_id: string,
+  target_user_id: string,
+  action: "approve" | "reject",
+) => {
+  try {
+    const ctx = await load_group_actor_context(conversation_id, actor_id);
+    if (!ctx.exists || ctx.deletedAt) {
+      return { success: false, code: 404, message: "Group not found" };
+    }
+    const caps = compute_group_caps({
+      ownerId: ctx.ownerId,
+      myUserId: actor_id,
+      myGroupRole: ctx.role,
+      myStatus: ctx.status,
+      globalRole: ctx.globalRole,
+    });
+    if (!caps.canManageJoinRequests) {
+      return { success: false, code: 403, message: "You can't manage join requests for this group" };
+    }
+
+    const [pending] = await db
+      .select({ id: chat_member_model.id })
+      .from(chat_member_model)
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, target_user_id),
+          eq(chat_member_model.status, "pending"),
+          isNull(chat_member_model.removed_at),
+        ),
+      )
+      .limit(1);
+    if (!pending) {
+      return { success: false, code: 404, message: "No pending request for this user" };
+    }
+
+    if (action === "approve") {
+      // add_new_member treats the pending row as inactive → revives it to
+      // active, re-hydrates the cache, and fires member_added + conversation:new.
+      const res = await add_new_member(conversation_id, [target_user_id], "member", actor_id);
+      if (!res.success) {
+        return { success: false, code: res.code || 500, message: res.message || "Failed to approve request" };
+      }
+      return { success: true, code: 200, message: "Join request approved" };
+    }
+
+    // Reject: back to the 'left' shell. Notify the requester directly.
+    await db
+      .update(chat_member_model)
+      .set({ status: "left" })
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, target_user_id),
+          isNull(chat_member_model.removed_at),
+        ),
+      );
+
+    await broadcast_conversation_action({
+      conv_id: conversation_id,
+      conv_type: (ctx.type as ChatType) || "group",
+      action: "join_request:resolved",
+      members: [await member_payload_for(target_user_id)],
+      actor_id,
+      resolution: "rejected",
+      direct_user_ids: [target_user_id],
+    });
+
+    return { success: true, code: 200, message: "Join request rejected" };
+  } catch (error) {
+    console.error("respond_join_request error:", error);
+    return { success: false, code: 500, message: "ERROR : respond_join_request" };
+  }
+};
+
 export {
   get_group_info,
   create_group,
@@ -1121,6 +1566,11 @@ export {
   update_group_profile_pic,
   get_group_admin_info,
   is_chat_admin,
+  leave_group,
+  transfer_ownership,
+  request_join,
+  list_join_requests,
+  respond_join_request,
   bulk_add_members_to_groups,
   bulk_remove_members_from_groups,
 };

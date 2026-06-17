@@ -235,6 +235,21 @@ type MiscPayload = {
 type ConversationActionType =
   | 'member_added'
   | 'member_removed'
+  // A member voluntarily left (members = the leaver). Broadcast to the
+  // conversation AND direct to the leaver's other devices so their client
+  // flips the chat to a read-only "ask to join" shell.
+  | 'member_left'
+  // Group ownership transferred (members = the new owner; owner_id carries the
+  // new owner's id). Sent when an owner hands off — including the implicit
+  // transfer an owner must do before leaving.
+  | 'owner_changed'
+  // A user requested to (re)join. Sent ONLY to the owner + masters (never the
+  // whole conversation). members = the requester.
+  | 'join_request:new'
+  // A pending request was approved/rejected (resolution field). Sent direct to
+  // the requester so their shell updates. Approval ALSO arrives as the usual
+  // member_added + conversation:new so the active chat is rebuilt.
+  | 'join_request:resolved'
   | 'member_promoted'
   | 'member_demoted'
   | 'chat_delete'
@@ -265,6 +280,10 @@ type ConversationActionPayload = {
   // profile_pic == null (cleared) and field-absent (title-only update) would
   // otherwise collapse to the same wire shape.
   profile_pic_changed?: boolean;
+  // owner_changed: the new owner's user id.
+  owner_id?: string | null;
+  // join_request:resolved: how the owner/master decided the request.
+  resolution?: 'approved' | 'rejected';
   // actor_name?: string;
   // actor_pfp?: string;
 };

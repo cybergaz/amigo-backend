@@ -3,12 +3,17 @@ import db from "@/config/db";
 import {
   compare_password,
   generate_jwt,
-  generate_refresh_jwt,
 } from "@/utils/general.utils";
 import { eq, desc } from "drizzle-orm";
 import { socket_connections } from "@/sockets/socket.server";
 import { MiscPayload } from "@/types/socket.types";
 import { create_user } from "./user.services";
+import {
+  create_session,
+  revoke_user_sessions,
+  rotate_refresh_token,
+  validate_session,
+} from "./session.service";
 
 const handle_login = async ({
   phone,
@@ -63,14 +68,16 @@ const handle_login = async ({
     }
 
     const access_token = generate_jwt(user.id, user.role || false, "7d");
-    const refresh_token = generate_refresh_jwt(user.id, user.role, "90d");
 
-    // Force logout all other devices before updating the refresh token
+    // Single-device: WS-kick the live socket, drop every other session, then mint a
+    // fresh session-bound refresh token. Clear the legacy column too, so any stale
+    // pre-sessions token for this user can't be replayed via the refresh fallback.
     await force_logout_other_devices(user.id);
-
+    await revoke_user_sessions(user.id);
+    const refresh_token = await create_session(user.id, user.role, "90d");
     await db
       .update(user_model)
-      .set({ refresh_token })
+      .set({ refresh_token: null })
       .where(eq(user_model.id, user.id));
 
     return {
@@ -100,124 +107,17 @@ const handle_login = async ({
   }
 };
 
-const handle_refresh_token = async (token: string) => {
-  try {
-    const [user] = await db
-      .select()
-      .from(user_model)
-      .where(eq(user_model.refresh_token, token))
-      .limit(1);
+// Web refresh: short-lived access (1d) + 7d refresh, grace-aware rotation.
+const handle_refresh_token = (token: string) =>
+  rotate_refresh_token(token, { access: "1d", refresh: "7d" });
 
-    if (!user) {
-      return {
-        success: false,
-        code: 404,
-        message: "Invalid refresh token",
-      };
-    }
+// Mobile refresh: 1d access + 30d refresh, grace-aware rotation.
+const handle_refresh_token_mobile = (token: string) =>
+  rotate_refresh_token(token, { access: "1d", refresh: "30d" });
 
-    const access_token = generate_jwt(user.id, user.role || false);
-    const refresh_token = generate_refresh_jwt(user.id, user.role);
-
-    await db
-      .update(user_model)
-      .set({ refresh_token })
-      .where(eq(user_model.id, user.id));
-
-    return {
-      success: true,
-      code: 200,
-      message: "Token refreshed successfully",
-      data: {
-        access_token,
-        refresh_token,
-      },
-    };
-  } catch (error: any) {
-    console.error("Refresh token error:", error);
-    return {
-      success: false,
-      code: 500,
-      message: "Internal server error during token refresh",
-    };
-  }
-};
-
-const handle_refresh_token_mobile = async (token: string) => {
-  try {
-    const [user] = await db
-      .select()
-      .from(user_model)
-      .where(eq(user_model.refresh_token, token))
-      .limit(1);
-
-    if (!user) {
-      return {
-        success: false,
-        code: 404,
-        message: "Invalid refresh token",
-      };
-    }
-
-    const access_token = generate_jwt(user.id, user.role || false, "1d");
-    const refresh_token = generate_refresh_jwt(user.id, user.role, "30d");
-
-    await db
-      .update(user_model)
-      .set({ refresh_token })
-      .where(eq(user_model.id, user.id));
-
-    return {
-      success: true,
-      code: 200,
-      message: "Token refreshed successfully",
-      data: {
-        access_token,
-        refresh_token,
-      },
-    };
-  } catch (error: any) {
-    console.error("Refresh token error:", error);
-    return {
-      success: false,
-      code: 500,
-      message: "Internal server error during token refresh",
-    };
-  }
-};
-
-// Validate if a refresh token is still valid (matches what's in the database)
-// This is a lightweight check to verify if the token was invalidated by a new login
-const validate_refresh_token = async (token: string) => {
-  try {
-    const [user] = await db
-      .select({ id: user_model.id })
-      .from(user_model)
-      .where(eq(user_model.refresh_token, token))
-      .limit(1);
-
-    if (!user) {
-      return {
-        success: false,
-        code: 404,
-        message: "Invalid refresh token",
-      };
-    }
-
-    return {
-      success: true,
-      code: 200,
-      message: "Refresh token is valid",
-    };
-  } catch (error: any) {
-    console.error("Token validation error:", error);
-    return {
-      success: false,
-      code: 500,
-      message: "Internal server error during token validation",
-    };
-  }
-};
+// Validate if a refresh token still maps to a live session (or a legacy column
+// token). Lightweight, read-only.
+const validate_refresh_token = (token: string) => validate_session(token);
 
 // Force logout all other devices when a user logs in on a new device
 // This sends a WebSocket message to all active connections for the user
@@ -443,13 +343,10 @@ const demo_login = async () => {
     }
 
     const access_token = generate_jwt(demo_user.id, demo_user.role || false, '7d');
-    const refresh_token = generate_refresh_jwt(demo_user.id, demo_user.role, '30d');
 
-    // Update refresh token without forcing logout of other demo sessions
-    await db
-      .update(user_model)
-      .set({ refresh_token })
-      .where(eq(user_model.id, demo_user.id));
+    // Demo accounts intentionally allow concurrent sessions — create a session
+    // without revoking the others.
+    const refresh_token = await create_session(demo_user.id, demo_user.role, '30d');
 
     return {
       success: true,

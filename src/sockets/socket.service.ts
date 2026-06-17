@@ -5,7 +5,7 @@ import { broadcast_message, is_user_online, } from "./socket.handlers";
 import { socket_connections } from "./socket.server";
 import { forward_messages, store_message_with_retry } from "@/services/message.services";
 import { batch_insert_message_status, mark_read_upto } from "@/services/message-status.service";
-import { add_members, get_conversation_members } from "@/cache-management/conv.cache";
+import { add_members, get_conversation_members, is_member } from "@/cache-management/conv.cache";
 import { update_chat_meta, batch_increment_unread, reset_unread } from "@/cache-management/chat-meta.cache";
 import db from "@/config/db";
 import { chat_model, chat_member_model } from "@/models/chat.model";
@@ -378,13 +378,55 @@ const revive_hidden_dm_members = async (conv_id: string, sender_id: string): Pro
 
 const handle_message_new = async (payload: ChatMessagePayload, user_name: string): Promise<ResultType> => {
   try {
+    // Send guard: only active members may post (so a left/kicked user can't keep
+    // sending into a group they no longer belong to). Active members ARE the
+    // conversation member set, which broadcast_message loads anyway — so the
+    // is_member fast-path reuses that load and adds NO DB round-trip on the hot
+    // path (an active member sending). A user is evicted from the set the instant
+    // they leave / are kicked (cache_remove_member), so is_member==true ⟹ active.
     //
-    // const ack_message_payload: ChatMessageAckPayload = {
-    //   id: payload.id,
-    //   conv_id: payload.conv_id,
-    //   sender_id: payload.sender_id,
-    //   delivered_at: new Date(),
-    // };
+    // Only a cache MISS pays for one indexed status lookup, covering the rare
+    // cases: a genuinely-removed member trying to post, OR a user re-sending into
+    // a DM they "deleted-for-me" (removed_at set but status still 'active') — the
+    // latter must be allowed so revive_hidden_dm_members below re-adds them, which
+    // is why we gate on status='active' here, not removed_at.
+    let sender_active = await is_member(payload.sender_id, payload.conv_id);
+    if (!sender_active) {
+      const [m] = await db
+        .select({ status: chat_member_model.status })
+        .from(chat_member_model)
+        .where(
+          and(
+            eq(chat_member_model.chat_id, payload.conv_id),
+            eq(chat_member_model.user_id, payload.sender_id),
+            eq(chat_member_model.status, "active"),
+          ),
+        )
+        .limit(1);
+      sender_active = !!m;
+    }
+    if (!sender_active) {
+      const rejected_ack: MessageSentAckPayload = {
+        msg_id: payload.id,
+        conv_id: payload.conv_id,
+        is_sent: false,
+        error_code: 403,
+      };
+      await broadcast_message({
+        to: "users",
+        user_ids: [payload.sender_id],
+        message: {
+          type: "message:sent:ack",
+          payload: rejected_ack,
+          ws_timestamp: new Date(),
+        },
+      });
+      return {
+        success: false,
+        code: 403,
+        message: "Not an active member of this conversation",
+      };
+    }
 
     // store the new message in DB
     const store_msg_result = await store_message_with_retry(payload, 5);

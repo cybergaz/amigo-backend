@@ -61,7 +61,8 @@ const verify_user_membership = async (conversation_id: string, user_id: string) 
       and(
         eq(chat_member_model.chat_id, conversation_id),
         eq(chat_member_model.user_id, user_id),
-        isNull(chat_member_model.removed_at)
+        isNull(chat_member_model.removed_at),
+        eq(chat_member_model.status, "active")
       )
     );
 
@@ -615,6 +616,18 @@ const get_starred_messages = async (user_id: string, conversation_id?: string) =
 // React/unreact to a message - stores per-user reaction in message_status table
 const react_to_message = async (request: ReactMessageRequest, user_id: string, user_name?: string) => {
   try {
+    // Only active members may react — a left/kicked member must not be able to
+    // post reactions into a group they no longer belong to (verify_user_membership
+    // requires removed_at IS NULL AND status='active', same as pin/unpin/send).
+    const membership = await verify_user_membership(request.conversation_id, user_id);
+    if (!membership) {
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
+
     // Verify the message exists
     const [message] = await db
       .select({ id: message_model.id, chat_id: message_model.chat_id })

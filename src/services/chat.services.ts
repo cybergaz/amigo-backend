@@ -15,17 +15,18 @@ import { broadcast_message } from "@/sockets/socket.handlers";
 import { ConversationActionPayload, DeleteMessagePayload, MembersType, WSMessage } from "@/types/socket.types";
 import FCMService from "./fcm.service";
 import { queue_message_fcm } from "./fcm-batch.service";
-import { get_conversation_members } from "@/cache-management/conv.cache";
+import { get_conversation_members, invalidate_conversation, invalidate_user_conversations } from "@/cache-management/conv.cache";
 import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
 import { get_chat_metas, get_all_unread } from "@/cache-management/chat-meta.cache";
 import { get_message_statuses_bulk } from "@/cache-management/message.cache";
 import { generate_unique_id } from "@/utils/general.utils";
 import { randomUUIDv7 } from "bun";
+import { compute_group_caps, load_group_actor_context } from "./group-caps";
 
 const build_conversation_action_message = (
   action: ConversationActionPayload["action"],
   members: MembersType[],
-  details?: { title?: string | null; profile_pic?: string | null; profile_pic_changed?: boolean },
+  details?: { title?: string | null; profile_pic?: string | null; profile_pic_changed?: boolean; resolution?: 'approved' | 'rejected' },
 ) => {
   const names = members.map((m) => m.user_name).filter(Boolean);
   const target = names.length ? names.join(", ") : "Member";
@@ -35,6 +36,16 @@ const build_conversation_action_message = (
       return `${target} added`;
     case "member_removed":
       return `${target} removed`;
+    case "member_left":
+      return `${target} left`;
+    case "owner_changed":
+      return `${target} is now the owner`;
+    case "join_request:new":
+      return `${target} requested to join`;
+    case "join_request:resolved":
+      return details?.resolution === "approved"
+        ? `${target}'s request was approved`
+        : `${target}'s request was declined`;
     case "member_promoted":
       return `${target} promoted to admin`;
     case "member_demoted":
@@ -73,6 +84,15 @@ const broadcast_conversation_action = async (data: {
   // True when the pfp actually changed (incl. cleared). Distinguishes "no
   // pfp change in this update" (undefined) from "cleared to null".
   profile_pic_changed?: boolean;
+  // owner_changed: the new owner's id.
+  owner_id?: string | null;
+  // join_request:resolved: the decision.
+  resolution?: 'approved' | 'rejected';
+  // When set, the event is delivered ONLY to these user ids (no conversation
+  // fan-out). Used for owner/master-only events (join_request:new) and
+  // requester-only events (join_request:resolved) that must not leak to the
+  // whole group.
+  direct_user_ids?: string[];
 }) => {
   // Member-action events require at least one member in the list (otherwise
   // there's nothing to announce). chat_details:update is the exception — it
@@ -93,6 +113,7 @@ const broadcast_conversation_action = async (data: {
       title: data.title,
       profile_pic: data.profile_pic,
       profile_pic_changed: data.profile_pic_changed,
+      resolution: data.resolution,
     }),
     action_at,
     ...(data.title !== undefined || data.action === "chat_delete"
@@ -105,7 +126,25 @@ const broadcast_conversation_action = async (data: {
         profile_pic_changed: true,
       }
       : {}),
+    ...(data.owner_id !== undefined ? { owner_id: data.owner_id } : {}),
+    ...(data.resolution !== undefined ? { resolution: data.resolution } : {}),
   };
+
+  // Targeted-only events (owner/master or requester notifications): deliver to
+  // the explicit recipient list and skip the conversation fan-out entirely so
+  // join-request activity never leaks to ordinary members.
+  if (data.direct_user_ids && data.direct_user_ids.length > 0) {
+    await broadcast_message({
+      to: "users",
+      user_ids: data.direct_user_ids,
+      message: {
+        type: "conversation:action",
+        payload,
+        ws_timestamp: action_at,
+      },
+    });
+    return;
+  }
 
   // For chat_delete the chat row is already gone, so the conversation member
   // cache lookup returns nothing → skip the conversation broadcast and rely
@@ -123,13 +162,14 @@ const broadcast_conversation_action = async (data: {
     });
   }
 
-  // For member_removed and chat_delete: the affected users are no longer in
-  // the conv member cache (or the cache is gone), so the conversation
-  // broadcast above either skips them or didn't run. Send the event direct
-  // to user IDs so their client can mark themselves as removed / purge the
-  // chat from local state.
+  // For member_removed / member_left / chat_delete: the affected users are no
+  // longer in the conv member cache (or the cache is gone), so the conversation
+  // broadcast above either skips them or didn't run. Send the event direct to
+  // their user IDs so their client can flip itself to a shell / purge the chat.
   if (
-    (data.action === "member_removed" || data.action === "chat_delete") &&
+    (data.action === "member_removed" ||
+      data.action === "member_left" ||
+      data.action === "chat_delete") &&
     data.members.length > 0
   ) {
     await broadcast_message({
@@ -280,6 +320,10 @@ const get_chat_list = async (user_id: string, type: string) => {
         lastMsgId: chat_model.last_msg_id,
         lastMsgAt: chat_model.last_msg_at,
         createrId: chat_model.creater_id,
+        // Current group owner (transferable). Null for DMs. The client persists
+        // this on the chat row to gate delete/leave/transfer and render the
+        // Owner badge without a separate group-info fetch.
+        ownerId: chat_model.owner_id,
         // Which message is pinned in this chat (null = none). Shipped so a
         // fresh-login client knows a pin exists; the full message rides along
         // in `pinnedMessage` (see enrichment below) so it renders even when the
@@ -292,6 +336,10 @@ const get_chat_list = async (user_id: string, type: string) => {
         disappearingAfterSec: chat_model.disappearing_after_sec,
 
         role: chat_member_model.role,
+        // Current user's membership status: 'active' | 'left' | 'pending'. For
+        // groups, left/pending rows still come back (their removed_at is NULL)
+        // so the chat shows as a read-only shell with an "ask to join" action.
+        status: chat_member_model.status,
         joinedAt: chat_member_model.joined_at,
         // For deleted DMs, expose the soft-delete timestamp so the UI can
         // show "deleted X ago". Null for active chats.
@@ -349,6 +397,13 @@ const get_chat_list = async (user_id: string, type: string) => {
     const enriched = chats.map(chat => {
       const meta = chat_metas.get(chat.conversationId);
       const unread = unread_counts.get(chat.conversationId) ?? 0;
+      // Shell membership (left/pending): the user no longer participates, so we
+      // must NOT leak any group activity that happened after they left. Freeze
+      // the row — no last message / pinned message / unread / advancing
+      // last_msg_id. Otherwise every chat-list refresh would re-deliver the
+      // group's current last message to a left/kicked member. The client keeps
+      // whatever it had locally before leaving (insertOrIgnore won't overwrite).
+      const is_active_member = chat.status === "active";
 
       return {
         ...chat,
@@ -358,15 +413,18 @@ const get_chat_list = async (user_id: string, type: string) => {
         userPhone: chat.type === "dm" ? chat.userPhone : null,
         userProfilePic: chat.type === "dm" ? chat.userProfilePic : null,
         lastSeen: chat.type === "dm" ? chat.lastSeen : null,
-        // Redis enrichment
-        lastMessage: meta ?? null,
+        // Don't advance a shell's last-message pointer to a post-leave message.
+        lastMsgId: is_active_member ? chat.lastMsgId : null,
+        pinnedMsgId: is_active_member ? chat.pinnedMsgId : null,
+        // Redis enrichment — withheld for shells (would leak post-leave content).
+        lastMessage: is_active_member ? (meta ?? null) : null,
         // Full pinned message (body, sender, attachments) so the client renders
         // the pinned pill without resolving the id against its local store —
         // which fails for any pin older than its synced message window.
-        pinnedMessage: chat.pinnedMsgId
+        pinnedMessage: is_active_member && chat.pinnedMsgId
           ? pinned_messages.get(chat.pinnedMsgId) ?? null
           : null,
-        unreadCount: unread,
+        unreadCount: is_active_member ? unread : 0,
       };
     });
 
@@ -456,24 +514,23 @@ const soft_delete_chat = async (conversation_id: string, user_id: string) => {
       };
     }
 
-    // Only an active admin of the group can soft-delete it.
-    const [requester] = await db
-      .select({ role: chat_member_model.role })
-      .from(chat_member_model)
-      .where(
-        and(
-          eq(chat_member_model.chat_id, conversation_id),
-          eq(chat_member_model.user_id, user_id),
-          isNull(chat_member_model.removed_at),
-        )
-      )
-      .limit(1);
+    // Only the group owner or an app-level master (admin / sub_admin) can
+    // delete the group. Group admins and ordinary members cannot — they leave
+    // instead. (This is a deliberate tightening from the old "any admin" rule.)
+    const actor_ctx = await load_group_actor_context(conversation_id, user_id);
+    const caps = compute_group_caps({
+      ownerId: actor_ctx.ownerId,
+      myUserId: user_id,
+      myGroupRole: actor_ctx.role,
+      myStatus: actor_ctx.status,
+      globalRole: actor_ctx.globalRole,
+    });
 
-    if (requester?.role !== "admin") {
+    if (!caps.canDelete) {
       return {
         success: false,
         code: 403,
-        message: "Only group admins can delete the group",
+        message: "Only the group owner can delete the group",
       };
     }
 
@@ -550,6 +607,29 @@ const soft_delete_chat = async (conversation_id: string, user_id: string) => {
         title: conversation.title,
       }).catch(err => console.error("[chat_delete] broadcast failed:", err));
     }
+
+    // Kick everyone: deactivate every membership + evict them from the conv and
+    // user-conversation caches. This neutralises the window between delete and
+    // each client processing chat_delete — the send guard now blocks (no active
+    // member rows + empty member set) and broadcasts stop fanning out, so a
+    // member who hasn't yet purged the chat locally can't keep posting into it.
+    // get-chat-list already hides deleted_at chats, so reconcile finishes the job.
+    await db
+      .update(chat_member_model)
+      .set({ status: "left" })
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          isNull(chat_member_model.removed_at),
+        ),
+      );
+    await invalidate_conversation(conversation_id);
+    await Promise.all(
+      members
+        .map((m) => m.user_id)
+        .filter((id): id is string => !!id)
+        .map((id) => invalidate_user_conversations(id)),
+    );
 
     return {
       success: true,
@@ -801,7 +881,7 @@ const delete_message_for_me = async (
   conversation_id: string
 ) => {
   try {
-    // Verify user is a member of the conversation
+    // Verify user is an active member of the conversation
     const membership = await db
       .select()
       .from(chat_member_model)
@@ -809,7 +889,8 @@ const delete_message_for_me = async (
         and(
           eq(chat_member_model.chat_id, conversation_id),
           eq(chat_member_model.user_id, user_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
         )
       )
       .limit(1);
@@ -956,6 +1037,7 @@ const get_conversation_history = async (
           eq(chat_member_model.chat_id, conversation_id),
           eq(chat_member_model.user_id, user_id),
           isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active"),
         )
       )
       .limit(1);
@@ -1072,7 +1154,7 @@ const get_message_statuses = async (
   limit: number = 1000
 ) => {
   try {
-    // First, verify user is a member of this conversation
+    // First, verify user is an active member of this conversation
     const [member] = await db
       .select({
         user_id: chat_member_model.user_id,
@@ -1082,7 +1164,8 @@ const get_message_statuses = async (
         and(
           eq(chat_member_model.chat_id, conversation_id),
           eq(chat_member_model.user_id, user_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
         )
       )
       .limit(1);
@@ -1321,7 +1404,8 @@ const get_messages_around = async (
       .where(
         and(
           eq(chat_member_model.chat_id, conversation_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
         )
       );
 
@@ -1489,6 +1573,7 @@ const get_chat_members = async (conversation_id: string, user_id: string) => {
           eq(chat_member_model.chat_id, conversation_id),
           eq(chat_member_model.user_id, user_id),
           isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active"),
         )
       )
       .limit(1);
@@ -1523,6 +1608,7 @@ const get_chat_members = async (conversation_id: string, user_id: string) => {
         and(
           eq(chat_member_model.chat_id, conversation_id),
           isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active"),
         )
       )
       .orderBy(asc(chat_member_model.joined_at));

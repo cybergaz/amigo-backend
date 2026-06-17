@@ -43,6 +43,20 @@
       "when": 1779201331689,
       "tag": "0005_open_speed",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1781528170291,
+      "tag": "0006_warm_skullbuster",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1781694193052,
+      "tag": "0007_mean_gunslinger",
+      "breakpoints": true
     }
   ]
 }

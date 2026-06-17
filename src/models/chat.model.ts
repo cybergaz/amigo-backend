@@ -1,12 +1,16 @@
-import { CHAT_TYPE_CONSTS, CHAT_ROLE_CONST } from "@/types/chat.types";
+import { CHAT_TYPE_CONSTS, CHAT_ROLE_CONST, CHAT_MEMBER_STATUS_CONST } from "@/types/chat.types";
 import { pgTable, bigint, varchar, timestamp, boolean, jsonb, integer, bigserial, uuid, index, uniqueIndex, text } from "drizzle-orm/pg-core";
 import { user_model } from "./user.model";
-import { desc, InferInsertModel, InferSelectModel, isNull } from "drizzle-orm";
+import { and, desc, eq, InferInsertModel, InferSelectModel, isNull } from "drizzle-orm";
 import { message_model } from "./message.model";
 
 const chat_model = pgTable("chats", {
   id: uuid().primaryKey().defaultRandom(),
   creater_id: uuid().references(() => user_model.id, { onDelete: 'set null' }),
+  // Current group owner. Backfilled from creater_id. creater_id is immutable
+  // ("who first made the group"); owner_id is transferable — an owner must hand
+  // ownership to another member before they can leave. Null for DMs.
+  owner_id: uuid().references(() => user_model.id, { onDelete: 'set null' }),
   type: varchar({ enum: CHAT_TYPE_CONSTS }).notNull(), // "dm", "group", "community_group"
   title: varchar({ length: 255 }),
   // S3 URL of the group avatar. Null for DMs (clients fall back to the peer's
@@ -32,6 +36,11 @@ const chat_member_model = pgTable("chat_members", {
   chat_id: uuid().references(() => chat_model.id, { onDelete: 'cascade' }).notNull(),
   user_id: uuid().references(() => user_model.id, { onDelete: 'set null' }),
   role: varchar({ enum: CHAT_ROLE_CONST }),
+  // Membership lifecycle. "active" rows (the default) are the only ones that
+  // can send/receive/read. "left" (voluntary leave or admin kick) and "pending"
+  // (join request awaiting approval) rows are KEPT with removed_at IS NULL so
+  // the chat stays in the user's list as a shell. See CHAT_MEMBER_STATUS_CONST.
+  status: varchar({ enum: CHAT_MEMBER_STATUS_CONST }).default("active").notNull(),
   last_read_msg_id: uuid(),
   last_delivered_msg_id: uuid(),
   joined_at: timestamp({ withTimezone: true }).defaultNow(),
@@ -47,6 +56,8 @@ const chat_member_model = pgTable("chat_members", {
   uniqueIndex("uniq_chat_members_active").on(table.chat_id, table.user_id).where(isNull(table.removed_at)),
   index("idx_chatmemeber_chat_id_user_id_unremoved").on(table.chat_id, table.user_id).where(isNull(table.removed_at)),
   index("idx_chatmemeber_user_id_chat_id_unremoved").on(table.user_id, table.chat_id).where(isNull(table.removed_at)),
+  // Fast lookup of pending join requests for a group's "manage requests" screen.
+  index("idx_chat_members_pending").on(table.chat_id).where(and(eq(table.status, "pending"), isNull(table.removed_at))!),
 ]);
 
 

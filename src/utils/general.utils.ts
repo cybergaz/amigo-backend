@@ -34,11 +34,15 @@ const generate_jwt = (id: string, role: string, time: StringValue = "1d") => {
   });
 };
 
-const generate_refresh_jwt = (id: string, role: string, time: StringValue = "7d") => {
+const generate_refresh_jwt = (id: string, role: string, time: StringValue = "7d", sid?: string) => {
   // TESTING OVERRIDE: set REFRESH_TOKEN_TTL (e.g. "2m") in .env to test the
   // refresh-expiry/clean-logout path quickly. Leave unset in production.
   const ttl = (process.env.REFRESH_TOKEN_TTL as StringValue) || time;
-  return jwt.sign({ id, role }, process.env.ACCESS_KEY || "heymama", {
+  // `sid` (session id) ties the token to a row in refresh_sessions; omitted only by
+  // legacy call sites. Self-identifying tokens enable future device management.
+  const payload: Record<string, unknown> = { id, role };
+  if (sid) payload.sid = sid;
+  return jwt.sign(payload, process.env.ACCESS_KEY || "heymama", {
     expiresIn: ttl,
   });
 };

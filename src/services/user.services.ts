@@ -4,10 +4,10 @@ import { UpdateUserType, user_model } from "@/models/user.model";
 import { RoleType } from "@/types/user.types";
 import {
   generate_jwt,
-  generate_refresh_jwt,
   hash_password,
   parse_phone,
 } from "@/utils/general.utils";
+import { create_session } from "./session.service";
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
 import { eq, and, inArray, isNull, ne, sql, or, ilike } from "drizzle-orm";
 import { store_fcm_token } from "@/cache-management/fcm-token.cache";
@@ -54,12 +54,8 @@ const create_user = async ({
       .returning();
 
     const access_token = generate_jwt(new_user.id, role, "7d");
-    const refresh_token = generate_refresh_jwt(new_user.id, role, "90d");
-
-    await db
-      .update(user_model)
-      .set({ refresh_token })
-      .where(eq(user_model.id, new_user.id));
+    // Brand-new account → first session. No other sessions to revoke.
+    const refresh_token = await create_session(new_user.id, role, "90d");
 
     return {
       success: true,
@@ -767,13 +763,8 @@ const create_admin_user = async (email: string, password: string, permissions: s
       });
 
     const access_token = generate_jwt(new_admin.id, "sub_admin");
-    const refresh_token = generate_refresh_jwt(new_admin.id, "sub_admin");
-
-    // store refresh token in database
-    await db
-      .update(user_model)
-      .set({ refresh_token })
-      .where(eq(user_model.id, new_admin.id));
+    // New admin → first session (7d refresh, matching the prior default).
+    const refresh_token = await create_session(new_admin.id, "sub_admin", "7d");
 
     return {
       success: true,

@@ -105,7 +105,11 @@ const get_conversation_members = async (conv_id: string): Promise<Set<string>> =
         .where(
           and(
             eq(chat_member_model.chat_id, conv_id),
-            isNull(chat_member_model.removed_at)
+            isNull(chat_member_model.removed_at),
+            // Only ACTIVE members belong in the broadcast set. left/pending
+            // rows keep removed_at NULL, so we must exclude them here or a cold
+            // rehydrate would re-deliver messages to users who left.
+            eq(chat_member_model.status, "active")
           )
         );
 
@@ -153,7 +157,10 @@ const get_user_conversations = async (user_id: string): Promise<Set<string>> => 
         .where(
           and(
             eq(chat_member_model.user_id, user_id),
-            isNull(chat_member_model.removed_at)
+            isNull(chat_member_model.removed_at),
+            // Mirror get_conversation_members: only active memberships count
+            // for broadcast/presence fan-out. left/pending users are shells.
+            eq(chat_member_model.status, "active")
           )
         );
 

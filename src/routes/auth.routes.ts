@@ -2,6 +2,7 @@ import db from "@/config/db";
 import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
 import { create_signup_request, get_signup_request_status, handle_login, handle_refresh_token, handle_refresh_token_mobile, validate_refresh_token } from "@/services/auth.service";
+import { revoke_user_sessions } from "@/services/session.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { VerifySignupSchema } from "@/types/auth.types";
@@ -454,9 +455,10 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       // Remove FCM token from all 3 tiers (LRU, Redis, DB)
       await remove_fcm_token(info.data.id);
 
-      // Invalidate the stored refresh token so this session can no longer be
-      // refreshed after logout (server-side session kill, not just clearing the
-      // client cookies). Otherwise the logged-out token stays valid until expiry.
+      // Server-side session kill: drop the user's sessions (single-device, so this
+      // is the active one) and clear the legacy column. Without this the token would
+      // stay refreshable until expiry even after logout.
+      await revoke_user_sessions(info.data.id);
       await db
         .update(user_model)
         .set({ refresh_token: null })
