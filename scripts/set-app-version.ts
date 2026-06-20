@@ -11,21 +11,30 @@
  *
  *   # With release-note message and override store URL
  *   bun run version:set android 3.0.5 16 --msg="Critical message-delivery fix"
+ *
+ *   # Set the version but DON'T push the update notification to users
+ *   bun run version:set android 3.0.5 16 --no-notify
+ *
+ * By default, setting a version also broadcasts an "update available" push to
+ * every user with an FCM token (batched to spare the server). Tapping it opens
+ * the store. Pass --no-notify to skip the broadcast.
  */
 
 import "dotenv/config";
 import { redis } from "@/config/redis";
 import { set_app_version, type AppPlatform } from "@/services/app-version.service";
+import { broadcast_version_update } from "@/services/app-update-notify.service";
 
 type Flags = {
   min?: number;
   url?: string;
   msg?: string;
+  notify?: boolean;
 };
 
 const usage = () => {
   console.log(
-    `Usage: bun run version:set <platform> <version> <build> [--min=<build>] [--url=<url>] [--msg="<text>"]\n` +
+    `Usage: bun run version:set <platform> <version> <build> [--min=<build>] [--url=<url>] [--msg="<text>"] [--no-notify]\n` +
     `       platform: android | ios`,
   );
 };
@@ -34,6 +43,9 @@ const parse_flags = (argv: string[]): Flags => {
   const out: Flags = {};
   for (const arg of argv) {
     if (!arg.startsWith("--")) continue;
+    // Boolean flags (no '=').
+    if (arg === "--no-notify") { out.notify = false; continue; }
+    if (arg === "--notify") { out.notify = true; continue; }
     const eq = arg.indexOf("=");
     if (eq === -1) continue;
     const key = arg.slice(2, eq);
@@ -89,6 +101,24 @@ const main = async () => {
 
   console.log(`✅ App version updated for ${result.platform}`);
   console.log(JSON.stringify(result, null, 2));
+
+  // Broadcast the "update available" push to all users (unless opted out).
+  if (flags.notify === false) {
+    console.log("🔕 Skipped update notification (--no-notify).");
+  } else {
+    console.log("📣 Broadcasting update notification to all users…");
+    try {
+      const stats = await broadcast_version_update(result);
+      console.log(
+        `📣 Notification broadcast: recipients=${stats.recipients} ` +
+        `sent=${stats.sent} failed=${stats.failed} batches=${stats.batches}`,
+      );
+    } catch (err) {
+      // The version is already set; a notification failure shouldn't fail the
+      // whole command. Surface it and continue to a clean exit.
+      console.error("⚠️  Update notification broadcast failed:", err);
+    }
+  }
 
   await redis.quit();
   process.exit(0);
