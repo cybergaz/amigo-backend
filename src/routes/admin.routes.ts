@@ -13,6 +13,7 @@ import { force_declare_group_creater, get_all_conversations_admin, get_conversat
 import { add_new_member, remove_member, bulk_add_members_to_groups, bulk_remove_members_from_groups } from "@/services/chat-group.service";
 import { hard_delete_message, revive_chat } from "@/services/chat.services";
 import { get_marquee_banner, set_marquee_banner } from "@/services/app-settings.service";
+import { publish_global_broadcast } from "@/sockets/ws-broadcast";
 
 const admin_routes = new Elysia({ prefix: "/admin" })
   // unauthorized route to create a super admin if none exists
@@ -911,6 +912,14 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       { text: body.text, enabled: body.enabled },
       store.id,
     );
+    // Push the change live to every connected client (across all instances).
+    // Fire-and-forget — the DB write is the source of truth; clients also
+    // re-fetch on launch, so a failed broadcast just delays the live update.
+    publish_global_broadcast({
+      type: "marquee:update",
+      payload: data,
+      ws_timestamp: new Date(),
+    }).catch((err) => console.error("[MARQUEE] broadcast failed:", err));
     set.status = 200;
     return { success: true, code: 200, message: "Marquee banner updated", data };
   }, {

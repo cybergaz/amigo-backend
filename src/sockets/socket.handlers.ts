@@ -39,6 +39,23 @@ type BroadcastData = {
   exclude_user_ids?: string[];
 };
 
+// Fire a message to EVERY client connected to THIS instance. Used for global,
+// non-vital broadcasts (e.g. the marquee banner) where there is no conversation
+// or user-list scope. Cross-instance fan-out is handled by the Redis pub/sub in
+// ws-broadcast.ts, which calls this on each instance. Intentionally lightweight:
+// no offline persistence (transient config — clients re-fetch on next launch).
+const broadcast_to_all = (message: WSMessage) => {
+  const serialized = JSON.stringify(message);
+  for (const [user_id, connection] of socket_connections) {
+    if (connection.ws.readyState !== 1) continue;
+    try {
+      connection.ws.send(serialized, true);
+    } catch (error) {
+      console.error(`[WS] broadcast_to_all error for user ${user_id}:`, error);
+    }
+  }
+};
+
 const broadcast_message = async (data: BroadcastData) => {
   let members: string[] = [];
   if (data.to === "conversation" && data.conv_id) {
@@ -642,6 +659,7 @@ export {
   get_ws_data,
   is_user_online,
   broadcast_message,
+  broadcast_to_all,
   // get_connected_users,
   // handle_join_conversation,
   socket_message_handler,

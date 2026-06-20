@@ -50,6 +50,7 @@ type WSMessage = {
   | MiscPayload
   | ConversationActionPayload
   | UserUpdatePayload
+  | MarqueeBannerPayload
   | ConversationDisappearingPayload;
   // | SyncMessagesPayload
   // | MessageDeliveredPayload;
@@ -317,6 +318,14 @@ type UserUpdatePayload = {
   updated_at: Date;
 };
 
+// Global super-admin-controlled marquee banner shown on the app's group list.
+// Broadcast to every connected client when the super admin saves a change.
+type MarqueeBannerPayload = {
+  text: string;
+  enabled: boolean;
+  updated_at: string | null;
+};
+
 // type SyncMessagesPayload = {
 //   messages: ChatMessagePayload[];
 //   sync_timestamp: Date;
@@ -376,6 +385,7 @@ const WS_MESSAGE_EVENTS_CONST = [
   'socket:error',
   'auth:force_logout',
   'user:update',
+  'marquee:update',
 ] as const;
 
 const VITAL_WS_EVENTS_CONST = [
@@ -431,6 +441,7 @@ export type {
   ConnectionStatusType,
   ConversationActionPayload,
   UserUpdatePayload,
+  MarqueeBannerPayload,
   ConversationDisappearingPayload,
   // SyncMessageItem,
   // SyncMessagesPayload,
