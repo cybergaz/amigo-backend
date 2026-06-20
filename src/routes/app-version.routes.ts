@@ -1,5 +1,6 @@
 import { Elysia, t } from "elysia";
 import { get_app_version, type AppPlatform } from "@/services/app-version.service";
+import { get_marquee_banner } from "@/services/app-settings.service";
 
 const SUPPORTED_PLATFORMS: AppPlatform[] = ["android", "ios"];
 
@@ -37,6 +38,13 @@ const app_version_routes = new Elysia({ prefix: "/app" })
         platform: t.String(),
       }),
     },
-  );
+  )
+  // Public, unauthenticated. The app reads this on the group-list screen to
+  // render the super-admin-controlled marquee banner below the search bar.
+  .get("/marquee", async ({ set }) => {
+    const data = await get_marquee_banner();
+    set.status = 200;
+    return { success: true, code: 200, data };
+  });
 
 export default app_version_routes;

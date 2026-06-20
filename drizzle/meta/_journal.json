@@ -57,6 +57,13 @@
       "when": 1781694193052,
       "tag": "0007_mean_gunslinger",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1781965828597,
+      "tag": "0008_tired_vindicator",
+      "breakpoints": true
     }
   ]
 }

@@ -12,6 +12,7 @@ import { update_signup_request_status, get_all_signup_requests } from "@/service
 import { force_declare_group_creater, get_all_conversations_admin, get_conversation_history_admin, get_conversation_members_admin, hard_delete_chat } from "@/services/chat-admin.service";
 import { add_new_member, remove_member, bulk_add_members_to_groups, bulk_remove_members_from_groups } from "@/services/chat-group.service";
 import { hard_delete_message, revive_chat } from "@/services/chat.services";
+import { get_marquee_banner, set_marquee_banner } from "@/services/app-settings.service";
 
 const admin_routes = new Elysia({ prefix: "/admin" })
   // unauthorized route to create a super admin if none exists
@@ -876,6 +877,46 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     body: t.Object({
       phone: t.String(),
       user_id: t.String(),
+    })
+  })
+
+  // Marquee banner shown on the app's group-list screen. Super-admin only:
+  // sub-admins must not be able to author the global banner.
+  .get("/marquee-banner", async ({ set, store }) => {
+    if (store.role !== "admin") {
+      set.status = 403;
+      return {
+        success: false,
+        code: 403,
+        message: "Only super admin can manage the marquee banner",
+        data: null,
+      };
+    }
+    const data = await get_marquee_banner();
+    set.status = 200;
+    return { success: true, code: 200, message: "OK", data };
+  })
+
+  .put("/marquee-banner", async ({ set, store, body }) => {
+    if (store.role !== "admin") {
+      set.status = 403;
+      return {
+        success: false,
+        code: 403,
+        message: "Only super admin can manage the marquee banner",
+        data: null,
+      };
+    }
+    const data = await set_marquee_banner(
+      { text: body.text, enabled: body.enabled },
+      store.id,
+    );
+    set.status = 200;
+    return { success: true, code: 200, message: "Marquee banner updated", data };
+  }, {
+    body: t.Object({
+      text: t.String(),
+      enabled: t.Boolean(),
     })
   });
 
