@@ -1,4 +1,5 @@
 import admin from 'firebase-admin';
+import { EventEmitter } from 'events';
 import { isNotNull } from 'drizzle-orm';
 import { ChatMessagePayload, VitalWSMessage, WSMessage, } from '@/types/socket.types';
 import { MessageType } from '@/types/chat.types';
@@ -150,23 +151,37 @@ export class FCMService {
   // Broadcast a single notification to EVERY user that currently has an FCM
   // token. Used for app-wide announcements (e.g. a new app version).
   //
-  // Sends via Firebase multicast in chunks of `batch_size` tokens — FCM caps
-  // multicast at 500 tokens/request — with a `delay_ms` pause between chunks,
-  // so a large user base doesn't burst thousands of sends at FCM (and our own
-  // egress) all at once. A `notification` block is included so the OS renders
-  // the tray entry itself when the recipient app is backgrounded/terminated
-  // (this is what lets users on OLDER builds, which don't know this push type,
-  // still see it). Tokens FCM reports as dead are evicted from the 3-tier
-  // cache so the column self-heals.
+  // IMPORTANT — why this sends one message at a time in bounded waves rather
+  // than via `sendEachForMulticast`: that helper fires every message as a
+  // concurrent HTTP/2 stream on a SINGLE connection to FCM. FCM caps concurrent
+  // streams per connection (~100), and Bun's http2 client (unlike Node's) does
+  // not queue streams beyond the server's limit — it opens them all, so FCM
+  // resets the whole connection with `GOAWAY exceeded_max_concurrent_streams`
+  // and the entire batch fails. So we cap in-flight sends to `concurrency`
+  // (well under the stream limit) and pause `delay_ms` between waves to keep
+  // load gentle.
+  //
+  // A `notification` block is included so the OS renders the tray entry itself
+  // when the recipient app is backgrounded/terminated (this is what lets users
+  // on OLDER builds, which don't know this push type, still see it). Tokens FCM
+  // reports as dead are evicted from the 3-tier cache so the column self-heals.
   async broadcast_to_all(input: {
     title: string;
     body: string;
     data?: Record<string, string>;
-    batch_size?: number;
+    concurrency?: number;
     delay_ms?: number;
-  }): Promise<{ recipients: number; sent: number; failed: number; batches: number }> {
-    const batch_size = Math.min(Math.max(input.batch_size ?? 500, 1), 500);
-    const delay_ms = input.delay_ms ?? 300;
+  }): Promise<{ recipients: number; sent: number; failed: number; waves: number }> {
+    const concurrency = Math.min(Math.max(input.concurrency ?? 20, 1), 100);
+    const delay_ms = input.delay_ms ?? 200;
+
+    // Bun adds a per-request timeout listener to the shared FCM socket; lift
+    // the limit so bounded concurrency doesn't trip Node's (cosmetic)
+    // MaxListenersExceededWarning.
+    EventEmitter.defaultMaxListeners = Math.max(
+      EventEmitter.defaultMaxListeners,
+      concurrency + 20,
+    );
 
     const rows = await db
       .select({ id: user_model.id, fcm_token: user_model.fcm_token })
@@ -175,74 +190,76 @@ export class FCMService {
 
     const recipients = rows.length;
     if (recipients === 0) {
-      return { recipients: 0, sent: 0, failed: 0, batches: 0 };
+      return { recipients: 0, sent: 0, failed: 0, waves: 0 };
     }
 
     let sent = 0;
     let failed = 0;
-    let batches = 0;
+    let waves = 0;
 
-    for (let i = 0; i < rows.length; i += batch_size) {
-      const slice = rows.slice(i, i + batch_size);
-      const tokens = slice.map((r) => r.fcm_token as string);
+    for (let i = 0; i < rows.length; i += concurrency) {
+      const slice = rows.slice(i, i + concurrency);
 
-      const message: admin.messaging.MulticastMessage = {
-        tokens,
-        notification: { title: input.title, body: input.body },
-        data: { ...(input.data ?? {}) },
-        android: {
-          priority: 'high',
-          ttl: 2419200000,
-          notification: {
-            // Reuse the always-present 'messages' channel so the tray entry
-            // still renders on already-installed (older) builds that have no
-            // dedicated channel for app updates.
-            channelId: 'messages',
-            priority: 'high',
-            sound: 'default',
-          },
-        },
-        apns: {
-          payload: { aps: { sound: 'default', badge: 1, contentAvailable: true } },
-        },
-      };
+      const results = await Promise.allSettled(
+        slice.map(async (row) => {
+          const message: admin.messaging.Message = {
+            token: row.fcm_token as string,
+            notification: { title: input.title, body: input.body },
+            data: { ...(input.data ?? {}) },
+            android: {
+              priority: 'high',
+              ttl: 2419200000,
+              notification: {
+                // Reuse the always-present 'messages' channel so the tray
+                // entry still renders on already-installed (older) builds that
+                // have no dedicated channel for app updates.
+                channelId: 'messages',
+                priority: 'high',
+                sound: 'default',
+              },
+            },
+            apns: {
+              payload: { aps: { sound: 'default', badge: 1, contentAvailable: true } },
+            },
+          };
 
-      try {
-        const res = await admin.messaging().sendEachForMulticast(message);
-        sent += res.successCount;
-        failed += res.failureCount;
-        batches += 1;
+          try {
+            await admin.messaging().send(message);
+            return true;
+          } catch (err: any) {
+            const code = err?.code;
+            if (
+              code === 'messaging/registration-token-not-registered' ||
+              code === 'messaging/invalid-registration-token'
+            ) {
+              await remove_fcm_token(row.id);
+            } else {
+              console.error(
+                `[FCM] broadcast send error for user ${row.id}:`,
+                code ?? err,
+              );
+            }
+            return false;
+          }
+        }),
+      );
 
-        if (res.failureCount > 0) {
-          await Promise.allSettled(
-            res.responses.map(async (r, idx) => {
-              if (r.success) return;
-              const code = r.error?.code;
-              if (
-                code === 'messaging/registration-token-not-registered' ||
-                code === 'messaging/invalid-registration-token'
-              ) {
-                await remove_fcm_token(slice[idx].id);
-              }
-            }),
-          );
-        }
-      } catch (err) {
-        failed += tokens.length;
-        batches += 1;
-        console.error(`[FCM] broadcast batch ${batches} failed:`, err);
+      for (const r of results) {
+        if (r.status === 'fulfilled' && r.value === true) sent++;
+        else failed++;
       }
+      waves += 1;
 
-      // Breathe between batches to keep load off FCM / our egress.
-      if (i + batch_size < rows.length && delay_ms > 0) {
+      // Breathe between waves to keep load off FCM / our egress.
+      if (i + concurrency < rows.length && delay_ms > 0) {
         await new Promise((resolve) => setTimeout(resolve, delay_ms));
       }
     }
 
     console.log(
-      `[FCM] broadcast complete: recipients=${recipients} sent=${sent} failed=${failed} batches=${batches}`,
+      `[FCM] broadcast complete: recipients=${recipients} sent=${sent} failed=${failed} waves=${waves}`,
     );
-    return { recipients, sent, failed, batches };
+    return { recipients, sent, failed, waves };
   }
 
   // Update user's FCM token (updates all 3 tiers)

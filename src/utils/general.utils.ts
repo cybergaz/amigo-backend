@@ -60,14 +60,29 @@ function parse_phone(input: string, default_country_code?: string) {
     code: "",
     phone: input,
     concatinated: `+${default_country_code}${input.replace(" ", "")}`,
+    valid: false,
+    e164: input.replace(/\s+/g, ""),
   };
 
   return {
     country: phone.country || null,
     code: phone.countryCallingCode, // e.g. "91"
     phone: phone.nationalNumber,     // e.g. "7777777777"
-    concatinated: `+${phone.countryCallingCode || ""}${phone.nationalNumber}`.replace(" ", "") // e.g. "+917777777777"
+    concatinated: `+${phone.countryCallingCode || ""}${phone.nationalNumber}`.replace(" ", ""), // e.g. "+917777777777"
+    // `valid` is false for malformed input such as a doubled country code
+    // ("+9191…"): libphonenumber still resolves the country from the leading
+    // "+91", but the over-long national number fails the per-country pattern.
+    valid: phone.isValid(),
+    e164: phone.number,              // canonical E.164, e.g. "+917777777777"
   };
+}
+
+// Normalise any user-supplied phone string to canonical E.164 ("+<cc><national>").
+// Falls back to the whitespace-stripped input when the number can't be parsed or
+// validated (e.g. internal test numbers) so existing lookups keep working.
+function to_e164(input: string): string {
+  const phone = parsePhoneNumberFromString(input);
+  return phone && phone.isValid() ? phone.number : input.replace(/\s+/g, "");
 }
 
 const create_dm_key = (user1: string, user2: string) => {
@@ -75,4 +90,4 @@ const create_dm_key = (user1: string, user2: string) => {
 };
 
 
-export { parse_phone, generate_unique_id, create_otp, hash_password, generate_jwt, generate_refresh_jwt, compare_password, create_dm_key };
+export { parse_phone, to_e164, generate_unique_id, create_otp, hash_password, generate_jwt, generate_refresh_jwt, compare_password, create_dm_key };

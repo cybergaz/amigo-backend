@@ -862,8 +862,7 @@ const admin_routes = new Elysia({ prefix: "/admin" })
   }, {
     body: t.Object({
       phone: t.String(),
-      first_name: t.String(),
-      last_name: t.String(),
+      name: t.Optional(t.String()),
       status: t.Optional(t.Enum(Object.fromEntries(REQUEST_STATUS_CONST.map(x => [x, x])))),
       rejected_reason: t.Optional(t.String()),
     })

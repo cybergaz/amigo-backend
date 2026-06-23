@@ -47,7 +47,7 @@ const main = async () => {
   const stats = await broadcast_version_update(info, { title, body });
   console.log(
     `✅ recipients=${stats.recipients} sent=${stats.sent} ` +
-    `failed=${stats.failed} batches=${stats.batches}`,
+    `failed=${stats.failed} waves=${stats.waves}`,
   );
 
   await redis.quit();

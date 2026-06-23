@@ -167,13 +167,12 @@ const force_logout_other_devices = async (user_id: string): Promise<void> => {
   }
 };
 
-const create_signup_request = async ({ first_name, last_name, phone }: { first_name: string; last_name: string; phone: string; }) => {
+const create_signup_request = async ({ name, phone }: { name: string; phone: string; }) => {
   try {
     const signup_request = await db
       .insert(signup_request_model)
       .values({
-        first_name,
-        last_name,
+        name,
         phone,
       })
       .returning();
@@ -190,8 +189,7 @@ const create_signup_request = async ({ first_name, last_name, phone }: { first_n
     // ---------------------------------------------------------
     await update_signup_request_status({
       phone,
-      first_name,
-      last_name,
+      name,
       status: "accepted",
     });
 
@@ -283,7 +281,7 @@ const update_signup_request_status = async (payload: UpdateSignupRequestType) =>
     // Only create user if status is accepted
     if (payload.status === "accepted") {
       const create_user_res = await create_user({
-        name: signup_request[0].first_name + " " + signup_request[0].last_name,
+        name: signup_request[0].name,
         password: null,
         role: "user",
         phone: signup_request[0].phone,

@@ -111,7 +111,7 @@ const main = async () => {
       const stats = await broadcast_version_update(result);
       console.log(
         `📣 Notification broadcast: recipients=${stats.recipients} ` +
-        `sent=${stats.sent} failed=${stats.failed} batches=${stats.batches}`,
+        `sent=${stats.sent} failed=${stats.failed} waves=${stats.waves}`,
       );
     } catch (err) {
       // The version is already set; a notification failure shouldn't fail the

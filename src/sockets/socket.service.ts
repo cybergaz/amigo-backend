@@ -458,6 +458,39 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       };
     }
 
+    // Idempotency guard. This exact message (same client id) was already stored AND
+    // already fanned out on its first arrival. A second arrival here is a benign
+    // flaky-network resend (the original WS frame got buffered into a dropped socket,
+    // then the client's GC/poll resent the SAME id). Re-ack the sender so their
+    // pending tick resolves — but do NOT fan out or re-run side effects again. The
+    // recipients already received this message (and would dedup it by its stable id
+    // regardless). This is the line that makes duplicate delivery impossible.
+    if (store_msg_result.duplicate) {
+      console.warn(
+        `[message:new] idempotent duplicate ignored: msg_id=${payload.id} conv=${payload.conv_id} sender=${payload.sender_id}`,
+      );
+      const dup_ack: MessageSentAckPayload = {
+        msg_id: payload.id,
+        conv_id: payload.conv_id,
+        is_sent: true,
+        sent_at: store_msg_result.data?.sent_at ?? undefined,
+      };
+      await broadcast_message({
+        to: "users",
+        user_ids: [payload.sender_id],
+        message: {
+          type: "message:sent:ack",
+          payload: dup_ack,
+          ws_timestamp: new Date(),
+        },
+      });
+      return {
+        success: true,
+        code: 200,
+        message: "Duplicate message ignored (idempotent)",
+      };
+    }
+
     // Pre-warm replied-to preview on the broadcast payload so recipients can
     // render the reply container on first paint without a local DB lookup.
     let replied_to_message: ChatMessagePayload["replied_to_message"] = null;
@@ -504,7 +537,7 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
 
     const updated_message_payload: ChatMessagePayload = {
       ...payload,
-      id: store_msg_result.new_id ?? payload.id, // update message ID if it was changed during retry
+      id: payload.id, // client-generated UUIDv7, stable end-to-end — never rewritten
       replied_to_message,
       // Broadcast the stored sent_at, not the client claim — store_message
       // clamps skewed client clocks to server time, and recipients must see
@@ -543,7 +576,6 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       msg_id: payload.id,
       conv_id: payload.conv_id,
       is_sent: true,
-      new_id: store_msg_result.new_id,
       // Canonical stored sent_at — lets a sender with a skewed clock correct
       // its local copy to what the server persisted and recipients received.
       sent_at: store_msg_result.data?.sent_at ?? undefined,
@@ -571,7 +603,7 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
 
       // 1. Update Redis chat_meta (last message display data)
       update_chat_meta(payload.conv_id, {
-        id: store_msg_result.new_id ?? store_msg_result.data.id,
+        id: store_msg_result.data.id,
         body: payload.body ?? "",
         type: payload.msg_type,
         sender_id: payload.sender_id,

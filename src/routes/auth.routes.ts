@@ -5,6 +5,7 @@ import { create_signup_request, get_signup_request_status, handle_login, handle_
 import { revoke_user_sessions } from "@/services/session.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
+import { to_e164 } from "@/utils/general.utils";
 import { VerifySignupSchema } from "@/types/auth.types";
 import Elysia, { t } from "elysia";
 import { eq, sql } from "drizzle-orm";
@@ -55,7 +56,7 @@ function getCookieConfig(userAgent?: string) {
 
 const auth_routes = new Elysia({ prefix: "/auth" })
   .post("/generate-signup-otp/:phone", async ({ set, params }) => {
-    const existing_user_res = await find_user_by_phone(params.phone);
+    const existing_user_res = await find_user_by_phone(to_e164(params.phone));
     if (existing_user_res.success) {
       set.status = 409;
       return {
@@ -78,7 +79,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/generate-login-otp/:phone", async ({ set, params }) => {
-    const existing_user_res = await find_user_by_phone(params.phone);
+    const existing_user_res = await find_user_by_phone(to_e164(params.phone));
     if (!existing_user_res?.success) {
       set.status = existing_user_res?.code;
       return existing_user_res;
@@ -147,9 +148,9 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   )
 
   .post("/request-signup", async ({ body, set }) => {
-    const { first_name, last_name, phone } = body;
+    const { name, phone } = body;
 
-    const signup_request_res = await create_signup_request({ first_name, last_name, phone });
+    const signup_request_res = await create_signup_request({ name, phone });
     if (!signup_request_res?.success) {
       set.status = signup_request_res?.code;
       return signup_request_res;
@@ -159,8 +160,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   },
     {
       body: t.Object({
-        first_name: t.String(),
-        last_name: t.String(),
+        name: t.String(),
         phone: t.String(),
       }),
     }

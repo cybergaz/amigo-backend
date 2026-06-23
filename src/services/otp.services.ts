@@ -1,6 +1,6 @@
 import db from "@/config/db";
 import { otp_model } from "@/models/otp.model";
-import { create_otp, parse_phone } from "@/utils/general.utils";
+import { create_otp, parse_phone, to_e164 } from "@/utils/general.utils";
 import { eq } from "drizzle-orm";
 
 const generate_otp = async (phone: string) => {
@@ -18,13 +18,23 @@ const generate_otp = async (phone: string) => {
     // -----------------------------------------------------------
     const parsed_phone = parse_phone(phone);
 
-    if (!parsed_phone.country) {
+    // Reject anything that isn't a valid number for its country. This is the hard
+    // stop for a doubled country code (e.g. a "+91"-prefixing field that also receives
+    // a number the user already typed "91" into → "+9191…"): libphonenumber resolves
+    // the country from the leading "+91", but the over-long national number fails
+    // validation, so it never gets OTP'd or persisted.
+    if (!parsed_phone.country || !parsed_phone.valid) {
       return {
         success: false,
         code: 400,
-        message: "Invalid phone number format. Could not determine country code.",
+        message:
+          "Invalid phone number. Please enter your number without the country code in the number field.",
       };
     }
+
+    // Canonical E.164 is the single source of truth for storage + lookup, so the
+    // number we OTP, store, and later match at verify/login are always identical.
+    const canonical_phone = parsed_phone.e164;
 
     // -----------------------------------------------------------
     // Generate OTP using Nanoid
@@ -106,7 +116,7 @@ const generate_otp = async (phone: string) => {
     await db
       .insert(otp_model)
       .values({
-        phone: phone,
+        phone: canonical_phone,
         otp: otp,
       })
       .onConflictDoUpdate({
@@ -119,9 +129,9 @@ const generate_otp = async (phone: string) => {
     return {
       success: true,
       code: 200,
-      message: `OTP sent to ${phone}`,
+      message: `OTP sent to ${canonical_phone}`,
       data: {
-        phone: phone,
+        phone: canonical_phone,
         otp: otp,
       }
     };
@@ -139,11 +149,15 @@ const generate_otp = async (phone: string) => {
 
 const verify_otp = async (otp: number, phone: string) => {
   try {
+    // Normalise to the same canonical E.164 that generate_otp stored, so a
+    // differently-formatted-but-equivalent number still resolves to its OTP row.
+    const lookup_phone = to_e164(phone);
+
     // Fetch OTP from DB and compare
     const db_res = await db
       .select()
       .from(otp_model)
-      .where(eq(otp_model.phone, phone));
+      .where(eq(otp_model.phone, lookup_phone));
 
     if (db_res.length === 0) {
       return {
@@ -160,7 +174,7 @@ const verify_otp = async (otp: number, phone: string) => {
       // OTP is correct; delete it
       await db
         .delete(otp_model)
-        .where(eq(otp_model.phone, phone));
+        .where(eq(otp_model.phone, lookup_phone));
 
       return {
         success: true,

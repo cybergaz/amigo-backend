@@ -79,7 +79,13 @@ const get_user_info = async (user_id: string) => {
   return user;
 };
 
-const store_message = async (payload: ChatMessagePayload, custom_msg_id?: string): Promise<ResultType<DBInsertMessageType>> => {
+// Result of storing a message. `duplicate` = a row with this exact client id
+// already existed (an idempotent re-send), so the caller must NOT fan it out again.
+interface StoreMessageResultType extends ResultType<DBInsertMessageType> {
+  duplicate?: boolean;
+}
+
+const store_message = async (payload: ChatMessagePayload): Promise<StoreMessageResultType> => {
   try {
     // Compute the disappearing-messages deadline before insert. Sent_at on the
     // wire is the client-stamped time; we add the chat's configured duration
@@ -102,10 +108,21 @@ const store_message = async (payload: ChatMessagePayload, custom_msg_id?: string
       ? new Date(sent_at_date.getTime() + duration_sec * 1000)
       : null;
 
+    // Idempotent insert keyed on the client-generated message id (UUIDv7 = the PK).
+    // The same logical message legitimately reaches the server more than once on a
+    // flaky network (the original WS frame buffered into a dropped socket, then a
+    // GC/poll resend carrying the SAME id). onConflictDoNothing makes that second
+    // arrival a no-op instead of a unique-violation — so we NEVER store the body
+    // twice. If nothing was inserted, the row already exists: fetch it and report
+    // a duplicate so the caller can re-ack the sender without fanning out again.
+    //
+    // (This replaces the old "PK collision → mint a fresh id → re-insert" path,
+    //  which turned every duplicate send into a second row with a different id that
+    //  recipients could not dedup — the root cause of duplicate messages.)
     const [new_message] = await db
       .insert(message_model)
       .values({
-        id: custom_msg_id ? custom_msg_id : payload.id,
+        id: payload.id,
         chat_id: payload.conv_id,
         replied_to: payload.replied_to || null,
         sender_id: payload.sender_id,
@@ -114,21 +131,42 @@ const store_message = async (payload: ChatMessagePayload, custom_msg_id?: string
         attachments: payload.attachments,
         sent_at: sent_at_date,
         expires_at,
-      }).returning();
+      })
+      .onConflictDoNothing({ target: message_model.id })
+      .returning();
 
-    if (!new_message) {
+    if (new_message) {
       return {
-        success: false,
-        code: 500,
-        message: "Failed to store message",
+        success: true,
+        code: 200,
+        message: "Message stored successfully",
+        data: new_message,
       };
     }
 
+    // Nothing inserted → this id is already stored (duplicate send). Return the
+    // canonical persisted row, flagged duplicate, so the caller skips re-fan-out.
+    const [existing] = await db
+      .select()
+      .from(message_model)
+      .where(eq(message_model.id, payload.id))
+      .limit(1);
+
+    if (existing) {
+      return {
+        success: true,
+        code: 200,
+        message: "Message already stored (duplicate send)",
+        data: existing,
+        duplicate: true,
+      };
+    }
+
+    // Neither inserted nor found — a genuine failure (should not happen).
     return {
-      success: true,
-      code: 200,
-      message: "Message stored successfully",
-      data: new_message,
+      success: false,
+      code: 500,
+      message: "Failed to store message",
     };
   }
   catch (error) {
@@ -150,27 +188,14 @@ const store_message = async (payload: ChatMessagePayload, custom_msg_id?: string
 };
 
 
-interface StoreWithRetryResultType extends ResultType<DBInsertMessageType> {
-  new_id?: string; // If a new ID was generated due to collision, return it here
-}
-
-const store_message_with_retry = async (payload: ChatMessagePayload, retry_count: number): Promise<StoreWithRetryResultType> => {
-  const first = await store_message(payload);
-  if (first.success) return first;
-  if (first.code !== 409) return first;
-
-  for (let i = 0; i < retry_count; i++) {
-    const new_id = randomUUIDv7();
-    const result = await store_message(payload, new_id);
-    if (result.success) return { ...result, new_id };
-    if (result.code !== 409) return result;
-  }
-
-  return {
-    success: false,
-    code: 500,
-    message: "Failed to store message after retries — ID collision persisted",
-  };
+// Retained for the call site. The old retry loop minted a fresh id and re-inserted
+// the body whenever the client id "collided" (a 409) — but a 409 on a client UUIDv7
+// id is NOT an accidental collision, it is a duplicate send, and re-inserting under a
+// new id produced two undedupable rows (the duplicate-message bug). store_message is
+// now idempotent on the client id, so exactly one call is correct and exactly-once.
+// `retry_count` is kept only for signature compatibility and is unused.
+const store_message_with_retry = async (payload: ChatMessagePayload, _retry_count?: number): Promise<StoreMessageResultType> => {
+  return store_message(payload);
 };
 
 // Pin a message in a conversation — stores message_id in chat_model.pinned_msg_id

@@ -6,6 +6,7 @@ import {
   generate_jwt,
   hash_password,
   parse_phone,
+  to_e164,
 } from "@/utils/general.utils";
 import { create_session } from "./session.service";
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
@@ -42,12 +43,16 @@ const create_user = async ({
       hashed_password = await hash_password(password);
     }
 
+    // Persist the canonical E.164 form so the stored number always matches what
+    // OTP generation/verification used (and never a doubled "+9191…" string).
+    const canonical_phone = to_e164(phone);
+
     const [new_user] = await db
       .insert(user_model)
       .values({
         name,
         role,
-        phone: phone.replace(" ", ""),
+        phone: canonical_phone,
         hashed_password,
         call_access: true,
       })
@@ -65,7 +70,7 @@ const create_user = async ({
         id: new_user.id,
         name,
         role,
-        phone,
+        phone: canonical_phone,
         refresh_token,
         access_token,
       },
@@ -372,11 +377,19 @@ const get_available_users = async (self_id: string, phone_numbers: string[]) => 
 
   const default_country_code = parse_phone(self.phone!).code;
 
-  // console.log("phone_numbers ->", phone_numbers)
-  // const cleaned_phone_numbers = phone_numbers.map((phone) => phone.replace(" ", ""));
-  const parsed_phone_numbers = phone_numbers.map((phone) => parse_phone(phone, default_country_code).concatinated);
-  // console.log("cleaned_phone_numbers ->", cleaned_phone_numbers)
-  // console.log("parsed_phone_numbers ->", parsed_phone_numbers)
+  // Normalize every raw device number to canonical E.164 for the lookup, while
+  // remembering which original raw string produced each normalized number.
+  // Multiple raw formats can collapse to the same E.164 — keep the first one.
+  // The client re-uses `matched_input` to re-link a returned user back to the
+  // exact device-contact string it sent, so it can resolve the saved name
+  // (the canonical phone we store rarely matches the raw on-device format).
+  const norm_to_raw = new Map<string, string>();
+  for (const raw of phone_numbers) {
+    const normalized = parse_phone(raw, default_country_code).concatinated;
+    if (!norm_to_raw.has(normalized)) norm_to_raw.set(normalized, raw);
+  }
+  // Deduped keys keep the `IN (...)` list as small as the distinct number set.
+  const parsed_phone_numbers = [...norm_to_raw.keys()];
 
 
   try {
@@ -403,11 +416,18 @@ const get_available_users = async (self_id: string, phone_numbers: string[]) => 
       };
     }
 
+    // Echo back the original raw input each user matched on so the client can
+    // map this canonical phone back to a device contact and read its name.
+    const data = users.map((u) => ({
+      ...u,
+      matched_input: norm_to_raw.get(u.phone!) ?? u.phone,
+    }));
+
     return {
       success: true,
       code: 200,
       message: "Users fetched successfully",
-      data: users,
+      data,
     };
   } catch (error) {
     return {

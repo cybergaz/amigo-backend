@@ -28,8 +28,7 @@ const user_model = pgTable("users", {
 
 const signup_request_model = pgTable("signup_requests", {
   id: bigserial({ mode: "number" }).primaryKey(),
-  first_name: varchar({ length: 50 }).notNull(),
-  last_name: varchar({ length: 50 }).notNull(),
+  name: varchar({ length: 100 }).notNull(),
   phone: varchar({ length: 20 }).unique().notNull(),
   status: varchar({ enum: REQUEST_STATUS_CONST }).default("pending").notNull(),
   rejected_reason: text(),
