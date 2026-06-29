@@ -491,6 +491,36 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       };
     }
 
+    // Ack the sender the INSTANT the message is durably stored — BEFORE the
+    // fan-out. The single tick means "the server has your message", which is
+    // true right now; it must NOT trail delivery to the other members.
+    //
+    // Fanning out first made the ack wait on the whole O(N) recipient loop:
+    // broadcast_message awaits store_pending_message for every member, and each
+    // costs a few round-trips to Redis. In a 100+ member group (especially on a
+    // slow link / at peak, when Redis command-queue depth grows) that left the
+    // sender staring at the clock for 10-15s — even though the recipients had
+    // already received the message in <0.5s (their ws.send fires first).
+    // Delivery and read are tracked separately by their own receipts.
+    const sent_ack: MessageSentAckPayload = {
+      msg_id: payload.id,
+      conv_id: payload.conv_id,
+      is_sent: true,
+      // Canonical stored sent_at — lets a sender with a skewed clock correct
+      // its local copy to what the server persisted and recipients received.
+      sent_at: store_msg_result.data?.sent_at ?? undefined,
+    };
+    // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    await broadcast_message({
+      to: "users",
+      user_ids: [payload.sender_id],
+      message: {
+        type: "message:sent:ack",
+        payload: sent_ack,
+        ws_timestamp: new Date(),
+      },
+    });
+
     // Pre-warm replied-to preview on the broadcast payload so recipients can
     // render the reply container on first paint without a local DB lookup.
     let replied_to_message: ChatMessagePayload["replied_to_message"] = null;
@@ -570,30 +600,10 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       exclude_user_ids: [payload.sender_id]
     });
 
-    // const is_sender_online = socket_connections.has(payload.sender_id);
-    // const is_sender_in_conv = socket_connections.get(payload.sender_id)?.active_conv_id === payload.conv_id;
-    const sent_ack: MessageSentAckPayload = {
-      msg_id: payload.id,
-      conv_id: payload.conv_id,
-      is_sent: true,
-      // Canonical stored sent_at — lets a sender with a skewed clock correct
-      // its local copy to what the server persisted and recipients received.
-      sent_at: store_msg_result.data?.sent_at ?? undefined,
-      // delivered_to: sent_result.online,
-      // read_by: sent_result.active_in_conv,
-    };
-
-    // send ack to sender along with message delivery status
-    // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    await broadcast_message({
-      to: "users",
-      user_ids: [payload.sender_id],
-      message: {
-        type: "message:sent:ack",
-        payload: sent_ack,
-        ws_timestamp: new Date()
-      },
-    });
+    // NOTE: the sender's message:sent:ack is sent ABOVE, immediately after the
+    // message is stored and before this fan-out — see the comment there. Do not
+    // move it back down here: that reintroduces the 10-15s clock-tick lag in
+    // large groups by making the ack wait on the whole recipient loop.
 
     // ── Fire-and-forget: Redis caches, DB status inserts, FCM ───────────
     // These run after the sender ACK is sent — latency-insensitive work.
