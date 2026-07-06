@@ -1,15 +1,10 @@
 import { WebSocketData, WSMessage, ConnectionStatusPayload, ChatMessagePayload, TypingPayload, MessagePinPayload, MessageForwardPayload, VitalWSMessage, CallPayload, ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD, type AllowedWSEventsWithoutPayloadType, ConvJoinPayload, MessageStatusAckPayload } from "@/types/socket.types";
 import { ElysiaWS } from "elysia/dist/ws";
-import { get_conversation_members, get_user_conversations } from "@/cache-management/conv.cache";
+import { get_conversation_members } from "@/cache-management/conv.cache";
 import { socket_connections, handlePongResponse, polling_connections } from "./socket.server";
 import { is_allowed_event, store_pending_message } from "@/cache-management/polling.cache";
 import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_call_connected, handle_call_rejoin_open, handle_call_rejoin_resolved, handle_connection_status, handle_message_forward, handle_message_new, handle_conv_join, handle_conv_mark_read, handle_message_status_ack, } from "./socket.service";
 import { pin_message, unpin_message } from "@/services/message.services";
-import { mark_message_delivered } from "@/services/message-status.service";
-import { batch_mark_status } from "@/cache-management/message.cache";
-import db from "@/config/db";
-import { message_model } from "@/models/message.model";
-import { inArray } from "drizzle-orm";
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------

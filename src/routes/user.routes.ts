@@ -12,7 +12,7 @@ const user_routes = new Elysia({ prefix: "/user" })
       const state_result = app_middleware({ cookie, headers });
 
       set.status = state_result.code;
-      if (!state_result.data) return state_result
+      if (!state_result.data) return state_result;
 
       store.id = state_result.data.id;
       store.role = state_result.data.role;
@@ -50,13 +50,13 @@ const user_routes = new Elysia({ prefix: "/user" })
   .get("/all-users", async ({ set }) => {
     try {
       const users = await get_all_users();
-      set.status = users.code
+      set.status = users.code;
       return users;
     } catch (error) {
-      set.status = 500
+      set.status = 500;
       return {
         success: false,
-      }
+      };
     }
   })
 
@@ -115,6 +115,6 @@ const user_routes = new Elysia({ prefix: "/user" })
         fcm_token: t.String(),
       }),
     }
-  )
+  );
 
 export default user_routes;
