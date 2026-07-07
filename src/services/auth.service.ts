@@ -5,14 +5,14 @@ import {
   generate_jwt,
 } from "@/utils/general.utils";
 import { eq, desc } from "drizzle-orm";
-import { socket_connections } from "@/sockets/socket.server";
-import { MiscPayload } from "@/types/socket.types";
+import { redis } from "@/config/redis";
 import { create_user } from "./user.services";
 import {
   create_session,
   revoke_user_sessions,
   rotate_refresh_token,
   validate_session,
+  login_device,
 } from "./session.service";
 
 const handle_login = async ({
@@ -119,51 +119,88 @@ const handle_refresh_token_mobile = (token: string) =>
 // token). Lightweight, read-only.
 const validate_refresh_token = (token: string) => validate_session(token);
 
-// Force logout all other devices when a user logs in on a new device
-// This sends a WebSocket message to all active connections for the user
-// and closes those connections
+// Force-logout the user's other live socket (single-device). Publishes over Redis so
+// it reaches the socket on ANY PM2 worker — the old socket_connections.get(user_id)
+// only ever saw same-worker sockets, so a cross-worker device was never told to log
+// out (the split-brain behind late/never "logged in elsewhere" logouts). The durable
+// authority is auth_devices.token_version (re-checked on WS open); this is just the
+// instant nudge. Delivered by the ws:force_logout subscriber in ws-broadcast.ts.
 const force_logout_other_devices = async (user_id: string): Promise<void> => {
   try {
-    const connection = socket_connections.get(user_id);
+    await redis.publish("ws:force_logout", JSON.stringify({ user_id }));
+  } catch (error) {
+    console.error(`[AUTH] Error publishing force_logout for user ${user_id}:`, error);
+  }
+};
 
-    if (connection && connection.ws.readyState === 1) {
-      // Send force logout message to the existing connection
-      const force_logout_message = {
-        type: 'auth:force_logout' as const,
-        payload: {
-          message: 'You have been logged out because you logged in on another device',
-          code: 499,
-        } as MiscPayload,
-        ws_timestamp: new Date(),
-      };
+// Mobile device login: verify identity (phone OTP is checked at the route; email+
+// password is checked here), run the single-device engine + mint the long-lived
+// device JWT (login_device), THEN nudge the old device. Order matters — the DB
+// version bump + authver write happen BEFORE the nudge, so a racing reconnect from
+// the old device fails the WS version-check instead of slipping back in.
+const handle_login_device = async ({
+  phone,
+  email,
+  password,
+  device,
+}: {
+  phone?: string;
+  email?: string;
+  password?: string;
+  device: { device_id: string; platform?: string; device_name?: string };
+}) => {
+  try {
+    const user = await db
+      .select()
+      .from(user_model)
+      .where(phone ? eq(user_model.phone, phone) : eq(user_model.email, email!))
+      .then((res) => res[0]);
 
-      try {
-        connection.ws.send(force_logout_message, true);
-        console.log(`[AUTH] Sent force logout message to user ${user_id}`);
+    if (!user) {
+      return { success: false, code: 404, message: "User not found" };
+    }
 
-        // Close the WebSocket connection after a short delay to allow message delivery
-        setTimeout(() => {
-          if (connection.ws.readyState === 1) {
-            connection.ws.close(4003, "Logged out due to new login on another device");
-            socket_connections.delete(user_id);
-            console.log(`[AUTH] Closed WebSocket connection for user ${user_id}`);
-          }
-        }, 100);
-      } catch (error) {
-        console.error(`[AUTH] Error sending force logout to user ${user_id}:`, error);
-        // Still try to close the connection
-        try {
-          if (connection.ws.readyState === 1) {
-            connection.ws.close(4003, "Logged out due to new login on another device");
-          }
-          socket_connections.delete(user_id);
-        } catch (closeError) {
-          console.error(`[AUTH] Error closing connection for user ${user_id}:`, closeError);
-        }
+    if (password) {
+      if (!user.hashed_password) {
+        return {
+          success: false,
+          code: 403,
+          message: "Account is not password protected",
+          help: {
+            message: "Login via OTP!",
+            link: `${process.env.FRONTEND_URL}/otp-login`,
+          },
+        };
+      }
+      const isPasswordCorrect = await compare_password(password, user.hashed_password);
+      if (!isPasswordCorrect) {
+        return { success: false, code: 401, message: "Incorrect password" };
       }
     }
-  } catch (error) {
-    console.error(`[AUTH] Error in force_logout_other_devices for user ${user_id}:`, error);
+
+    // Authoritative single-device + mint FIRST, then the instant nudge.
+    const { token } = await login_device(user.id, user.role, device);
+    await force_logout_other_devices(user.id);
+
+    return {
+      success: true,
+      code: 200,
+      message: "Login successful",
+      data: {
+        id: user.id,
+        name: user.name,
+        role: user.role,
+        phone: user.phone,
+        email: user.email,
+        profile_pic: user.profile_pic,
+        call_access: user.call_access,
+        created_at: user.created_at,
+        token, // long-lived device JWT in body; NO refresh_token
+      },
+    };
+  } catch (error: any) {
+    console.error("Device login error:", error);
+    return { success: false, code: 500, message: "Internal server error during login" };
   }
 };
 
@@ -375,6 +412,7 @@ const demo_login = async () => {
 
 export {
   handle_login,
+  handle_login_device,
   handle_refresh_token,
   handle_refresh_token_mobile,
   force_logout_other_devices,

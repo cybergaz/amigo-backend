@@ -1,8 +1,10 @@
 import db from "@/config/db";
 import { refresh_session_model } from "@/models/session.model";
+import { auth_device_model } from "@/models/auth-device.model";
 import { user_model } from "@/models/user.model";
-import { generate_jwt, generate_refresh_jwt } from "@/utils/general.utils";
-import { and, eq, gt, or } from "drizzle-orm";
+import { generate_jwt, generate_refresh_jwt, generate_device_jwt } from "@/utils/general.utils";
+import { and, eq, gt, ne, or, sql } from "drizzle-orm";
+import { redis } from "@/config/redis";
 import type { StringValue } from "ms";
 
 // How long the previous refresh token stays valid after a rotation. This is what
@@ -251,9 +253,85 @@ const validate_session = async (token: string) => {
   }
 };
 
+// ─── Mobile single-token auth (auth_devices) ────────────────────────────────
+// Separate from the refresh_sessions machinery above (web/admin). login_device is
+// the single-device engine + long-lived-token minter for the mobile app.
+
+// Evict the user's OTHER device rows (and their Redis version keys), upsert THIS
+// device with a bumped token_version, and mint the long-lived device JWT. The
+// bumped version is what invalidates a superseded device on the WS open check.
+const login_device = async (
+  user_id: string,
+  role: string,
+  device: { device_id: string; platform?: string; device_name?: string }
+): Promise<{ token: string; token_version: number }> => {
+  // 1. Evict all OTHER devices; capture them so we can purge their Redis keys.
+  const removed = await db
+    .delete(auth_device_model)
+    .where(
+      and(
+        eq(auth_device_model.user_id, user_id),
+        ne(auth_device_model.device_id, device.device_id)
+      )
+    )
+    .returning({ device_id: auth_device_model.device_id });
+
+  // 2. Upsert THIS device; bump token_version when the same device re-logs in.
+  const [row] = await db
+    .insert(auth_device_model)
+    .values({
+      user_id,
+      device_id: device.device_id,
+      token_version: 1,
+      platform: device.platform,
+      device_name: device.device_name,
+      last_seen_at: new Date(),
+    })
+    .onConflictDoUpdate({
+      target: [auth_device_model.user_id, auth_device_model.device_id],
+      set: {
+        token_version: sql`${auth_device_model.token_version} + 1`,
+        platform: device.platform,
+        device_name: device.device_name,
+        last_seen_at: new Date(),
+      },
+    })
+    .returning({ token_version: auth_device_model.token_version });
+
+  const token_version = row.token_version;
+  const token = generate_device_jwt(user_id, role, device.device_id, token_version);
+
+  // 3. Purge evicted devices' cached versions (else a stale token could still pass
+  //    the WS check off a cached value — there's no TTL), then write-through this
+  //    device's current version for the WS open fast-path.
+  await Promise.all(
+    removed.map((r) => redis.del(`authver:${user_id}:${r.device_id}`))
+  );
+  await redis.set(`authver:${user_id}:${device.device_id}`, String(token_version));
+
+  return { token, token_version };
+};
+
+// Current token_version for a device (WS open falls back to this on a Redis miss).
+const get_auth_device = async (user_id: string, device_id: string) => {
+  const [row] = await db
+    .select({ token_version: auth_device_model.token_version })
+    .from(auth_device_model)
+    .where(
+      and(
+        eq(auth_device_model.user_id, user_id),
+        eq(auth_device_model.device_id, device_id)
+      )
+    )
+    .limit(1);
+  return row ?? null;
+};
+
 export {
   create_session,
   revoke_user_sessions,
   rotate_refresh_token,
   validate_session,
+  login_device,
+  get_auth_device,
 };

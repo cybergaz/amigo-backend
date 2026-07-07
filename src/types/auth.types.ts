@@ -7,6 +7,11 @@ const VerifySignupSchema = t.Object({
   phone: t.String(),
   role: t.Enum(Object.fromEntries(ROLE_CONST.map(area => [area, area]))),
   otp: t.Number(),
+  // Mobile single-token flow: presence of device_id routes signup to the
+  // device-JWT mint (no cookies). Absent ⇒ legacy cookie/refresh path.
+  device_id: t.Optional(t.String()),
+  platform: t.Optional(t.String()),
+  device_name: t.Optional(t.String()),
 });
 
 export { VerifySignupSchema };

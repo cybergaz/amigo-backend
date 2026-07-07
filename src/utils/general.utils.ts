@@ -20,6 +20,16 @@ const hash_password = async (password: string): Promise<string> => {
 };
 
 
+const getAccessKey = (): string => {
+  const k = process.env.ACCESS_KEY;
+  if (k) return k;
+  // Fail-fast: with long-lived (365d) device tokens, a known fallback key would let
+  // anyone mint a valid token for any user. Require ACCESS_KEY; opt into the dev
+  // convenience explicitly (NOT gated on NODE_ENV — unreliable in this deploy).
+  if (process.env.ALLOW_DEV_SECRET === "1") return "heymama";
+  throw new Error("ACCESS_KEY must be set (or set ALLOW_DEV_SECRET=1 for local dev)");
+};
+
 const generate_jwt = (id: string, role: string, time: StringValue = "1d") => {
   // TESTING OVERRIDE: set ACCESS_TOKEN_TTL (e.g. "60s") in .env to force short
   // access tokens regardless of call site, so token-refresh can be tested
@@ -29,7 +39,7 @@ const generate_jwt = (id: string, role: string, time: StringValue = "1d") => {
     id,
     role,
   },
-    process.env.ACCESS_KEY || "heymama", {
+    getAccessKey(), {
     expiresIn: ttl,
   });
 };
@@ -42,7 +52,23 @@ const generate_refresh_jwt = (id: string, role: string, time: StringValue = "7d"
   // legacy call sites. Self-identifying tokens enable future device management.
   const payload: Record<string, unknown> = { id, role };
   if (sid) payload.sid = sid;
-  return jwt.sign(payload, process.env.ACCESS_KEY || "heymama", {
+  return jwt.sign(payload, getAccessKey(), {
+    expiresIn: ttl,
+  });
+};
+
+// Long-lived (365d) device-bound token for mobile single-token auth. Carries
+// device_id + token_version so the WS open handler enforces single-device: a
+// superseded device's token_version no longer matches auth_devices / Redis.
+const generate_device_jwt = (
+  id: string,
+  role: string,
+  device_id: string,
+  token_version: number,
+  time: StringValue = "365d"
+) => {
+  const ttl = (process.env.DEVICE_TOKEN_TTL as StringValue) || time;
+  return jwt.sign({ id, role, device_id, token_version }, getAccessKey(), {
     expiresIn: ttl,
   });
 };
@@ -90,4 +116,4 @@ const create_dm_key = (user1: string, user2: string) => {
 };
 
 
-export { parse_phone, to_e164, generate_unique_id, create_otp, hash_password, generate_jwt, generate_refresh_jwt, compare_password, create_dm_key };
+export { parse_phone, to_e164, generate_unique_id, create_otp, hash_password, generate_jwt, generate_refresh_jwt, generate_device_jwt, getAccessKey, compare_password, create_dm_key };

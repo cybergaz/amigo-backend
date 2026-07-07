@@ -1,7 +1,7 @@
 import db from "@/config/db";
 import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
-import { create_signup_request, get_signup_request_status, handle_login, handle_refresh_token, handle_refresh_token_mobile, validate_refresh_token } from "@/services/auth.service";
+import { create_signup_request, get_signup_request_status, handle_login, handle_login_device, handle_refresh_token, handle_refresh_token_mobile, validate_refresh_token } from "@/services/auth.service";
 import { revoke_user_sessions } from "@/services/session.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { create_user, find_user_by_phone } from "@/services/user.services";
@@ -111,6 +111,9 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       password,
       role,
       phone,
+      ...(body.device_id
+        ? { device: { device_id: body.device_id, platform: body.platform, device_name: body.device_name } }
+        : {}),
     });
     if (!create_user_res?.success) {
       set.status = create_user_res?.code;
@@ -191,6 +194,21 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       }
     }
 
+    // Mobile single-token flow (OTP already verified above): mint the long-lived
+    // device JWT into the BODY, set NO cookies. Gated purely on device_id presence.
+    if (body.device_id) {
+      const device_login_res = await handle_login_device({
+        phone: body.phone,
+        device: {
+          device_id: body.device_id,
+          platform: body.platform,
+          device_name: body.device_name,
+        },
+      });
+      set.status = device_login_res.code;
+      return device_login_res;
+    }
+
     const login_res = await handle_login({ phone: body.phone });
     if (login_res.success == false) {
       set.status = login_res.code;
@@ -225,6 +243,9 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       body: t.Object({
         phone: t.String(),
         otp: t.Number(),
+        device_id: t.Optional(t.String()),
+        platform: t.Optional(t.String()),
+        device_name: t.Optional(t.String()),
       }),
     }
   )

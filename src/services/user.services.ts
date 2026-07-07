@@ -8,7 +8,7 @@ import {
   parse_phone,
   to_e164,
 } from "@/utils/general.utils";
-import { create_session } from "./session.service";
+import { create_session, login_device } from "./session.service";
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
 import { eq, and, inArray, isNull, ne, sql, or, ilike } from "drizzle-orm";
 import { store_fcm_token } from "@/cache-management/fcm-token.cache";
@@ -22,6 +22,8 @@ type CreateUserParams = {
   password: string | undefined | null;
   role: RoleType;
   phone: string;
+  // Mobile signup: presence routes to the device-JWT mint (see create_user).
+  device?: { device_id: string; platform?: string; device_name?: string };
 };
 
 const create_user = async ({
@@ -29,6 +31,7 @@ const create_user = async ({
   password,
   role,
   phone,
+  device,
 }: CreateUserParams) => {
   try {
     // let user_id;
@@ -57,6 +60,23 @@ const create_user = async ({
         call_access: true,
       })
       .returning();
+
+    // Mobile device signup → single long-lived device JWT (no cookies/refresh).
+    if (device) {
+      const { token } = await login_device(new_user.id, role, device);
+      return {
+        success: true,
+        code: 200,
+        message: "User Created Successfully",
+        data: {
+          id: new_user.id,
+          name,
+          role,
+          phone: canonical_phone,
+          token,
+        },
+      };
+    }
 
     const access_token = generate_jwt(new_user.id, role, "7d");
     // Brand-new account → first session. No other sessions to revoke.

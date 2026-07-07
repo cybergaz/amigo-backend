@@ -8,6 +8,9 @@ import { update_user_details } from "@/services/user.services";
 // import { sync_missed_messages } from "@/services/chat.services";
 import { start_cleanup_cron, stop_cleanup_cron } from "@/cache-management/polling.cache";
 import { get_user_peers } from "@/cache-management/user-peer.cache";
+import { get_auth_device } from "@/services/session.service";
+import { redis } from "@/config/redis";
+import { AuthError } from "@/constants/auth-codes";
 
 // Connection maps for different transport types
 const socket_connections = new Map<string, UserConnection>(); // user_id -> UserConnection (WebSocket)
@@ -109,6 +112,7 @@ const web_socket_server = new Elysia({
           ws.send({
             type: 'socket:error',
             error_code: 'AUTH_REQUIRED',
+            auth_error: AuthError.TOKEN_MISSING,
             message: 'Authentication token is required',
             timestamp: new Date().toISOString()
           }, true);
@@ -119,15 +123,53 @@ const web_socket_server = new Elysia({
         // Verify JWT token
         const auth_result = authenticate_jwt(token);
         if (!auth_result.success || !auth_result.data) {
-          // Send error message before closing so client can detect auth failure
+          // Forward the specific auth_error (TOKEN_EXPIRED/TOKEN_INVALID). These are
+          // NON-terminal on the socket: the client reconnects, it does not log out.
           ws.send({
             type: 'socket:error',
             error_code: 'AUTH_INVALID',
+            auth_error: (auth_result as { auth_error?: string }).auth_error ?? AuthError.TOKEN_INVALID,
             message: 'Invalid or expired authentication token',
             timestamp: new Date().toISOString()
           }, true);
           ws.close(4001, "Invalid authentication token");
           return;
+        }
+
+        // Single-device enforcement (mobile device tokens only). A device token
+        // carries device_id + token_version; if they no longer match the current
+        // auth_devices row (checked via Redis, DB fallback on miss), this device was
+        // superseded by a newer login → reject. Old/admin/web tokens lack these
+        // claims → skipped (dual-run). Runs BEFORE the socket registers so a
+        // rejected connection never enters socket_connections / presence.
+        const device_id = auth_result.data.device_id;
+        const token_version = auth_result.data.token_version;
+        if (device_id != null && token_version != null) {
+          const uid = auth_result.data.id;
+          let ok = false;
+          const cached = await redis.get(`authver:${uid}:${device_id}`);
+          if (cached != null) {
+            ok = Number(cached) === token_version;
+          } else {
+            const row = await get_auth_device(uid, device_id);
+            if (row) {
+              await redis.set(`authver:${uid}:${device_id}`, String(row.token_version));
+              ok = row.token_version === token_version;
+            }
+          }
+          if (!ok) {
+            // Terminal: single-device supersede. Send the labeled frame before the
+            // close so a client reading it gets the reason; close(4003) remains the
+            // primary logout trigger.
+            ws.send({
+              type: 'socket:error',
+              auth_error: AuthError.DEVICE_SUPERSEDED,
+              message: 'Session superseded on another device',
+              timestamp: new Date().toISOString()
+            }, true);
+            ws.close(4003, "Session superseded on another device");
+            return;
+          }
         }
 
         // Store user_id in WebSocket data using type-safe helper
