@@ -52,7 +52,10 @@ const get_all_conversations_admin = async (type?: string) => {
           .where(
             and(
               eq(chat_member_model.chat_id, conv.conversationId),
-              isNull(chat_member_model.removed_at)
+              isNull(chat_member_model.removed_at),
+              // Only count active members; left/kicked/pending rows keep
+              // removed_at NULL and would otherwise inflate the count.
+              eq(chat_member_model.status, "active")
             )
           );
 
@@ -73,7 +76,8 @@ const get_all_conversations_admin = async (type?: string) => {
             .where(
               and(
                 eq(chat_member_model.chat_id, conv.conversationId),
-                isNull(chat_member_model.removed_at)
+                isNull(chat_member_model.removed_at),
+                eq(chat_member_model.status, "active")
               )
             )
             .limit(2);
@@ -142,7 +146,12 @@ const get_conversation_members_admin = async (conversation_id: string) => {
       .where(
         and(
           eq(chat_member_model.chat_id, conversation_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          // INVARIANT: left/kicked/pending rows keep removed_at NULL as
+          // read-only shells. Without this status gate a removed member still
+          // shows as a "current member" in the admin panel AND gets filtered
+          // out of the "Available Users" list, so he can never be re-added.
+          eq(chat_member_model.status, "active")
         )
       )
       .orderBy(asc(chat_member_model.joined_at));
@@ -311,7 +320,10 @@ const force_declare_group_creater = async (conversation_id: string, member_id: s
       };
     }
 
-    // Verify that the member is part of the conversation
+    // Verify that the member is an ACTIVE part of the conversation. A left/
+    // kicked/pending row keeps removed_at NULL, so without the status gate a
+    // removed user would be treated as present and skip the re-add path below,
+    // leaving a group "creater" whose membership is still 'left'.
     const [member] = await db
       .select({
         user_id: chat_member_model.user_id,
@@ -321,7 +333,8 @@ const force_declare_group_creater = async (conversation_id: string, member_id: s
         and(
           eq(chat_member_model.chat_id, conversation_id),
           eq(chat_member_model.user_id, member_id),
-          isNull(chat_member_model.removed_at)
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
         )
       )
       .limit(1);

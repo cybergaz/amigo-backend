@@ -110,7 +110,16 @@ const get_connected_communities = async (user_id: string) => {
     const userGroupIdsResult = await db
       .select({ conversation_id: chat_member_model.chat_id })
       .from(chat_member_model)
-      .where(eq(chat_member_model.user_id, user_id));
+      .where(
+        and(
+          eq(chat_member_model.user_id, user_id),
+          // Only groups the user is ACTIVELY in count as "connected". Left/
+          // kicked/pending rows keep removed_at NULL as shells, so without the
+          // status gate a removed member would still see the community.
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active")
+        )
+      );
 
     const userGroupIds = userGroupIdsResult.map(r => r.conversation_id);
 
