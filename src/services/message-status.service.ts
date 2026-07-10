@@ -7,10 +7,19 @@ import {
 } from "@/models/message.model";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { ResultType } from "@/types/core.types";
-import Snowflake from "@/utils/snowflake.utils";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import { remove_pending_message } from "@/cache-management/polling.cache";
 import { MessageStatusAckPayload } from "@/types/socket.types";
+
+// The chat_id / message_id / user_id columns are Postgres `uuid`. Passing an
+// empty string or any non-UUID text straight into a WHERE clause makes
+// Postgres throw `22P02 invalid input syntax for type uuid`, which surfaces as
+// a 500 and error spam rather than a clean rejection. Guard inputs before they
+// reach the query. (An old client shipping an empty conversation_id was the
+// original trigger — see message_gc.service.dart.)
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const is_uuid = (v: unknown): v is string =>
+  typeof v === "string" && UUID_RE.test(v);
 
 const insert_message_status = async (msg_status: Pick<DBInsertMessageStatusType, "user_id" | "message_id" | "chat_id" | "delivered_at" | "read_at">) => {
   try {
@@ -350,12 +359,32 @@ const verify_message_ids = async (
   not_found: string[];
 }>> => {
   try {
-    if (message_ids.length === 0) {
+    // Reject malformed identifiers before they reach the uuid-typed query.
+    // A bad conversation_id/sender_id can never match a row, so treat every
+    // requested id as not_found rather than 500-ing on a Postgres cast error.
+    if (!is_uuid(conversation_id) || !is_uuid(sender_id)) {
+      console.warn(
+        `verify_message_ids: rejecting non-UUID input conv=${JSON.stringify(
+          conversation_id,
+        )} sender=${JSON.stringify(sender_id)}`,
+      );
+      return {
+        success: true,
+        code: 200,
+        message: "Invalid identifiers",
+        data: { found: {}, not_found: message_ids },
+      };
+    }
+
+    // Drop any non-UUID message ids too (same uuid-column hazard on the IN list).
+    const valid_ids = message_ids.filter(is_uuid);
+
+    if (valid_ids.length === 0) {
       return {
         success: true,
         code: 200,
         message: "No IDs to verify",
-        data: { found: {}, not_found: [] },
+        data: { found: {}, not_found: message_ids },
       };
     }
 
@@ -364,7 +393,7 @@ const verify_message_ids = async (
       .from(message_model)
       .where(
         and(
-          inArray(message_model.id, message_ids),
+          inArray(message_model.id, valid_ids),
           eq(message_model.chat_id, conversation_id),
           eq(message_model.sender_id, sender_id),
           isNull(message_model.deleted_at),

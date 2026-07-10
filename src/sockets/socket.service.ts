@@ -4,23 +4,20 @@ import { broadcast_message, is_user_online, } from "./socket.handlers";
 // import { update_user_connection_status } from "@/services/user.services";
 import { socket_connections } from "./socket.server";
 import { forward_messages, store_message_with_retry } from "@/services/message.services";
-import { batch_insert_message_status, mark_read_upto } from "@/services/message-status.service";
-import { add_members, get_conversation_members, is_member } from "@/cache-management/conv.cache";
+import { mark_read_upto } from "@/services/message-status.service";
+import { add_members, is_member } from "@/cache-management/conv.cache";
 import { update_chat_meta, batch_increment_unread, reset_unread } from "@/cache-management/chat-meta.cache";
 import db from "@/config/db";
 import { chat_model, chat_member_model } from "@/models/chat.model";
 import { message_model } from "@/models/message.model";
 import { user_model } from "@/models/user.model";
 import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
-import { update_conversation } from "@/services/chat.services";
 import FCMService from "@/services/fcm.service";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
 import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
-import { ChatType } from "@/types/chat.types";
 import type { CallEndReasonsType } from "@/types/call.types";
 import { CALL_TIMEOUT_MS, CallService, active_calls, register_missed_call_notifier } from "@/services/call.service";
 import StreamCallService from "@/services/stream-call.service";
-import { call_model } from "@/models/call.model";
 import { get_user_peers } from "@/cache-management/user-peer.cache";
 import { set_last_read, get_receipt } from "@/cache-management/chat-member.cache";
 import { batch_mark_status } from "@/cache-management/message.cache";
@@ -694,12 +691,24 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       // }
     }
 
-    // 5. Update conversation's last_msg_id and last_msg_at in the DB (fire-and-forget)
-    // update_conversation({
-    //   id: payload.conv_id,
-    //   last_msg_id: store_msg_result.data?.id,
-    //   last_msg_at: new Date()
-    // });
+    // // 5. Persist the last-message pointer to Postgres (fire-and-forget).
+    // //    chat_meta in Redis holds this for display, but it's a CACHE and is
+    // //    never flushed to PG — so without this write the pointer is lost on any
+    // //    cache wipe/flush, which blanks every DM list (the app hides chats whose
+    // //    last_msg_id is null). Runs after the sender ack, so it's off the
+    // //    latency path; failures are logged, not thrown.
+    // if (store_msg_result.data) {
+    //   db
+    //     .update(chat_model)
+    //     .set({
+    //       last_msg_id: store_msg_result.data.id,
+    //       last_msg_at: store_msg_result.data.sent_at ?? new Date(),
+    //     })
+    //     .where(eq(chat_model.id, payload.conv_id))
+    //     .catch((err) =>
+    //       console.error(`[WS] last_msg_id persist failed (${payload.conv_id}):`, err),
+    //     );
+    // }
 
     // 6. Queue FCM for offline AND backgrounded users. Backgrounded users keep
     //    a live WS (so they also received the frame above), but the OS may have
@@ -1276,7 +1285,7 @@ const handle_call_termination = async (
 
     let reason: CallEndReasonsType;
     let status: string | undefined;
-    let terminate_error: { code?: number; message?: string; error?: any } | null = null;
+    let terminate_error: { code?: number; message?: string; error?: any; } | null = null;
 
     if (is_legacy_call) {
       // ── In-house WebRTC backend ─────────────────────────────────────────
@@ -1506,7 +1515,7 @@ const handle_call_connected = async (payload: CallPayload, user_id: string): Pro
 };
 
 /** Look up a user's display name + avatar for the rejoin payloads. */
-const get_user_display = async (userId: string): Promise<{ name?: string; pfp?: string }> => {
+const get_user_display = async (userId: string): Promise<{ name?: string; pfp?: string; }> => {
   try {
     const [u] = await db
       .select({ name: user_model.name, profile_pic: user_model.profile_pic })
@@ -1570,7 +1579,7 @@ const notify_rejoin_open = async (args: {
  * "Reconnecting…" banner from a server signal, not only its local timer).
  */
 const notify_rejoin_ended = async (
-  w: { cid: string; dropped_id: string; waiter_id: string },
+  w: { cid: string; dropped_id: string; waiter_id: string; },
   reason: string,
   outcome?: string,
 ): Promise<void> => {
@@ -1581,8 +1590,8 @@ const notify_rejoin_ended = async (
     data: { reason, outcome, role },
     timestamp: new Date(),
   });
-  await fan_out_to_user(w.dropped_id, "call:rejoin:expired", mk("dropped")).catch(() => {});
-  await fan_out_to_user(w.waiter_id, "call:rejoin:expired", mk("waiter")).catch(() => {});
+  await fan_out_to_user(w.dropped_id, "call:rejoin:expired", mk("dropped")).catch(() => { });
+  await fan_out_to_user(w.waiter_id, "call:rejoin:expired", mk("waiter")).catch(() => { });
 };
 
 /**
@@ -1593,7 +1602,7 @@ const notify_rejoin_ended = async (
  * Webhook-independent — everyone is informed and cleanup runs for both, as the
  * single authoritative end-of-window action.
  */
-const terminate_rejoin_window = async (w: { cid: string; dropped_id: string; waiter_id: string }): Promise<void> => {
+const terminate_rejoin_window = async (w: { cid: string; dropped_id: string; waiter_id: string; }): Promise<void> => {
   StreamCallService.clearCall(w.cid, [w.dropped_id, w.waiter_id]);
   const terminate = (): CallPayload => ({
     call_id: w.cid,
@@ -1602,8 +1611,8 @@ const terminate_rejoin_window = async (w: { cid: string; dropped_id: string; wai
     data: { success: true, terminated_by: "server", status: "ended", reason: "rejoin_timeout" },
     timestamp: new Date(),
   });
-  await fan_out_to_user(w.waiter_id, "call:terminate", terminate()).catch(() => {});
-  await fan_out_to_user(w.dropped_id, "call:terminate", terminate()).catch(() => {});
+  await fan_out_to_user(w.waiter_id, "call:terminate", terminate()).catch(() => { });
+  await fan_out_to_user(w.dropped_id, "call:terminate", terminate()).catch(() => { });
   // Also clear L's rejoin dot (in case L is sitting on the call-logs screen).
   await notify_rejoin_ended(w, "expired");
   console.log(`[WS] rejoin window TERMINATED (30s elapsed) cid=${w.cid} both=${w.dropped_id},${w.waiter_id}`);
