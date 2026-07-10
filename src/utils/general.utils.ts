@@ -1,6 +1,7 @@
 import jwt from "jsonwebtoken";
 import type { StringValue } from "ms";
 import bcrypt from "bcryptjs";
+import { createHmac } from "node:crypto";
 import { customAlphabet } from "nanoid";
 import { parsePhoneNumberFromString } from "libphonenumber-js";
 
@@ -77,6 +78,37 @@ const compare_password = async (password: string, hashed_password: string) => {
   return await bcrypt.compare(password, hashed_password);
 };
 
+// ─── PIN hashing (phone + 4-digit PIN auth) ─────────────────────────────────
+// A 4-digit PIN is only a 10,000-value space, so bcrypt alone would be cracked
+// instantly offline if the DB ever leaked. We first HMAC the PIN with a server-held
+// secret (PIN_PEPPER) that never lives in the DB, THEN bcrypt the digest. An
+// attacker with the DB dump still can't brute-force the PIN without also stealing
+// the pepper. (Online brute force is handled separately by the Redis lockout.)
+const getPinPepper = (): string => {
+  const p = process.env.PIN_PEPPER;
+  if (p) return p;
+  // Fail-fast mirrors getAccessKey: a known fallback pepper would defeat the point.
+  // Opt into the dev convenience explicitly.
+  if (process.env.ALLOW_DEV_SECRET === "1") return "dev-pin-pepper";
+  throw new Error("PIN_PEPPER must be set (or set ALLOW_DEV_SECRET=1 for local dev)");
+};
+
+const pepper_pin = (pin: string): string =>
+  createHmac("sha256", getPinPepper()).update(pin).digest("hex");
+
+const hash_pin = async (pin: string): Promise<string> => {
+  return await bcrypt.hash(pepper_pin(pin), 10);
+};
+
+const compare_pin = async (pin: string, hashed_pin: string): Promise<boolean> => {
+  return await bcrypt.compare(pepper_pin(pin), hashed_pin);
+};
+
+// Server-side format guard — the PIN must be exactly 4 digits. Mirrored on the
+// client, enforced here as the authority.
+const is_valid_pin = (pin: unknown): pin is string =>
+  typeof pin === "string" && /^\d{4}$/.test(pin);
+
 
 function parse_phone(input: string, default_country_code?: string) {
   const phone = parsePhoneNumberFromString(input);
@@ -116,4 +148,4 @@ const create_dm_key = (user1: string, user2: string) => {
 };
 
 
-export { parse_phone, to_e164, generate_unique_id, create_otp, hash_password, generate_jwt, generate_refresh_jwt, generate_device_jwt, getAccessKey, compare_password, create_dm_key };
+export { parse_phone, to_e164, generate_unique_id, create_otp, hash_password, generate_jwt, generate_refresh_jwt, generate_device_jwt, getAccessKey, compare_password, hash_pin, compare_pin, is_valid_pin, create_dm_key };

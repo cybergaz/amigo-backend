@@ -4,6 +4,9 @@ import { ROLE_CONST } from "./user.types";
 const VerifySignupSchema = t.Object({
   name: t.String(),
   password: t.Optional(t.String()),
+  // Mobile signup sets the login (password) PIN — 4 digits, hashed into
+  // password_pin_hash (separate from the web `password`).
+  password_pin: t.Optional(t.String({ pattern: "^\\d{4}$" })),
   phone: t.String(),
   role: t.Enum(Object.fromEntries(ROLE_CONST.map(area => [area, area]))),
   otp: t.Number(),

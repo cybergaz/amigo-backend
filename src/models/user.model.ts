@@ -11,6 +11,13 @@ const user_model = pgTable("users", {
   role: varchar({ enum: ROLE_CONST }).notNull(),
   profile_pic: text(),
   hashed_password: text(),
+  // PIN-auth (phone + 4-digit PIN login). Both store a bcrypt hash of an
+  // HMAC-peppered PIN (see hash_pin/compare_pin) — NEVER plaintext, and kept
+  // SEPARATE from hashed_password (that's the web/email password). NULL = "not set",
+  // which is what drives the app's create-PIN enforcement gate.
+  // password_pin = the login credential; admin_pin = second PIN for a future feature.
+  password_pin_hash: text(),
+  admin_pin_hash: text(),
   refresh_token: text(),
   last_seen: timestamp({ withTimezone: true }).defaultNow(),
   location: jsonb(), // { latitude: number, longitude: number }

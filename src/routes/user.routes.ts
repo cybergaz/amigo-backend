@@ -1,6 +1,7 @@
 import { Elysia, t } from "elysia";
 import { get_available_users, get_user_details, update_user_details, update_profile_image } from "@/services/user.services";
 import { get_all_users } from "@/services/user.services";
+import { set_user_pin } from "@/services/pin.service";
 import { app_middleware } from "@/middleware";
 import { ROLE_CONST } from "@/types/user.types";
 import FCMService from "@/services/fcm.service";
@@ -113,6 +114,23 @@ const user_routes = new Elysia({ prefix: "/user" })
     {
       body: t.Object({
         fcm_token: t.String(),
+      }),
+    }
+  )
+
+  // Set or update a security PIN (authenticated). kind = "password" | "admin".
+  // First-time set needs no current_pin; changing an existing PIN requires it.
+  // Used by both the Settings PIN rows and the enforcement create-PINs screen.
+  .post("/set-pin", async ({ set, store, body }) => {
+    const result = await set_user_pin(store.id, body.kind, body.pin, body.current_pin);
+    set.status = result.code;
+    return result;
+  },
+    {
+      body: t.Object({
+        kind: t.Union([t.Literal("password"), t.Literal("admin")]),
+        pin: t.String({ pattern: "^\\d{4}$" }),
+        current_pin: t.Optional(t.String({ pattern: "^\\d{4}$" })),
       }),
     }
   );

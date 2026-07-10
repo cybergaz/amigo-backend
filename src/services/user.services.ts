@@ -5,6 +5,7 @@ import { RoleType } from "@/types/user.types";
 import {
   generate_jwt,
   hash_password,
+  hash_pin,
   parse_phone,
   to_e164,
 } from "@/utils/general.utils";
@@ -22,6 +23,9 @@ type CreateUserParams = {
   password: string | undefined | null;
   role: RoleType;
   phone: string;
+  // Mobile signup sets the login (password) PIN here. Hashed into password_pin_hash,
+  // kept separate from `password`/hashed_password (that's the web/email password).
+  password_pin?: string | null;
   // Mobile signup: presence routes to the device-JWT mint (see create_user).
   device?: { device_id: string; platform?: string; device_name?: string };
 };
@@ -31,6 +35,7 @@ const create_user = async ({
   password,
   role,
   phone,
+  password_pin,
   device,
 }: CreateUserParams) => {
   try {
@@ -46,6 +51,10 @@ const create_user = async ({
       hashed_password = await hash_password(password);
     }
 
+    // Login PIN set at signup (mobile). Peppered + bcrypt via hash_pin.
+    const password_pin_hash =
+      password_pin ? await hash_pin(password_pin) : undefined;
+
     // Persist the canonical E.164 form so the stored number always matches what
     // OTP generation/verification used (and never a doubled "+9191…" string).
     const canonical_phone = to_e164(phone);
@@ -57,6 +66,7 @@ const create_user = async ({
         role,
         phone: canonical_phone,
         hashed_password,
+        password_pin_hash,
         call_access: true,
       })
       .returning();
@@ -73,6 +83,8 @@ const create_user = async ({
           name,
           role,
           phone: canonical_phone,
+          has_password_pin: new_user.password_pin_hash != null,
+          has_admin_pin: new_user.admin_pin_hash != null,
           token,
         },
       };
@@ -180,6 +192,10 @@ const get_user_details = async (id: string) => {
         // online_status: user_model.online_status,
         location: user_model.location,
         ip_address: user_model.ip_address,
+        // PIN-auth flags: booleans only (never the hashes). Drive the app's
+        // create-PIN enforcement gate + the Settings "PIN set / not set" state.
+        has_password_pin: sql<boolean>`(${user_model.password_pin_hash} IS NOT NULL)`,
+        has_admin_pin: sql<boolean>`(${user_model.admin_pin_hash} IS NOT NULL)`,
       })
       .from(user_model)
       .where(eq(user_model.id, id))
@@ -216,11 +232,26 @@ const update_user_details = async (id: string, body: UpdateUserType) => {
       previous_profile_pic = existing.success ? (existing.data?.profile_pic ?? null) : undefined;
     }
 
+    // Explicit projection — NEVER a bare .returning() here: that would ship
+    // hashed_password / password_pin_hash / admin_pin_hash back to the client.
     const user_details = await db
       .update(user_model)
       .set(body)
       .where(eq(user_model.id, id))
-      .returning();
+      .returning({
+        id: user_model.id,
+        name: user_model.name,
+        phone: user_model.phone,
+        email: user_model.email,
+        role: user_model.role,
+        profile_pic: user_model.profile_pic,
+        created_at: user_model.created_at,
+        last_seen: user_model.last_seen,
+        call_access: user_model.call_access,
+        location: user_model.location,
+        ip_address: user_model.ip_address,
+        app_version: user_model.app_version,
+      });
 
     if (user_details.length === 0) {
       return {
@@ -315,7 +346,20 @@ const batch_update_users_details = async (ids: string[], body: UpdateUserType) =
       .update(user_model)
       .set(body)
       .where(inArray(user_model.id, ids))
-      .returning();
+      .returning({
+        id: user_model.id,
+        name: user_model.name,
+        phone: user_model.phone,
+        email: user_model.email,
+        role: user_model.role,
+        profile_pic: user_model.profile_pic,
+        created_at: user_model.created_at,
+        last_seen: user_model.last_seen,
+        call_access: user_model.call_access,
+        location: user_model.location,
+        ip_address: user_model.ip_address,
+        app_version: user_model.app_version,
+      });
 
     if (users_details.length === 0) {
       return {

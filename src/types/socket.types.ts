@@ -16,9 +16,6 @@ interface UserConnection {
   ws: ElysiaWS;
   missed_pings: number;
   active_conv_id?: string;
-  // True when the client has reported it is backgrounded. The WS stays
-  // registered (so live frames are still delivered while the OS allows it),
-  // but the user is ALSO eligible for FCM push so messages reliably arrive.
   is_background?: boolean;
 }
 
@@ -26,9 +23,6 @@ interface PollingConnection {
   connection_status: ConnectionStatusType;
   last_poll_at?: Date;
   client_ip?: string;
-  // last_poll_message_id?: string;
-  // active_conv_id?: string;
-  // connected_at: Date;
 }
 
 // Regular WebSocket message with payload
@@ -52,8 +46,6 @@ type WSMessage = {
   | UserUpdatePayload
   | MarqueeBannerPayload
   | ConversationDisappearingPayload;
-  // | SyncMessagesPayload
-  // | MessageDeliveredPayload;
   ws_timestamp?: Date;
 };
 
@@ -72,7 +64,6 @@ interface VitalWSMessage {
   | ConversationActionPayload
   | UserUpdatePayload
   | ConversationDisappearingPayload;
-  // | MessageDeliveredPayload;
   ws_timestamp?: Date;
 }
 
@@ -236,28 +227,13 @@ type MiscPayload = {
 type ConversationActionType =
   | 'member_added'
   | 'member_removed'
-  // A member voluntarily left (members = the leaver). Broadcast to the
-  // conversation AND direct to the leaver's other devices so their client
-  // flips the chat to a read-only "ask to join" shell.
   | 'member_left'
-  // Group ownership transferred (members = the new owner; owner_id carries the
-  // new owner's id). Sent when an owner hands off — including the implicit
-  // transfer an owner must do before leaving.
   | 'owner_changed'
-  // A user requested to (re)join. Sent ONLY to the owner + masters (never the
-  // whole conversation). members = the requester.
   | 'join_request:new'
-  // A pending request was approved/rejected (resolution field). Sent direct to
-  // the requester so their shell updates. Approval ALSO arrives as the usual
-  // member_added + conversation:new so the active chat is rebuilt.
   | 'join_request:resolved'
   | 'member_promoted'
   | 'member_demoted'
   | 'chat_delete'
-  // Group title or profile picture changed by an admin. Members carries no
-  // entries for this action — title / profile_pic / previous_profile_pic
-  // describe the change. Routed through conversation:action so it inherits
-  // the existing vital-event storage path for offline-replay.
   | 'chat_details:update';
 
 type ConversationActionPayload = {
@@ -269,24 +245,12 @@ type ConversationActionPayload = {
   actor_id?: string;
   message: string;
   action_at: Date;
-  // chat_details:update fields. Only set when at least one of title /
-  // profile_pic changed. profile_pic == null with profile_pic_changed = true
-  // means the avatar was cleared.
   title?: string | null;
   profile_pic?: string | null;
-  // Previous profile pic URL — clients use it as the cache key to evict the
-  // old image from on-disk CachedNetworkImage cache.
   previous_profile_pic?: string | null;
-  // Explicit "the pfp column was touched" flag. Needed because both
-  // profile_pic == null (cleared) and field-absent (title-only update) would
-  // otherwise collapse to the same wire shape.
   profile_pic_changed?: boolean;
-  // owner_changed: the new owner's user id.
   owner_id?: string | null;
-  // join_request:resolved: how the owner/master decided the request.
   resolution?: 'approved' | 'rejected';
-  // actor_name?: string;
-  // actor_pfp?: string;
 };
 
 // Broadcast when a user changes the disappearing-messages duration on a chat.
@@ -325,21 +289,6 @@ type MarqueeBannerPayload = {
   enabled: boolean;
   updated_at: string | null;
 };
-
-// type SyncMessagesPayload = {
-//   messages: ChatMessagePayload[];
-//   sync_timestamp: Date;
-//   total_count: number;
-// };
-
-// Delivery receipt payload - sent by recipient when message is delivered via FCM
-// type MessageDeliveredPayload = {
-//   message_id: string;
-//   conv_id: string;
-//   sender_id: string;
-//   recipient_id: string;
-//   delivered_at: Date;
-// };
 
 const WS_MESSAGE_EVENTS_CONST = [
   'connection:status',

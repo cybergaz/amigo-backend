@@ -2,6 +2,7 @@ import { signup_request_model, UpdateSignupRequestType, user_model } from "@/mod
 import db from "@/config/db";
 import {
   compare_password,
+  compare_pin,
   generate_jwt,
 } from "@/utils/general.utils";
 import { eq, desc } from "drizzle-orm";
@@ -14,6 +15,11 @@ import {
   validate_session,
   login_device,
 } from "./session.service";
+import {
+  get_pin_lock_status,
+  register_pin_failure,
+  clear_pin_attempts,
+} from "./pin-lockout.service";
 
 const handle_login = async ({
   phone,
@@ -195,11 +201,110 @@ const handle_login_device = async ({
         profile_pic: user.profile_pic,
         call_access: user.call_access,
         created_at: user.created_at,
+        has_password_pin: user.password_pin_hash != null,
+        has_admin_pin: user.admin_pin_hash != null,
         token, // long-lived device JWT in body; NO refresh_token
       },
     };
   } catch (error: any) {
     console.error("Device login error:", error);
+    return { success: false, code: 500, message: "Internal server error during login" };
+  }
+};
+
+// Mobile PIN login: phone + 4-digit password_pin. Same identity outcome as the OTP
+// path — verify the credential, then run the EXISTING single-device engine
+// (login_device + force_logout_other_devices) to mint the durable device JWT. The
+// token machinery is untouched; only the credential check differs (PIN vs OTP).
+//
+// Brute-force guarded by the per-phone Redis lockout. NONE of the failure responses
+// carry an `auth_error` field, so a wrong PIN / lockout can never log the user out
+// (see constants/auth-codes.ts).
+const handle_login_pin = async ({
+  phone,
+  pin,
+  device,
+}: {
+  phone: string;
+  pin: string;
+  device: { device_id: string; platform?: string; device_name?: string };
+}) => {
+  try {
+    // 1. Refuse early if this phone is currently locked out.
+    const lock = await get_pin_lock_status(phone);
+    if (lock.locked) {
+      return {
+        success: false,
+        code: 429,
+        message: `Too many incorrect attempts. Try again in ${Math.ceil(lock.retry_after / 60)} minute(s).`,
+        retry_after: lock.retry_after,
+      };
+    }
+
+    const user = await db
+      .select()
+      .from(user_model)
+      .where(eq(user_model.phone, phone))
+      .then((res) => res[0]);
+
+    if (!user) {
+      return { success: false, code: 404, message: "User not found" };
+    }
+
+    // No PIN set yet (pre-PIN user) → tell the client to fall back to OTP login.
+    if (!user.password_pin_hash) {
+      return {
+        success: false,
+        code: 403,
+        message: "No PIN set for this account. Please log in with OTP.",
+        pin_not_set: true,
+      };
+    }
+
+    const ok = await compare_pin(pin, user.password_pin_hash);
+    if (!ok) {
+      const after = await register_pin_failure(phone);
+      if (after.locked) {
+        return {
+          success: false,
+          code: 429,
+          message: `Too many incorrect attempts. Try again in ${Math.ceil(after.retry_after / 60)} minute(s).`,
+          retry_after: after.retry_after,
+        };
+      }
+      return {
+        success: false,
+        code: 401,
+        message: "Incorrect PIN",
+        attempts_remaining: after.attempts_remaining,
+      };
+    }
+
+    // Success — clear the counter, then the standard single-device mint + nudge.
+    await clear_pin_attempts(phone);
+    const { token } = await login_device(user.id, user.role, device);
+    await force_logout_other_devices(user.id);
+
+    return {
+      success: true,
+      code: 200,
+      message: "Login successful",
+      data: {
+        id: user.id,
+        name: user.name,
+        role: user.role,
+        phone: user.phone,
+        email: user.email,
+        profile_pic: user.profile_pic,
+        call_access: user.call_access,
+        created_at: user.created_at,
+        has_password_pin: user.password_pin_hash != null,
+        has_admin_pin: user.admin_pin_hash != null,
+        token, // long-lived device JWT in body; NO refresh_token
+      },
+    };
+  } catch (error: any) {
+    console.error("PIN login error:", error);
     return { success: false, code: 500, message: "Internal server error during login" };
   }
 };
@@ -413,6 +518,7 @@ const demo_login = async () => {
 export {
   handle_login,
   handle_login_device,
+  handle_login_pin,
   handle_refresh_token,
   handle_refresh_token_mobile,
   force_logout_other_devices,

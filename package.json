@@ -7,6 +7,7 @@
     "db:genpush": "drizzle-kit generate && drizzle-kit push",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
+    "db:apply-pins": "bun run scripts/apply-user-pins.ts",
     "version:set": "bun run scripts/set-app-version.ts",
     "version:notify": "bun run scripts/notify-app-update.ts",
     "flush:migrate": "bun run scripts/flush-before-migration.ts",

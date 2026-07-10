@@ -1,9 +1,10 @@
 import db from "@/config/db";
 import { authenticate_jwt } from "@/middleware";
 import { user_model } from "@/models/user.model";
-import { create_signup_request, get_signup_request_status, handle_login, handle_login_device, handle_refresh_token, handle_refresh_token_mobile, validate_refresh_token } from "@/services/auth.service";
+import { create_signup_request, get_signup_request_status, handle_login, handle_login_device, handle_login_pin, handle_refresh_token, handle_refresh_token_mobile, validate_refresh_token } from "@/services/auth.service";
 import { revoke_user_sessions } from "@/services/session.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
+import { get_phone_pin_status, reset_password_pin } from "@/services/pin.service";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { to_e164 } from "@/utils/general.utils";
 import { VerifySignupSchema } from "@/types/auth.types";
@@ -97,6 +98,21 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
   )
 
+  // Login precheck: { exists, has_pin } → app asks for a PIN when has_pin, else
+  // falls back to OTP login (pre-PIN users). Public, mirrors the existing
+  // generate-login-otp existence leak.
+  .get("/phone-status/:phone", async ({ set, params }) => {
+    const res = await get_phone_pin_status(params.phone);
+    set.status = res.code;
+    return res;
+  },
+    {
+      params: t.Object({
+        phone: t.String(),
+      }),
+    }
+  )
+
   .post("/verify-signup-otp", async ({ body, set, cookie, headers }) => {
     const { phone, name, password, role, otp } = body;
 
@@ -111,6 +127,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       password,
       role,
       phone,
+      password_pin: body.password_pin, // login PIN set during mobile signup
       ...(body.device_id
         ? { device: { device_id: body.device_id, platform: body.platform, device_name: body.device_name } }
         : {}),
@@ -246,6 +263,54 @@ const auth_routes = new Elysia({ prefix: "/auth" })
         device_id: t.Optional(t.String()),
         platform: t.Optional(t.String()),
         device_name: t.Optional(t.String()),
+      }),
+    }
+  )
+
+  // Phone + 4-digit PIN login (mobile). device_id required — this rides the same
+  // single-device durable-token mint as OTP login (handle_login_pin → login_device).
+  // Failure responses (401 wrong PIN / 403 no PIN / 429 locked) carry NO auth_error,
+  // so they can never force-logout the client.
+  .post("/login-pin", async ({ body, set }) => {
+    if (!body.device_id) {
+      set.status = 400;
+      return { success: false, code: 400, message: "device_id is required for PIN login" };
+    }
+    const res = await handle_login_pin({
+      phone: to_e164(body.phone),
+      pin: body.pin,
+      device: {
+        device_id: body.device_id,
+        platform: body.platform,
+        device_name: body.device_name,
+      },
+    });
+    set.status = res.code;
+    return res;
+  },
+    {
+      body: t.Object({
+        phone: t.String(),
+        pin: t.String({ pattern: "^\\d{4}$" }),
+        device_id: t.String(),
+        platform: t.Optional(t.String()),
+        device_name: t.Optional(t.String()),
+      }),
+    }
+  )
+
+  // Forgot-PIN: OTP proves phone ownership, then resets the login (password) PIN.
+  // Rides the existing OTP path unchanged.
+  .post("/reset-pin", async ({ body, set }) => {
+    const res = await reset_password_pin(body.phone, body.otp, body.new_pin);
+    set.status = res.code;
+    return res;
+  },
+    {
+      body: t.Object({
+        phone: t.String(),
+        otp: t.Number(),
+        new_pin: t.String({ pattern: "^\\d{4}$" }),
       }),
     }
   )
