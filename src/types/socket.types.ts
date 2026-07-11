@@ -130,24 +130,9 @@ type MessageStatusAckPayload = {
   }[];
 };
 
-// type ChatMessageAckPayload = {
-//   msg_id: string;
-//   conv_id: string;
-//   sender_id: string;
-//   is_failed?: boolean;
-//   error_code?: number;
-//   new_id?: string;  // In case of message ID change due to retry or edit
-//   // delivered_at: Date;
-//   // delivered_to?: string[];   // optimistic state for DMs (1-element max)
-//   // read_by?: string[];        // optimistic state for DMs (1-element max)
-// };
-
 type TypingPayload = {
   conv_id: string;
   sender_id: string;
-  // is_typing: boolean;
-  // sender_name?: string;
-  // sender_pfp?: string;
 };
 
 type MessagePinPayload = {
@@ -156,8 +141,6 @@ type MessagePinPayload = {
   message_type: MessageType;
   sender_id: string;
   pin: boolean;
-  // sender_name?: string;
-  // sender_pfp?: string;
 };
 
 type MessageForwardPayload = {
@@ -180,7 +163,6 @@ type MessageReactPayload = {
   sender_id: string;
   emoji: string;
   action: 'add' | 'remove';
-  // sender_name?: string;
 };
 
 type NewConversationPayload = {
@@ -292,12 +274,14 @@ type MarqueeBannerPayload = {
 
 const WS_MESSAGE_EVENTS_CONST = [
   'connection:status',
+
   'conversation:join',
-  // 'conversation:leave',
   'conversation:mark_read',
   'conversation:new',
   'conversation:typing',
   'conversation:action',
+  'conversation:disappearing',
+
   'message:new',
   'message:sent:ack',
   'message:status:ack',
@@ -305,9 +289,7 @@ const WS_MESSAGE_EVENTS_CONST = [
   'message:forward',
   'message:delete',
   'message:react',
-  'conversation:disappearing',
-  // 'message:sync',  // Sync missed messages on reconnection
-  // 'message:delivered',  // Delivery receipt from FCM messages
+
   'call:init',
   'call:init:ack',
   'call:ringing',
@@ -318,8 +300,6 @@ const WS_MESSAGE_EVENTS_CONST = [
   'call:terminate',
   'call:hold',
   'call:missed',
-  // 'call:decline',
-  // 'call:end',
   'call:error',
   'call:connected',           // client -> server: call reached CONNECTED (records in-call pairing)
   // Ghost-call recovery / rejoin window:
@@ -328,10 +308,12 @@ const WS_MESSAGE_EVENTS_CONST = [
   'call:rejoin:resolved',     // client -> server: window resolved (rejoined|ended)
   'call:rejoin:expired',      // server -> dropped party: window closed, clear dot
   'call:rejoin:peer_dropped', // server -> waiter: peer dropped, show "Reconnecting"
+
   'socket:health_check',
   'socket:ping',
   'socket:pong',
   'socket:error',
+
   'auth:force_logout',
   'user:update',
   'marquee:update',
@@ -339,10 +321,11 @@ const WS_MESSAGE_EVENTS_CONST = [
 
 const VITAL_WS_EVENTS_CONST = [
   'conversation:join',
-  // 'conversation:leave',
   'conversation:mark_read',
   'conversation:new',
   'conversation:action',
+  'conversation:disappearing',
+
   'message:new',
   'message:sent:ack',
   'message:status:ack',
@@ -350,8 +333,10 @@ const VITAL_WS_EVENTS_CONST = [
   'message:forward',
   'message:delete',
   'message:react',
-  'conversation:disappearing',
+
   'user:update',
+  'auth:force_logout',
+
 ] as const;
 
 const ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD = ['socket:ping', 'socket:pong', 'socket:health_check'] as const;

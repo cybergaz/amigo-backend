@@ -98,6 +98,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
   )
 
+  // TEMP-PIN-ENFORCEMENT
   // Login precheck: { exists, has_pin } → app asks for a PIN when has_pin, else
   // falls back to OTP login (pre-PIN users). Public, mirrors the existing
   // generate-login-otp existence leak.

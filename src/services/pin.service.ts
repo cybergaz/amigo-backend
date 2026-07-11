@@ -141,6 +141,7 @@ const reset_password_pin = async (phone: string, otp: number, new_pin: string) =
   }
 };
 
+// TEMP-PIN-ENFORCEMENT
 // Login-screen precheck: does this phone exist, and does it have a login PIN? Drives
 // whether the app asks for a PIN or falls back to OTP (pre-PIN users).
 const get_phone_pin_status = async (phone: string) => {
