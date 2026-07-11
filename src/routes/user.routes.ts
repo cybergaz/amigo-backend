@@ -1,7 +1,7 @@
 import { Elysia, t } from "elysia";
 import { get_available_users, get_user_details, update_user_details, update_profile_image } from "@/services/user.services";
 import { get_all_users } from "@/services/user.services";
-import { set_user_pin } from "@/services/pin.service";
+import { set_user_pin, verify_pin } from "@/services/pin.service";
 import { app_middleware } from "@/middleware";
 import { ROLE_CONST } from "@/types/user.types";
 import FCMService from "@/services/fcm.service";
@@ -119,8 +119,10 @@ const user_routes = new Elysia({ prefix: "/user" })
   )
 
   // Set or update a security PIN (authenticated). kind = "password" | "admin".
-  // First-time set needs no current_pin; changing an existing PIN requires it.
-  // Used by both the Settings PIN rows and the enforcement create-PINs screen.
+  // First-time set needs no current_pin. Changing an already-set PIN requires
+  // current_pin = the PASSWORD PIN (for BOTH kinds) — so a forgotten admin PIN is
+  // recoverable by proving the password PIN.
+  // Used by the Settings PIN rows and the enforcement create-PINs screen.
   .post("/set-pin", async ({ set, store, body }) => {
     const result = await set_user_pin(store.id, body.kind, body.pin, body.current_pin);
     set.status = result.code;
@@ -131,6 +133,21 @@ const user_routes = new Elysia({ prefix: "/user" })
         kind: t.Union([t.Literal("password"), t.Literal("admin")]),
         pin: t.String({ pattern: "^\\d{4}$" }),
         current_pin: t.Optional(t.String({ pattern: "^\\d{4}$" })),
+      }),
+    }
+  )
+
+  // App-lock: check a candidate PIN against the account's stored hashes and return
+  // { match: 'password' | 'admin' | null }. Used to ARM the on-device app-lock
+  // verifier for camouflage. Business error only — carries no auth_error.
+  .post("/verify-pin", async ({ set, store, body }) => {
+    const result = await verify_pin(store.id, body.pin);
+    set.status = result.code;
+    return result;
+  },
+    {
+      body: t.Object({
+        pin: t.String({ pattern: "^\\d{4}$" }),
       }),
     }
   );

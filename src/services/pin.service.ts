@@ -8,7 +8,7 @@ import { user_model } from "@/models/user.model";
 import { eq } from "drizzle-orm";
 import { hash_pin, compare_pin, is_valid_pin, to_e164 } from "@/utils/general.utils";
 import { verify_otp } from "./otp.services";
-import { clear_pin_attempts } from "./pin-lockout.service";
+import { clear_pin_attempts, get_pin_lock_status, register_pin_failure } from "./pin-lockout.service";
 
 export type PinKind = "password" | "admin";
 
@@ -40,17 +40,39 @@ const set_user_pin = async (
       return { success: false, code: 404, message: "User not found", data: null };
     }
 
-    const current_hash = kind === "password" ? user.password_pin_hash : user.admin_pin_hash;
+    const target_hash = kind === "password" ? user.password_pin_hash : user.admin_pin_hash;
     const other_hash = kind === "password" ? user.admin_pin_hash : user.password_pin_hash;
 
-    // Updating an existing PIN requires proving the current one.
-    if (current_hash) {
-      if (!current_pin) {
-        return { success: false, code: 400, message: "Current PIN is required to change it", data: null };
+    // Authorization to CHANGE an already-set PIN. The authorizing credential is
+    // ALWAYS the password PIN:
+    //   - changing the password PIN → prove the current password PIN
+    //   - changing/resetting the admin PIN → prove the PASSWORD PIN (NOT the old
+    //     admin PIN), so a FORGOTTEN admin PIN is recoverable by anyone who knows
+    //     the password PIN (their login PIN). This is the forgot-admin-PIN path.
+    // A first-time set (target_hash null) needs no proof — the authed session suffices.
+    if (target_hash) {
+      const auth_hash = user.password_pin_hash;
+      if (!auth_hash) {
+        return { success: false, code: 400, message: "Set your password PIN first", data: null };
       }
-      const ok = await compare_pin(current_pin, current_hash);
+      if (!current_pin) {
+        return {
+          success: false,
+          code: 400,
+          message: kind === "admin"
+            ? "Your password PIN is required to change the admin PIN"
+            : "Current PIN is required to change it",
+          data: null,
+        };
+      }
+      const ok = await compare_pin(current_pin, auth_hash);
       if (!ok) {
-        return { success: false, code: 401, message: "Incorrect current PIN", data: null };
+        return {
+          success: false,
+          code: 401,
+          message: kind === "admin" ? "Incorrect password PIN" : "Incorrect current PIN",
+          data: null,
+        };
       }
     }
 
@@ -141,6 +163,71 @@ const reset_password_pin = async (phone: string, otp: number, new_pin: string) =
   }
 };
 
+// App-lock: check a candidate PIN against the account's stored hashes and report
+// WHICH pin it is — 'password' | 'admin' | null. Used to ARM the on-device app-lock
+// verifier for camouflage (the "enter your admin PIN to turn on the safety feature"
+// dialogue + Settings confirm). Authenticated. Reuses the login brute-force lockout
+// (per-phone) so this PIN oracle can't be enumerated even with a valid token.
+// NOTE: not fatal — carries no auth_error, so a wrong PIN never logs the user out.
+const verify_pin = async (user_id: string, candidate: string) => {
+  try {
+    if (!is_valid_pin(candidate)) {
+      return { success: false, code: 400, message: "PIN must be exactly 4 digits", data: null };
+    }
+
+    const [user] = await db
+      .select({
+        phone: user_model.phone,
+        password_pin_hash: user_model.password_pin_hash,
+        admin_pin_hash: user_model.admin_pin_hash,
+      })
+      .from(user_model)
+      .where(eq(user_model.id, user_id))
+      .limit(1);
+
+    if (!user) {
+      return { success: false, code: 404, message: "User not found", data: null };
+    }
+
+    if (user.phone) {
+      const lock = await get_pin_lock_status(user.phone);
+      if (lock.locked) {
+        return {
+          success: false,
+          code: 429,
+          message: `Too many attempts. Try again in ${Math.ceil(lock.retry_after / 60)} minute(s).`,
+          data: null,
+        };
+      }
+    }
+
+    let match: "password" | "admin" | null = null;
+    if (user.password_pin_hash && (await compare_pin(candidate, user.password_pin_hash))) {
+      match = "password";
+    } else if (user.admin_pin_hash && (await compare_pin(candidate, user.admin_pin_hash))) {
+      match = "admin";
+    }
+
+    if (user.phone) {
+      if (match === null) {
+        await register_pin_failure(user.phone);
+      } else {
+        await clear_pin_attempts(user.phone);
+      }
+    }
+
+    return {
+      success: true,
+      code: 200,
+      message: "PIN checked",
+      data: { match }, // 'password' | 'admin' | null
+    };
+  } catch (error) {
+    console.error("verify_pin error:", error);
+    return { success: false, code: 500, message: "Failed to verify PIN", data: null };
+  }
+};
+
 // TEMP-PIN-ENFORCEMENT
 // Login-screen precheck: does this phone exist, and does it have a login PIN? Drives
 // whether the app asks for a PIN or falls back to OTP (pre-PIN users).
@@ -167,4 +254,4 @@ const get_phone_pin_status = async (phone: string) => {
   }
 };
 
-export { set_user_pin, reset_password_pin, get_phone_pin_status };
+export { set_user_pin, verify_pin, reset_password_pin, get_phone_pin_status };
