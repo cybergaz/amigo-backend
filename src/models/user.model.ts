@@ -1,7 +1,6 @@
-import { pgTable, text, timestamp, char, varchar, boolean, jsonb, bigserial, uuid, uniqueIndex, } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, char, varchar, boolean, jsonb, bigserial, uuid, uniqueIndex, index, } from "drizzle-orm/pg-core";
 import { InferInsertModel, InferSelectModel } from "drizzle-orm";
 import { ROLE_CONST, REQUEST_STATUS_CONST } from "@/types/user.types";
-import { chat_model } from "./chat.model";
 
 const user_model = pgTable("users", {
   id: uuid().primaryKey().defaultRandom(),
@@ -30,7 +29,9 @@ const user_model = pgTable("users", {
   // online_status: boolean().default(false),
   // connection_status: varchar({ enum: CONNECTION_STATUS_CONST }),
 }, (table) => [
-  uniqueIndex("idx_users_phone").on(table.phone)
+  uniqueIndex("idx_users_phone").on(table.phone),
+  index("idx_user_name").on(table.name),
+  index("idx_user_created").on(table.created_at),
 ]);
 
 const signup_request_model = pgTable("signup_requests", {

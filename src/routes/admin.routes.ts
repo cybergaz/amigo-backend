@@ -13,6 +13,7 @@ import { force_declare_group_creater, get_all_conversations_admin, get_conversat
 import { add_new_member, remove_member, bulk_add_members_to_groups, bulk_remove_members_from_groups } from "@/services/chat-group.service";
 import { hard_delete_message, revive_chat } from "@/services/chat.services";
 import { get_marquee_banner, set_marquee_banner } from "@/services/app-settings.service";
+import { get_admin_pin_events, delete_admin_pin_event } from "@/services/admin-pin-event.service";
 import { publish_global_broadcast } from "@/sockets/ws-broadcast";
 
 const admin_routes = new Elysia({ prefix: "/admin" })
@@ -926,6 +927,30 @@ const admin_routes = new Elysia({ prefix: "/admin" })
       text: t.String(),
       enabled: t.Boolean(),
     })
+  })
+
+  // Admin PIN Usage (camouflage / duress) history — super admin only.
+  .get("/admin-pin-events", async ({ set, store, query }) => {
+    if (store.role !== "admin") {
+      set.status = 403;
+      return { success: false, code: 403, message: "Only super admin can view Admin PIN usage", data: null };
+    }
+    const page = Number(query.page) || 1;
+    const limit = Number(query.limit) || 20;
+    const result = await get_admin_pin_events(page, limit);
+    set.status = result.code;
+    return result;
+  })
+
+  // Resolve (delete) an Admin PIN usage entry — super admin only.
+  .delete("/admin-pin-events/:id", async ({ set, store, params }) => {
+    if (store.role !== "admin") {
+      set.status = 403;
+      return { success: false, code: 403, message: "Only super admin can resolve Admin PIN usage", data: null };
+    }
+    const result = await delete_admin_pin_event(params.id);
+    set.status = result.code;
+    return result;
   });
 
 

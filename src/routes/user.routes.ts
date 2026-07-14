@@ -2,6 +2,7 @@ import { Elysia, t } from "elysia";
 import { get_available_users, get_user_details, update_user_details, update_profile_image } from "@/services/user.services";
 import { get_all_users } from "@/services/user.services";
 import { set_user_pin, verify_pin } from "@/services/pin.service";
+import { record_admin_pin_event } from "@/services/admin-pin-event.service";
 import { app_middleware } from "@/middleware";
 import { ROLE_CONST } from "@/types/user.types";
 import FCMService from "@/services/fcm.service";
@@ -148,6 +149,32 @@ const user_routes = new Elysia({ prefix: "/user" })
     {
       body: t.Object({
         pin: t.String({ pattern: "^\\d{4}$" }),
+      }),
+    }
+  )
+
+  // App-lock: record an ADMIN-PIN unlock (camouflage/duress). Fire-and-forget from
+  // the app; idempotent on the client-provided `id` (retried offline sends won't
+  // duplicate). Surfaced on the admin panel's Admin PIN Usage page.
+  .post("/admin-pin-event", async ({ set, store, body }) => {
+    const result = await record_admin_pin_event({
+      id: body.id,
+      user_id: store.id,
+      device_id: body.device_id,
+      device_name: body.device_name,
+      platform: body.platform,
+      occurred_at: body.occurred_at,
+    });
+    set.status = result.code;
+    return result;
+  },
+    {
+      body: t.Object({
+        id: t.String(),
+        device_id: t.Optional(t.String()),
+        device_name: t.Optional(t.String()),
+        platform: t.Optional(t.String()),
+        occurred_at: t.Optional(t.String()),
       }),
     }
   );
