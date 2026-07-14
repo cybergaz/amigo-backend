@@ -84,3 +84,72 @@ export const set_marquee_banner = async (
   cache = { value, expires: Date.now() + CACHE_TTL_MS };
   return value;
 };
+
+// ─── Single-device lock (kill-switch) ───────────────────────────────────────
+// Global toggle for the device-lock feature. When OFF, login reverts to the
+// legacy last-login-wins behaviour (the pre-mint gate short-circuits to allowed).
+// Read hot on every gated login, so it is cached like the marquee. Defaults to
+// DISABLED when the row is absent, so the feature stays dormant until an admin
+// explicitly enables it from the panel (safe, controlled rollout).
+export type SingleDeviceLock = {
+  enabled: boolean;
+  updated_at: string | null;
+};
+
+const SINGLE_DEVICE_LOCK_KEY = "single_device_lock";
+
+const DEFAULT_SINGLE_DEVICE_LOCK: SingleDeviceLock = {
+  enabled: false,
+  updated_at: null,
+};
+
+let lockCache: { value: SingleDeviceLock; expires: number } | null = null;
+
+export const get_single_device_lock = async (): Promise<SingleDeviceLock> => {
+  if (lockCache && lockCache.expires > Date.now()) return lockCache.value;
+
+  const rows = await db
+    .select()
+    .from(app_settings_model)
+    .where(eq(app_settings_model.key, SINGLE_DEVICE_LOCK_KEY))
+    .limit(1);
+
+  let value: SingleDeviceLock = DEFAULT_SINGLE_DEVICE_LOCK;
+  if (rows.length > 0) {
+    const raw = (rows[0].value ?? {}) as Partial<SingleDeviceLock>;
+    value = {
+      enabled: raw.enabled === true,
+      updated_at: rows[0].updated_at
+        ? new Date(rows[0].updated_at).toISOString()
+        : null,
+    };
+  }
+
+  lockCache = { value, expires: Date.now() + CACHE_TTL_MS };
+  return value;
+};
+
+export const set_single_device_lock = async (
+  enabled: boolean,
+  adminId: string,
+): Promise<SingleDeviceLock> => {
+  const updated_at = new Date();
+  const payload = { enabled };
+
+  await db
+    .insert(app_settings_model)
+    .values({
+      key: SINGLE_DEVICE_LOCK_KEY,
+      value: payload,
+      updated_by: adminId,
+      updated_at,
+    })
+    .onConflictDoUpdate({
+      target: app_settings_model.key,
+      set: { value: payload, updated_by: adminId, updated_at },
+    });
+
+  const value: SingleDeviceLock = { enabled, updated_at: updated_at.toISOString() };
+  lockCache = { value, expires: Date.now() + CACHE_TTL_MS };
+  return value;
+};

@@ -20,6 +20,10 @@ import {
   register_pin_failure,
   clear_pin_attempts,
 } from "./pin-lockout.service";
+import {
+  is_device_allowed,
+  consume_device_change_request,
+} from "./device-change-request.service";
 
 const handle_login = async ({
   phone,
@@ -184,9 +188,28 @@ const handle_login_device = async ({
       }
     }
 
+    // Single-device LOCK gate — runs BEFORE the destructive login_device mint, so
+    // a refused device evicts nothing. Refusal is a plain business error (NO
+    // auth_error) so it can never force-logout the legitimately-registered device.
+    const gate = await is_device_allowed(user.id, device.device_id);
+    if (!gate.allowed) {
+      return {
+        success: false,
+        code: 403,
+        message: "This device is not registered. Request a device change to log in here.",
+        data: {
+          device_change_required: true,
+          registered_device_name: gate.registered_device_name,
+          pending_request_status: gate.pending_request_status,
+        },
+      };
+    }
+
     // Authoritative single-device + mint FIRST, then the instant nudge.
     const { token } = await login_device(user.id, user.role, device);
     await force_logout_other_devices(user.id);
+    // Single-use: burn the approval that let this device in (if any).
+    await consume_device_change_request(gate.approved_request_id);
 
     return {
       success: true,
@@ -280,10 +303,29 @@ const handle_login_pin = async ({
       };
     }
 
-    // Success — clear the counter, then the standard single-device mint + nudge.
+    // Success — clear the counter. The PIN was correct; a device refusal below is
+    // a business error, not a credential failure.
     await clear_pin_attempts(phone);
+
+    // Single-device LOCK gate — pre-mint (see handle_login_device for the why).
+    const gate = await is_device_allowed(user.id, device.device_id);
+    if (!gate.allowed) {
+      return {
+        success: false,
+        code: 403,
+        message: "This device is not registered. Request a device change to log in here.",
+        data: {
+          device_change_required: true,
+          registered_device_name: gate.registered_device_name,
+          pending_request_status: gate.pending_request_status,
+        },
+      };
+    }
+
+    // Standard single-device mint + nudge.
     const { token } = await login_device(user.id, user.role, device);
     await force_logout_other_devices(user.id);
+    await consume_device_change_request(gate.approved_request_id);
 
     return {
       success: true,

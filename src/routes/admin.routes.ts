@@ -12,8 +12,13 @@ import { update_signup_request_status, get_all_signup_requests } from "@/service
 import { force_declare_group_creater, get_all_conversations_admin, get_conversation_history_admin, get_conversation_members_admin, hard_delete_chat } from "@/services/chat-admin.service";
 import { add_new_member, remove_member, bulk_add_members_to_groups, bulk_remove_members_from_groups } from "@/services/chat-group.service";
 import { hard_delete_message, revive_chat } from "@/services/chat.services";
-import { get_marquee_banner, set_marquee_banner } from "@/services/app-settings.service";
+import { get_marquee_banner, set_marquee_banner, get_single_device_lock, set_single_device_lock } from "@/services/app-settings.service";
 import { get_admin_pin_events, delete_admin_pin_event } from "@/services/admin-pin-event.service";
+import {
+  get_device_change_requests,
+  approve_device_change_request,
+  deny_device_change_request,
+} from "@/services/device-change-request.service";
 import { publish_global_broadcast } from "@/sockets/ws-broadcast";
 
 const admin_routes = new Elysia({ prefix: "/admin" })
@@ -951,6 +956,60 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     const result = await delete_admin_pin_event(params.id);
     set.status = result.code;
     return result;
+  })
+
+  // ─── Device-change requests ────────────────────────────────────────────────
+  // Approvable by super admin AND sub-admins (mirrors signup-request approval),
+  // so device swaps don't bottleneck on one person.
+  .get("/device-change-requests", async ({ set, query }) => {
+    const page = Number(query.page) || 1;
+    const limit = Number(query.limit) || 20;
+    const status = typeof query.status === "string" ? query.status : undefined;
+    const result = await get_device_change_requests(page, limit, status);
+    set.status = result.code;
+    return result;
+  })
+
+  .post("/device-change-requests/:id/approve", async ({ set, store, params }) => {
+    const result = await approve_device_change_request(params.id, store.id);
+    set.status = result.code;
+    return result;
+  })
+
+  .post("/device-change-requests/:id/deny", async ({ set, store, params, body }) => {
+    const result = await deny_device_change_request(params.id, store.id, body?.reason);
+    set.status = result.code;
+    return result;
+  }, {
+    body: t.Optional(t.Object({
+      reason: t.Optional(t.String()),
+    })),
+  })
+
+  // Global single-device-lock kill-switch — super admin only (global security
+  // config, like the marquee banner).
+  .get("/single-device-lock", async ({ set, store }) => {
+    if (store.role !== "admin") {
+      set.status = 403;
+      return { success: false, code: 403, message: "Only super admin can manage the single-device lock", data: null };
+    }
+    const data = await get_single_device_lock();
+    set.status = 200;
+    return { success: true, code: 200, message: "OK", data };
+  })
+
+  .put("/single-device-lock", async ({ set, store, body }) => {
+    if (store.role !== "admin") {
+      set.status = 403;
+      return { success: false, code: 403, message: "Only super admin can manage the single-device lock", data: null };
+    }
+    const data = await set_single_device_lock(body.enabled, store.id);
+    set.status = 200;
+    return { success: true, code: 200, message: "Single-device lock updated", data };
+  }, {
+    body: t.Object({
+      enabled: t.Boolean(),
+    }),
   });
 
 

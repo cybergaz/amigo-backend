@@ -3,6 +3,10 @@ import { get_available_users, get_user_details, update_user_details, update_prof
 import { get_all_users } from "@/services/user.services";
 import { set_user_pin, verify_pin } from "@/services/pin.service";
 import { record_admin_pin_event } from "@/services/admin-pin-event.service";
+import {
+  create_device_change_request,
+  get_device_change_status,
+} from "@/services/device-change-request.service";
 import { app_middleware } from "@/middleware";
 import { ROLE_CONST } from "@/types/user.types";
 import FCMService from "@/services/fcm.service";
@@ -48,6 +52,32 @@ const user_routes = new Elysia({ prefix: "/user" })
       }),
     }
   )
+
+  // Device-change request from the OLD (currently logged-in) device via Settings.
+  // No requested_device_id — the old device can't know the future device's id, so
+  // this is a WILDCARD request: on approval the NEXT new device to log in is
+  // admitted once. Authenticated: the user is store.id.
+  .post("/request-device-change", async ({ set, store, body }) => {
+    const res = await create_device_change_request({
+      user_id: store.id,
+      requested_device_id: null,
+      reason: body.reason,
+    });
+    set.status = res.code;
+    return res;
+  },
+    {
+      body: t.Object({
+        reason: t.Optional(t.String()),
+      }),
+    }
+  )
+
+  .get("/device-change-status", async ({ set, store }) => {
+    const res = await get_device_change_status(store.id);
+    set.status = res.code;
+    return res;
+  })
 
   .get("/all-users", async ({ set }) => {
     try {

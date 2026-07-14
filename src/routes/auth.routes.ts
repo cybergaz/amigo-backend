@@ -6,6 +6,10 @@ import { revoke_user_sessions } from "@/services/session.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
 import { get_phone_pin_status, reset_password_pin } from "@/services/pin.service";
 import { create_user, find_user_by_phone } from "@/services/user.services";
+import {
+  create_device_change_request,
+  get_device_change_status,
+} from "@/services/device-change-request.service";
 import { to_e164 } from "@/utils/general.utils";
 import { VerifySignupSchema } from "@/types/auth.types";
 import Elysia, { t } from "elysia";
@@ -192,6 +196,55 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     const signup_request_status_res = await get_signup_request_status(params.phone);
     set.status = signup_request_status_res.code;
     return signup_request_status_res;
+  },
+    {
+      params: t.Object({
+        phone: t.String(),
+      }),
+    }
+  )
+
+  // Device-change request from the NEW (blocked) device — UNAUTHENTICATED, keyed
+  // by phone (the device isn't authorized yet, so it has no token). Mirrors the
+  // signup-request existence pattern. The specific new device id is recorded so an
+  // admin approval admits only that device.
+  .post('/request-device-change', async ({ set, body }) => {
+    const user_res = await find_user_by_phone(to_e164(body.phone));
+    if (!user_res.success || !user_res.data) {
+      set.status = 404;
+      return { success: false, code: 404, message: "No account found for this phone number", data: null };
+    }
+    const res = await create_device_change_request({
+      user_id: user_res.data.id,
+      requested_device_id: body.requested_device_id,
+      device_name: body.device_name,
+      platform: body.platform,
+      reason: body.reason,
+    });
+    set.status = res.code;
+    return res;
+  },
+    {
+      body: t.Object({
+        phone: t.String(),
+        requested_device_id: t.String(),
+        platform: t.Optional(t.String()),
+        device_name: t.Optional(t.String()),
+        reason: t.Optional(t.String()),
+      }),
+    }
+  )
+
+  // Poll the latest device-change request status from the blocked new device.
+  .get('/device-change-status/:phone', async ({ set, params }) => {
+    const user_res = await find_user_by_phone(to_e164(params.phone));
+    if (!user_res.success || !user_res.data) {
+      set.status = 404;
+      return { success: false, code: 404, message: "No account found for this phone number", data: null };
+    }
+    const res = await get_device_change_status(user_res.data.id);
+    set.status = res.code;
+    return res;
   },
     {
       params: t.Object({

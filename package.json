@@ -9,6 +9,7 @@
     "db:studio": "drizzle-kit studio",
     "db:apply-pins": "bun run scripts/apply-user-pins.ts",
     "db:apply-admin-pin-events": "bun run scripts/apply-admin-pin-events.ts",
+    "db:apply-device-change-requests": "bun run scripts/apply-device-change-requests.ts",
     "version:set": "bun run scripts/set-app-version.ts",
     "version:notify": "bun run scripts/notify-app-update.ts",
     "flush:migrate": "bun run scripts/flush-before-migration.ts",
