@@ -1,14 +1,18 @@
 import db from "@/config/db";
 import { chat_member_model } from "@/models/chat.model";
 import { UpdateUserType, user_model } from "@/models/user.model";
+import { pin_reset_request_model } from "@/models/pin-reset-request.model";
 import { RoleType } from "@/types/user.types";
 import {
+  compare_pin,
   generate_jwt,
   hash_password,
   hash_pin,
+  is_valid_pin,
   parse_phone,
   to_e164,
 } from "@/utils/general.utils";
+import { clear_pin_attempts } from "./pin-lockout.service";
 import { create_session, login_device } from "./session.service";
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
 import { eq, and, inArray, isNull, ne, sql, or, ilike } from "drizzle-orm";
@@ -196,6 +200,9 @@ const get_user_details = async (id: string) => {
         // create-PIN enforcement gate + the Settings "PIN set / not set" state.
         has_password_pin: sql<boolean>`(${user_model.password_pin_hash} IS NOT NULL)`,
         has_admin_pin: sql<boolean>`(${user_model.admin_pin_hash} IS NOT NULL)`,
+        // Drives the app's forced create-PIN gate for admin-provisioned / admin-reset
+        // accounts (coalesce so a legacy NULL row reads false, never blocks).
+        must_reset_pin: sql<boolean>`COALESCE(${user_model.must_reset_pin}, false)`,
       })
       .from(user_model)
       .where(eq(user_model.id, id))
@@ -1090,6 +1097,125 @@ const delete_user_permanently = async (user_id: string) => {
   }
 };
 
+// Admin provisions a brand-new user with a phone + a starter password PIN. The
+// user has NO admin PIN yet and is flagged `must_reset_pin` so that on first login
+// the app forces them to set their OWN password PIN (+ the admin PIN). No token is
+// minted — the user logs in themselves via phone + PIN afterwards.
+const admin_create_user = async ({
+  name,
+  phone,
+  password_pin,
+  role = "user",
+}: {
+  name: string;
+  phone: string;
+  password_pin: string;
+  role?: RoleType;
+}) => {
+  try {
+    const trimmed_name = (name ?? "").trim();
+    if (!trimmed_name) {
+      return { success: false, code: 400, message: "Name is required", data: null };
+    }
+    if (!phone || !phone.trim()) {
+      return { success: false, code: 400, message: "Phone number is required", data: null };
+    }
+    if (!is_valid_pin(password_pin)) {
+      return { success: false, code: 400, message: "PIN must be exactly 4 digits", data: null };
+    }
+
+    const canonical_phone = to_e164(phone);
+    const password_pin_hash = await hash_pin(password_pin);
+
+    const [new_user] = await db
+      .insert(user_model)
+      .values({
+        name: trimmed_name.slice(0, 60),
+        role,
+        phone: canonical_phone,
+        password_pin_hash,
+        must_reset_pin: true,
+        call_access: true,
+      })
+      .returning({
+        id: user_model.id,
+        name: user_model.name,
+        phone: user_model.phone,
+        role: user_model.role,
+        created_at: user_model.created_at,
+      });
+
+    return {
+      success: true,
+      code: 201,
+      message: "User created successfully",
+      data: new_user,
+    };
+  } catch (error: any) {
+    if (error?.cause?.code === "23505") {
+      return { success: false, code: 409, message: "A user with this phone number already exists", data: null };
+    }
+    console.error("admin_create_user error:", error);
+    return { success: false, code: 500, message: "Failed to create user", data: null };
+  }
+};
+
+// Admin sets/overwrites a user's LOGIN (password) PIN — e.g. fulfilling a forgot-PIN
+// request. Re-flags `must_reset_pin` (the admin now knows the PIN, so the user must
+// set their own on next login), clears any brute-force lock so they can log straight
+// in, and auto-resolves the user's pending reset request(s). Never touches the admin
+// PIN. `admin_id` is recorded as the resolver.
+const admin_set_user_password_pin = async (user_id: string, pin: string, admin_id: string) => {
+  try {
+    if (!is_valid_pin(pin)) {
+      return { success: false, code: 400, message: "PIN must be exactly 4 digits", data: null };
+    }
+
+    const [user] = await db
+      .select({
+        id: user_model.id,
+        phone: user_model.phone,
+        admin_pin_hash: user_model.admin_pin_hash,
+      })
+      .from(user_model)
+      .where(eq(user_model.id, user_id))
+      .limit(1);
+
+    if (!user) {
+      return { success: false, code: 404, message: "User not found", data: null };
+    }
+
+    // The new login PIN must differ from the user's admin PIN (if they have one),
+    // mirroring the "two PINs must differ" rule enforced everywhere else.
+    if (user.admin_pin_hash && (await compare_pin(pin, user.admin_pin_hash))) {
+      return { success: false, code: 409, message: "This PIN matches the user's admin PIN — choose a different one", data: null };
+    }
+
+    const new_hash = await hash_pin(pin);
+    await db
+      .update(user_model)
+      .set({ password_pin_hash: new_hash, must_reset_pin: true })
+      .where(eq(user_model.id, user_id));
+
+    // Let them log in immediately with the new PIN.
+    if (user.phone) await clear_pin_attempts(user.phone);
+
+    // Fulfil any pending reset request(s) for this user.
+    await db
+      .update(pin_reset_request_model)
+      .set({ status: "accepted", resolved_by: admin_id, resolved_at: new Date() })
+      .where(and(
+        eq(pin_reset_request_model.user_id, user_id),
+        eq(pin_reset_request_model.status, "pending"),
+      ));
+
+    return { success: true, code: 200, message: "User's password PIN updated", data: { id: user_id } };
+  } catch (error) {
+    console.error("admin_set_user_password_pin error:", error);
+    return { success: false, code: 500, message: "Failed to update the user's PIN", data: null };
+  }
+};
+
 const admin_update_user_phone_number = async (user_id: string, new_phone: string) => {
   // const parsed_new_phone = parse_phone(new_phone)
   try {
@@ -1189,4 +1315,6 @@ export {
   get_user_permissions,
   delete_user_permanently,
   admin_update_user_phone_number,
+  admin_create_user,
+  admin_set_user_password_pin,
 };

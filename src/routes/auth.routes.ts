@@ -4,7 +4,8 @@ import { user_model } from "@/models/user.model";
 import { create_signup_request, get_signup_request_status, handle_login, handle_login_device, handle_login_pin, handle_refresh_token, handle_refresh_token_mobile, validate_refresh_token } from "@/services/auth.service";
 import { revoke_user_sessions } from "@/services/session.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
-import { get_phone_pin_status, reset_password_pin } from "@/services/pin.service";
+import { get_phone_pin_status } from "@/services/pin.service";
+import { raise_pin_reset_request } from "@/services/pin-reset.service";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { to_e164 } from "@/utils/general.utils";
 import { VerifySignupSchema } from "@/types/auth.types";
@@ -300,18 +301,29 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
   )
 
-  // Forgot-PIN: OTP proves phone ownership, then resets the login (password) PIN.
-  // Rides the existing OTP path unchanged.
-  .post("/reset-pin", async ({ body, set }) => {
-    const res = await reset_password_pin(body.phone, body.otp, body.new_pin);
-    set.status = res.code;
-    return res;
+  // Forgot-PIN is admin-fulfilled ONLY — the OTP self-service reset was removed
+  // (see /auth/request-pin-reset below + /admin/user/set-password-pin). Users can no
+  // longer reset their own login PIN without an admin.
+
+  // Forgot-PIN (unauthenticated, from the login screen): raise a request for an
+  // admin to reset this phone's login PIN. Returns a GENERIC success regardless of
+  // whether the number is registered (no account-enumeration oracle); idempotent
+  // server-side (one pending request per user).
+  .post("/request-pin-reset", async ({ body, set }) => {
+    const user_res = await find_user_by_phone(to_e164(body.phone));
+    if (user_res.success && user_res.data?.id) {
+      await raise_pin_reset_request(user_res.data.id);
+    }
+    set.status = 200;
+    return {
+      success: true,
+      code: 200,
+      message: "If this number is registered, your reset request has been sent to the admin.",
+    };
   },
     {
       body: t.Object({
         phone: t.String(),
-        otp: t.Number(),
-        new_pin: t.String({ pattern: "^\\d{4}$" }),
       }),
     }
   )

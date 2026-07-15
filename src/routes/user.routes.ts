@@ -3,6 +3,7 @@ import { get_available_users, get_user_details, update_user_details, update_prof
 import { get_all_users } from "@/services/user.services";
 import { set_user_pin, verify_pin } from "@/services/pin.service";
 import { record_admin_pin_event } from "@/services/admin-pin-event.service";
+import { raise_pin_reset_request } from "@/services/pin-reset.service";
 import { app_middleware } from "@/middleware";
 import { ROLE_CONST } from "@/types/user.types";
 import FCMService from "@/services/fcm.service";
@@ -28,13 +29,22 @@ const user_routes = new Elysia({ prefix: "/user" })
   })
 
   .post("/update-user", async ({ set, store, body }) => {
-    const user_Details = await update_user_details(store.id, body);
+    // SECURITY: this is a SELF-update (store.id). A user must NOT be able to change
+    // their own `role` (privilege escalation → the JWT role is re-read from the DB on
+    // the next mint) or `phone` (account takeover, no verification) here. Both are
+    // admin-only mutations (/admin/update-user-role, /admin/user/update-phone-number),
+    // so strip them before the mass-assign regardless of what the body carried.
+    const { role: _role, phone: _phone, ...safe } = body;
+    void _role; void _phone;
+    const user_Details = await update_user_details(store.id, safe);
     set.status = user_Details.code;
     return user_Details;
   },
     {
       body: t.Object({
         name: t.Optional(t.String()),
+        // `phone`/`role` are accepted by the schema for backward-compat but are
+        // STRIPPED in the handler above — a self-update can never set them.
         phone: t.Optional(t.String()),
         role: t.Optional(t.Enum(Object.fromEntries(ROLE_CONST.map(x => [x, x])))),
         profile_pic: t.Optional(t.String()),
@@ -177,6 +187,15 @@ const user_routes = new Elysia({ prefix: "/user" })
         occurred_at: t.Optional(t.String()),
       }),
     }
-  );
+  )
+
+  // Forgot-PIN: raise a request for an admin to reset this user's login PIN.
+  // Identity comes from the token (can't be spoofed); idempotent (one pending
+  // request per user). Used by Settings → Security. No body.
+  .post("/request-pin-reset", async ({ set, store }) => {
+    const result = await raise_pin_reset_request(store.id);
+    set.status = result.code;
+    return result;
+  });
 
 export default user_routes;

@@ -17,6 +17,10 @@ const user_model = pgTable("users", {
   // password_pin = the login credential; admin_pin = second PIN for a future feature.
   password_pin_hash: text(),
   admin_pin_hash: text(),
+  // TRUE when the password PIN was set by an ADMIN (create-user or admin reset) —
+  // forces the app's create-PIN gate to make the user set their OWN password PIN on
+  // next login (the admin knows the current one). Cleared when the user sets it.
+  must_reset_pin: boolean().default(false),
   refresh_token: text(),
   last_seen: timestamp({ withTimezone: true }).defaultNow(),
   location: jsonb(), // { latitude: number, longitude: number }

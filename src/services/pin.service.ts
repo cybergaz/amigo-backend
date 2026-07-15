@@ -31,6 +31,7 @@ const set_user_pin = async (
       .select({
         password_pin_hash: user_model.password_pin_hash,
         admin_pin_hash: user_model.admin_pin_hash,
+        must_reset_pin: user_model.must_reset_pin,
       })
       .from(user_model)
       .where(eq(user_model.id, user_id))
@@ -43,6 +44,12 @@ const set_user_pin = async (
     const target_hash = kind === "password" ? user.password_pin_hash : user.admin_pin_hash;
     const other_hash = kind === "password" ? user.admin_pin_hash : user.password_pin_hash;
 
+    // Forced-reset bypass: when the account is flagged `must_reset_pin` (the current
+    // password PIN was set BY an admin), the user may set their OWN password PIN
+    // WITHOUT proving the admin-assigned one — this is exactly the recovery path.
+    // Treated like a first-time set. Clearing the flag happens in the update below.
+    const forced_password_reset = kind === "password" && user.must_reset_pin === true;
+
     // Authorization to CHANGE an already-set PIN. The authorizing credential is
     // ALWAYS the password PIN:
     //   - changing the password PIN → prove the current password PIN
@@ -50,7 +57,7 @@ const set_user_pin = async (
     //     admin PIN), so a FORGOTTEN admin PIN is recoverable by anyone who knows
     //     the password PIN (their login PIN). This is the forgot-admin-PIN path.
     // A first-time set (target_hash null) needs no proof — the authed session suffices.
-    if (target_hash) {
+    if (target_hash && !forced_password_reset) {
       const auth_hash = user.password_pin_hash;
       if (!auth_hash) {
         return { success: false, code: 400, message: "Set your password PIN first", data: null };
@@ -87,8 +94,10 @@ const set_user_pin = async (
     }
 
     const new_hash = await hash_pin(pin);
+    // Setting the password PIN via this authed path is always the user choosing
+    // their own — so clear must_reset_pin (harmless no-op when it was already false).
     const column = kind === "password"
-      ? { password_pin_hash: new_hash }
+      ? { password_pin_hash: new_hash, must_reset_pin: false }
       : { admin_pin_hash: new_hash };
 
     const [updated] = await db

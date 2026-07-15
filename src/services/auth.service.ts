@@ -203,6 +203,7 @@ const handle_login_device = async ({
         created_at: user.created_at,
         has_password_pin: user.password_pin_hash != null,
         has_admin_pin: user.admin_pin_hash != null,
+        must_reset_pin: user.must_reset_pin === true,
         token, // long-lived device JWT in body; NO refresh_token
       },
     };
@@ -300,6 +301,7 @@ const handle_login_pin = async ({
         created_at: user.created_at,
         has_password_pin: user.password_pin_hash != null,
         has_admin_pin: user.admin_pin_hash != null,
+        must_reset_pin: user.must_reset_pin === true,
         token, // long-lived device JWT in body; NO refresh_token
       },
     };
