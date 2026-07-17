@@ -1,10 +1,9 @@
 import admin from 'firebase-admin';
 import { EventEmitter } from 'events';
 import { isNotNull } from 'drizzle-orm';
-import { ChatMessagePayload, VitalWSMessage, WSMessage, } from '@/types/socket.types';
-import { MessageType } from '@/types/chat.types';
+import { ChatMessagePayload, WSMessage, } from '@/types/socket.types';
 import { ResultType } from '@/types/core.types';
-import { store_fcm_token, fetch_fcm_token, fetch_fcm_tokens, remove_fcm_token } from '@/cache-management/fcm-token.cache';
+import { store_fcm_token, fetch_fcm_tokens, remove_fcm_token } from '@/cache-management/fcm-token.cache';
 import db from '@/config/db';
 import { user_model } from '@/models/user.model';
 
@@ -171,7 +170,7 @@ export class FCMService {
     data?: Record<string, string>;
     concurrency?: number;
     delay_ms?: number;
-  }): Promise<{ recipients: number; sent: number; failed: number; waves: number }> {
+  }): Promise<{ recipients: number; sent: number; failed: number; waves: number; }> {
     const concurrency = Math.min(Math.max(input.concurrency ?? 20, 1), 100);
     const delay_ms = input.delay_ms ?? 200;
 

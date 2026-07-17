@@ -1,6 +1,6 @@
 import { app_middleware } from "@/middleware";
 import Elysia, { t } from "elysia";
-import { get_all_users_paginated, update_user_role, update_user_call_access, get_dashboard_stats, create_admin_user, get_all_admins, update_admin_permissions, update_admin_status, get_user_permissions, delete_user_permanently, update_user_details, admin_update_user_phone_number, admin_create_user, admin_set_user_password_pin } from "@/services/user.services";
+import { get_all_users_paginated, update_user_role, update_user_call_access, get_dashboard_stats, create_admin_user, get_all_admins, update_admin_permissions, update_admin_status, get_user_permissions, delete_user_permanently, update_user_details, admin_update_user_phone_number, admin_create_user, admin_set_user_password_pin, admin_set_user_admin_pin } from "@/services/user.services";
 import { get_pin_reset_requests, resolve_pin_reset_request } from "@/services/pin-reset.service";
 import { get_communities, get_community_groups } from "@/services/community.services";
 import db from "@/config/db";
@@ -994,6 +994,23 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     }),
   })
 
+  // Set/override a user's ADMIN PIN (app-lock camouflage PIN). No login-reset side
+  // effects — just sets it (must differ from the login PIN).
+  .post("/user/set-admin-pin", async ({ set, store, body }) => {
+    if (store.role !== "admin") {
+      set.status = 403;
+      return { success: false, code: 403, message: "Only super admin can change a user's admin PIN", data: null };
+    }
+    const result = await admin_set_user_admin_pin(body.user_id, body.pin);
+    set.status = result.code;
+    return result;
+  }, {
+    body: t.Object({
+      user_id: t.String(),
+      pin: t.String({ pattern: "^\\d{4}$" }),
+    }),
+  })
+
   // List user-raised PIN reset requests (pending first).
   .get("/pin-reset-requests", async ({ set, store, query }) => {
     if (store.role !== "admin") {
@@ -1003,7 +1020,8 @@ const admin_routes = new Elysia({ prefix: "/admin" })
     const page = Number(query.page) || 1;
     const limit = Number(query.limit) || 20;
     const status = (query.status as string) || undefined;
-    const result = await get_pin_reset_requests(page, limit, status);
+    const search = (query.search as string) || undefined;
+    const result = await get_pin_reset_requests(page, limit, status, search);
     set.status = result.code;
     return result;
   })

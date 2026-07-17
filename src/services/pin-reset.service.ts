@@ -5,7 +5,7 @@
 import db from "@/config/db";
 import { pin_reset_request_model } from "@/models/pin-reset-request.model";
 import { user_model } from "@/models/user.model";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, ilike, or, sql } from "drizzle-orm";
 import type { RequestStatusType } from "@/types/user.types";
 
 // At most one PENDING request per user (partial unique index) → a retried tap is a
@@ -51,16 +51,36 @@ const raise_pin_reset_request = async (user_id: string) => {
   }
 };
 
-const get_pin_reset_requests = async (page: number = 1, limit: number = 20, status?: string) => {
+const get_pin_reset_requests = async (
+  page: number = 1,
+  limit: number = 20,
+  status?: string,
+  search?: string,
+) => {
   try {
     const offset = (page - 1) * limit;
-    const where = status && status !== "all"
-      ? eq(pin_reset_request_model.status, status as RequestStatusType)
-      : undefined;
 
+    const conditions = [];
+    if (status && status !== "all") {
+      conditions.push(eq(pin_reset_request_model.status, status as RequestStatusType));
+    }
+    const term = search?.trim();
+    if (term) {
+      // Search the REQUESTING user's name/phone (joined), mirroring the users table.
+      conditions.push(
+        or(
+          ilike(user_model.name, `%${term}%`),
+          ilike(user_model.phone, `%${term}%`),
+        ),
+      );
+    }
+    const where = conditions.length ? and(...conditions) : undefined;
+
+    // Both queries join users so the where clause can filter on the user's name/phone.
     const [{ count } = { count: 0 }] = await db
       .select({ count: sql<number>`count(*)` })
       .from(pin_reset_request_model)
+      .leftJoin(user_model, eq(pin_reset_request_model.user_id, user_model.id))
       .where(where);
     const totalCount = Number(count);
 

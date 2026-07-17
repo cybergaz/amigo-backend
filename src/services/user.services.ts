@@ -1165,7 +1165,16 @@ const admin_create_user = async ({
 // set their own on next login), clears any brute-force lock so they can log straight
 // in, and auto-resolves the user's pending reset request(s). Never touches the admin
 // PIN. `admin_id` is recorded as the resolver.
-const admin_set_user_password_pin = async (user_id: string, pin: string, admin_id: string) => {
+// `restrict_to_unprivileged` is set by the sub-admin path (mobile): a sub-admin may
+// only reset PINs for ordinary accounts, never for an admin/sub_admin — otherwise a
+// sub-admin could set a super-admin's login PIN to a known value and take the account
+// over. The super-admin panel path leaves it false (top authority, any target).
+const admin_set_user_password_pin = async (
+  user_id: string,
+  pin: string,
+  admin_id: string,
+  restrict_to_unprivileged = false,
+) => {
   try {
     if (!is_valid_pin(pin)) {
       return { success: false, code: 400, message: "PIN must be exactly 4 digits", data: null };
@@ -1175,6 +1184,7 @@ const admin_set_user_password_pin = async (user_id: string, pin: string, admin_i
       .select({
         id: user_model.id,
         phone: user_model.phone,
+        role: user_model.role,
         admin_pin_hash: user_model.admin_pin_hash,
       })
       .from(user_model)
@@ -1183,6 +1193,10 @@ const admin_set_user_password_pin = async (user_id: string, pin: string, admin_i
 
     if (!user) {
       return { success: false, code: 404, message: "User not found", data: null };
+    }
+
+    if (restrict_to_unprivileged && (user.role === "admin" || user.role === "sub_admin")) {
+      return { success: false, code: 403, message: "You can't change an admin's PIN", data: null };
     }
 
     // The new login PIN must differ from the user's admin PIN (if they have one),
@@ -1213,6 +1227,47 @@ const admin_set_user_password_pin = async (user_id: string, pin: string, admin_i
   } catch (error) {
     console.error("admin_set_user_password_pin error:", error);
     return { success: false, code: 500, message: "Failed to update the user's PIN", data: null };
+  }
+};
+
+// Admin sets/overrides a user's ADMIN PIN (the app-lock camouflage/duress PIN),
+// mirroring the password-PIN override but WITHOUT the login-reset semantics: no
+// must_reset_pin (the admin PIN isn't a login gate), no lockout clear, no reset-
+// request resolution. Only the "two PINs must differ" rule applies.
+const admin_set_user_admin_pin = async (user_id: string, pin: string) => {
+  try {
+    if (!is_valid_pin(pin)) {
+      return { success: false, code: 400, message: "PIN must be exactly 4 digits", data: null };
+    }
+
+    const [user] = await db
+      .select({
+        id: user_model.id,
+        password_pin_hash: user_model.password_pin_hash,
+      })
+      .from(user_model)
+      .where(eq(user_model.id, user_id))
+      .limit(1);
+
+    if (!user) {
+      return { success: false, code: 404, message: "User not found", data: null };
+    }
+
+    // The admin PIN must differ from the user's login (password) PIN.
+    if (user.password_pin_hash && (await compare_pin(pin, user.password_pin_hash))) {
+      return { success: false, code: 409, message: "This PIN matches the user's login PIN — choose a different one", data: null };
+    }
+
+    const new_hash = await hash_pin(pin);
+    await db
+      .update(user_model)
+      .set({ admin_pin_hash: new_hash })
+      .where(eq(user_model.id, user_id));
+
+    return { success: true, code: 200, message: "User's admin PIN updated", data: { id: user_id } };
+  } catch (error) {
+    console.error("admin_set_user_admin_pin error:", error);
+    return { success: false, code: 500, message: "Failed to update the user's admin PIN", data: null };
   }
 };
 
@@ -1317,4 +1372,5 @@ export {
   admin_update_user_phone_number,
   admin_create_user,
   admin_set_user_password_pin,
+  admin_set_user_admin_pin,
 };
