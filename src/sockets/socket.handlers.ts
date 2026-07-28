@@ -1,10 +1,11 @@
-import { WebSocketData, WSMessage, ConnectionStatusPayload, ChatMessagePayload, TypingPayload, MessagePinPayload, MessageForwardPayload, VitalWSMessage, CallPayload, ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD, type AllowedWSEventsWithoutPayloadType, ConvJoinPayload, MessageStatusAckPayload } from "@/types/socket.types";
+import { WebSocketData, WSMessage, ConnectionStatusPayload, ChatMessagePayload, TypingPayload, MessagePinPayload, MessageForwardPayload, VitalWSMessage, CallPayload, ALLOWED_WS_EVENTS_WITHOUT_PAYLOAD, type AllowedWSEventsWithoutPayloadType, ConvJoinPayload, MessageStatusAckPayload, DeleteMessagePayload } from "@/types/socket.types";
 import { ElysiaWS } from "elysia/dist/ws";
 import { get_conversation_members } from "@/cache-management/conv.cache";
 import { socket_connections, handlePongResponse, polling_connections } from "./socket.server";
-import { is_allowed_event, store_pending_message } from "@/cache-management/polling.cache";
+import { is_allowed_event, store_pending_message_for_users } from "@/cache-management/polling.cache";
 import { handle_call_accept, handle_call_init, handle_call_signaling, handle_call_termination, handle_call_hold, handle_call_connected, handle_call_rejoin_open, handle_call_rejoin_resolved, handle_connection_status, handle_message_forward, handle_message_new, handle_conv_join, handle_conv_mark_read, handle_message_status_ack, } from "./socket.service";
 import { pin_message, unpin_message } from "@/services/message.services";
+import { soft_delete_message } from "@/services/chat.services";
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -83,6 +84,11 @@ const broadcast_message = async (data: BroadcastData) => {
 
   const serialized_payload = JSON.stringify(data.message);
 
+  // Recipients whose pending-queue copy is written AFTER the send loop, in
+  // ONE pipelined batch — the old per-recipient store awaited ~3 Redis round
+  // trips inside this loop for every member.
+  const store_targets: string[] = [];
+
   // Separate online and offline users across all transport types
   // console.log("recipients_list : ", recipients_list);
   // console.log("data : ", data);
@@ -139,16 +145,22 @@ const broadcast_message = async (data: BroadcastData) => {
       offline_users_id.add(user_id);
     }
 
-    // Store missed messages in three-tier polling cache for offline users
-    // Only allowed event types are cached (message:new, conversation:new, etc.)
+    // Store missed messages in three-tier polling cache — for EVERY
+    // recipient (store-for-everyone: a ws.send into a ghost connection
+    // "succeeds", so online is not proof of delivery). Collected here,
+    // written in one pipelined batch below; drained by delivery acks.
     if (is_allowed_event(data.message.type)) {
-      try {
-        await store_pending_message(user_id, data.message as VitalWSMessage);
-      } catch (err) {
-        console.error("[BROADCAST] Error storing pending messages for offline users:", err);
-      }
+      store_targets.push(user_id);
     }
   }));
+
+  if (store_targets.length > 0) {
+    try {
+      await store_pending_message_for_users(store_targets, data.message as VitalWSMessage);
+    } catch (err) {
+      console.error("[BROADCAST] Error storing pending messages:", err);
+    }
+  }
 
   return {
     online: Array.from(online_users_id),
@@ -345,6 +357,29 @@ const socket_message_handler = async (
           break;
         }
 
+
+      // ----------------------------------------------------
+      case 'message:delete':
+        // --------------------------------------------------
+        {
+          // Delete-for-everyone over the WS — the offline-replayable path
+          // for the client's vital-event outbox. Previously this frame hit
+          // `default:` and was DROPPED as unhandled; only the HTTP route
+          // actually deleted, so an offline delete died at the API gate and
+          // was never replayed. soft_delete_message enforces sender
+          // ownership (unless elevated — the same client-supplied flag the
+          // HTTP route already trusts) and fans out via broadcast_deletion
+          // (WS + FCM + last-msg/pin repoint), excluding the actor. Outbox
+          // replays are idempotent: already-deleted rows match nothing, so
+          // there is no double fan-out.
+          const payload = message.payload as DeleteMessagePayload;
+          const elevated = (message.payload as any)?.is_admin_or_staff === true;
+          const ids = Array.isArray(payload?.message_ids) ? payload.message_ids : [];
+          if (ids.length > 0) {
+            await soft_delete_message(ids, user_id, elevated);
+          }
+          break;
+        }
 
       // ----------------------------------------------------
       case 'message:pin':

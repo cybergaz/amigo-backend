@@ -6,6 +6,8 @@ import {
   DBInsertMessageStatusType,
 } from "@/models/message.model";
 import { broadcast_message } from "@/sockets/socket.handlers";
+import { remove_pending_messages_batch } from "@/cache-management/polling.cache";
+import Snowflake from "@/utils/snowflake.utils";
 import { ResultType } from "@/types/core.types";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { MessageStatusAckPayload } from "@/types/socket.types";
@@ -304,9 +306,14 @@ const mark_message_delivered = async (
       });
     }
 
-    // Remove from polling cache — the pending entry is keyed by its own UUIDv7,
-    // not by message_id. We can't look it up by message_id, so skip this.
-    // The polling cache self-cleans when the user reconnects and fetches.
+    // Drain the recipient's pending-queue copy of this message. Possible now
+    // that entries use deterministic correlation keys
+    // (`{user}:message:new:{id}`) instead of random UUIDv7s — the old keys
+    // made this lookup impossible and forced poll/TTL-only cleanup.
+    // Pre-deploy random-keyed entries miss harmlessly.
+    remove_pending_messages_batch(recipient_id, [
+      Snowflake.correlationId(recipient_id, "message:new", message_id),
+    ]).catch(err => console.error("[STATUS] pending drain failed:", err));
 
     return {
       success: true,

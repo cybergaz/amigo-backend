@@ -41,7 +41,12 @@ const message_info_model = pgTable("message_info", {
 ]);
 
 const missed_ws_messages_model = pgTable("missed_ws_messages", {
-  id: uuid().primaryKey().defaultRandom(),
+  // TEXT, not uuid: since the drain-lifecycle change this holds the
+  // deterministic correlation key `{user_id}:{event_type}:{natural_id}`
+  // (see polling.cache correlation_key), which is how the ack path targets
+  // and deletes an entry. Column migrated uuid→text by
+  // scripts/apply-missed-ws-id-text.ts; ids are always app-supplied.
+  id: text().primaryKey(),
   user_id: uuid().references(() => user_model.id, { onDelete: 'cascade' }).notNull(),
   event_type: varchar({ enum: VITAL_WS_EVENTS_CONST }).notNull(),  // WS event type e.g. 'message:new', 'conversation:action'
   ws_message: jsonb().notNull(),  // Store the entire message payload that was missed

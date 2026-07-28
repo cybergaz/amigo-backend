@@ -42,7 +42,32 @@ type RejoinWindow = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+/** Value stored in the busy registry: the call the user is engaged on, when
+ * that fact was last set/refreshed (`at`, epoch ms), and — for CONNECTED
+ * entries only — since when the pairing has looked dead to the liveness
+ * probe (`stale_since`), used for the two-strike auto-clear. */
+type BusyEntry = {
+  cid: string;
+  at: number;
+  stale_since?: number;
+};
+
 export class StreamCallService {
+  /**
+   * MASTER SWITCH for the ghost-call rejoin feature (2026-07-25: DISABLED).
+   *
+   * The rejoin machinery (30s windows, "Reconnecting…" banner, rejoin dot /
+   * dialog) was causing more damage than it prevented: stale windows after
+   * clean hangups produced rejoin popups on restart, and the window/busy
+   * interplay left users stuck on "recipient is on another call". All entry
+   * points check this flag — the code is kept intact so it can be revived
+   * deliberately later. Type is annotated `boolean` (not literal `false`) so
+   * TS doesn't narrow it and flag the guarded code as unreachable.
+   *
+   * Mirrored client-side by `kCallRejoinEnabled` in stream_call.service.dart.
+   */
+  static readonly REJOIN_ENABLED: boolean = false;
+
   /**
    * In-memory busy registry: `userId → cid` of the call the user is
    * currently engaged in (ringing / answered / connected). Populated from
@@ -61,8 +86,79 @@ export class StreamCallService {
    *    safety net (StreamCallService.dart subscribes to incoming calls and
    *    rejects with CallRejectReason.busy() if it already has an active
    *    call).
+   *  - Historically STICKY: entries were only removed by terminal webhooks,
+   *    `call:terminate`, or rejoin-window expiry. If every one of those was
+   *    missed (webhooks unreachable + client died mid-ring), the user stayed
+   *    "busy" until a backend restart — they could not place or receive any
+   *    call. Now self-healing: see the staleness logic in [isUserBusy] and
+   *    the client-idle self-heal in the precheck route.
    */
-  private static busyByUser = new Map<string, string>();
+  private static busyByUser = new Map<string, BusyEntry>();
+
+  /** Ring-phase leak TTL. The clients hard-cap ringing at 30s, so a busy
+   * entry that has sat in ring phase (never upgraded to connected, never
+   * cleared) for this long means every terminal signal was lost. */
+  private static readonly RING_BUSY_TTL_MS = 90_000;
+
+  /** Two-strike confirmation gap for clearing a CONNECTED entry that shows
+   * no liveness (no socket on either side, no open rejoin window). Bridges
+   * the instant between a socket close and the close-handler opening the
+   * rejoin window, so a legitimate mid-call blip is never misread. */
+  private static readonly CONNECTED_STALE_CONFIRM_MS = 10_000;
+
+  /** Socket-liveness probe, injected by the socket layer at startup (avoids
+   * an import cycle — this module must not import socket internals). Returns
+   * true when the user has a live WS right now. */
+  private static livenessProbe: ((userId: string) => boolean) | null = null;
+
+  static setLivenessProbe(probe: (userId: string) => boolean): void {
+    this.livenessProbe = probe;
+  }
+
+  /**
+   * Tombstones of recently-TERMINATED cids.
+   *
+   * Guards against late busy re-marks — the observed failure: user hangs up
+   * (the WS `call:terminate` clears busy for both), then a delayed or
+   * out-of-order Stream `call.accepted` webhook re-marks BOTH parties busy
+   * on the already-dead cid. Both users are online, so the liveness heal
+   * (which only clears when nobody has a socket) never fires — every redial
+   * then gets "Recipient is on another call", and the phantom CONNECTED
+   * pairing makes the socket-close handler treat the next app kill as a
+   * mid-call drop (spurious rejoin window → popup on restart).
+   *
+   * Every terminate path stamps the cid here (via [clearCall]); any
+   * subsequent mark for a tombstoned cid is refused, and [isUserBusy] purges
+   * entries whose cid turns out to be tombstoned (covers a terminate whose
+   * participant list missed one side).
+   */
+  private static endedCids = new Map<string, number>();
+  private static readonly ENDED_TOMBSTONE_MS = 10 * 60_000;
+
+  static markCallEnded(cid: string): void {
+    if (!cid) return;
+    this.pruneEndedCids();
+    this.endedCids.set(cid, Date.now());
+  }
+
+  static isRecentlyEnded(cid: string): boolean {
+    if (!cid) return false;
+    const t = this.endedCids.get(cid);
+    if (t === undefined) return false;
+    if (Date.now() - t > this.ENDED_TOMBSTONE_MS) {
+      this.endedCids.delete(cid);
+      return false;
+    }
+    return true;
+  }
+
+  private static pruneEndedCids(): void {
+    if (this.endedCids.size < 200) return;
+    const cutoff = Date.now() - this.ENDED_TOMBSTONE_MS;
+    for (const [cid, t] of this.endedCids) {
+      if (t < cutoff) this.endedCids.delete(cid);
+    }
+  }
 
   /**
    * Cids that have reached the CONNECTED (answered) state — set from the
@@ -75,7 +171,12 @@ export class StreamCallService {
 
   static markUserBusy(userId: string, cid: string): void {
     if (!userId || !cid) return;
-    this.busyByUser.set(userId, cid);
+    if (this.isRecentlyEnded(cid)) {
+      console.warn(`[STREAM] busy+ REFUSED (cid tombstoned — late webhook?) `
+        + `user=${userId} cid=${cid}`);
+      return;
+    }
+    this.busyByUser.set(userId, { cid, at: Date.now() });
     console.log(`[STREAM] busy+ user=${userId} cid=${cid}`);
   }
 
@@ -90,8 +191,16 @@ export class StreamCallService {
    */
   static markCallConnected(a: string, b: string, cid: string): void {
     if (!cid) return;
-    if (a) this.busyByUser.set(a, cid);
-    if (b) this.busyByUser.set(b, cid);
+    if (this.isRecentlyEnded(cid)) {
+      console.warn(`[STREAM] connect-mark REFUSED (cid tombstoned) cid=${cid} `
+        + `parties=${a},${b}`);
+      return;
+    }
+    const now = Date.now();
+    // Fresh timestamps + wiped stale marks: a re-announce (WS reconnect
+    // mid-call) is positive proof the call is alive.
+    if (a) this.busyByUser.set(a, { cid, at: now });
+    if (b) this.busyByUser.set(b, { cid, at: now });
     this.connectedCids.add(cid);
     console.log(`[STREAM] call CONNECTED cid=${cid} parties=${a},${b}`);
   }
@@ -102,6 +211,9 @@ export class StreamCallService {
     if (!cid) return;
     for (const u of userIds) this.clearUserBusy(u, cid);
     this.connectedCids.delete(cid);
+    // Tombstone the cid so a straggler mark (late webhook, late re-announce)
+    // can't resurrect the pairing after this call is over.
+    this.markCallEnded(cid);
   }
 
   /** Only clears if the user is busy on THIS specific cid — avoids
@@ -109,16 +221,78 @@ export class StreamCallService {
    * unmark a newer in-progress one. */
   static clearUserBusy(userId: string, cid: string): void {
     if (!userId || !cid) return;
-    if (this.busyByUser.get(userId) === cid) {
+    if (this.busyByUser.get(userId)?.cid === cid) {
       this.busyByUser.delete(userId);
       console.log(`[STREAM] busy- user=${userId} cid=${cid}`);
     }
   }
 
-  /** Returns the cid the user is currently engaged on, or null. */
+  /** The other user marked busy on [cid], or null. */
+  private static peerOnCid(cid: string, userId: string): string | null {
+    for (const [uid, entry] of this.busyByUser) {
+      if (entry.cid === cid && uid !== userId) return uid;
+    }
+    return null;
+  }
+
+  /**
+   * Returns the cid the user is currently engaged on, or null.
+   *
+   * Self-healing: this is the single read path for busy gating, so leaked
+   * entries are detected and cleared lazily right here —
+   *  - RING phase: entry older than [RING_BUSY_TTL_MS] with no upgrade to
+   *    connected → every terminal signal was lost → clear.
+   *  - CONNECTED phase: a live call implies at least one party's socket is
+   *    up OR a rejoin window is open for the cid (both-sockets-down is
+   *    exactly the state a window covers, and window expiry itself clears
+   *    the call). If neither holds on two reads ≥ [CONNECTED_STALE_CONFIRM_MS]
+   *    apart, the pairing is dead → clear both parties.
+   */
   static isUserBusy(userId: string): string | null {
     if (!userId) return null;
-    return this.busyByUser.get(userId) ?? null;
+    const e = this.busyByUser.get(userId);
+    if (!e) return null;
+    // Entry survived a terminate that missed this user (bad participant list
+    // in the payload) or predates the tombstone — the call is over, purge.
+    if (this.isRecentlyEnded(e.cid)) {
+      console.warn(`[STREAM] busy purge (cid tombstoned) user=${userId} cid=${e.cid}`);
+      this.busyByUser.delete(userId);
+      return null;
+    }
+    const now = Date.now();
+    const connected = this.connectedCids.has(e.cid);
+
+    if (!connected) {
+      if (now - e.at > this.RING_BUSY_TTL_MS) {
+        console.warn(`[STREAM] busy LEAK (ring-phase, ${now - e.at}ms old) `
+          + `user=${userId} cid=${e.cid} — auto-clearing`);
+        this.busyByUser.delete(userId);
+        return null;
+      }
+      return e.cid;
+    }
+
+    const probe = this.livenessProbe;
+    if (probe) {
+      const peer = this.peerOnCid(e.cid, userId);
+      const alive = probe(userId)
+        || (peer !== null && probe(peer))
+        || this.hasAnyRejoinWindow(e.cid);
+      if (alive) {
+        if (e.stale_since) e.stale_since = undefined;
+      } else if (!e.stale_since) {
+        e.stale_since = now;
+        console.warn(`[STREAM] busy SUSPECT (connected, no liveness) `
+          + `user=${userId} cid=${e.cid} — will clear if still dead in `
+          + `${this.CONNECTED_STALE_CONFIRM_MS}ms`);
+      } else if (now - e.stale_since > this.CONNECTED_STALE_CONFIRM_MS) {
+        console.warn(`[STREAM] busy LEAK (connected, no liveness twice) `
+          + `cid=${e.cid} — auto-clearing`);
+        this.clearCall(e.cid, peer ? [userId, peer] : [userId]);
+        return null;
+      }
+    }
+    return e.cid;
   }
 
   /**
@@ -201,13 +375,50 @@ export class StreamCallService {
    */
   static getConnectedCallPeer(userId: string): { cid: string; peerId: string } | null {
     if (!userId) return null;
-    const cid = this.busyByUser.get(userId);
-    if (!cid) return null;
+    const entry = this.busyByUser.get(userId);
+    if (!entry) return null;
+    const cid = entry.cid;
     if (!this.connectedCids.has(cid)) return null; // ringing, not connected
-    for (const [uid, c] of this.busyByUser) {
-      if (c === cid && uid !== userId) return { cid, peerId: uid };
+    const peerId = this.peerOnCid(cid, userId);
+    return peerId ? { cid, peerId } : null;
+  }
+
+  /** True when a live (unexpired) rejoin window exists for [cid]. */
+  static hasAnyRejoinWindow(cid: string): boolean {
+    const w = this.rejoinByCid.get(cid);
+    return !!w && w.expires_at > Date.now();
+  }
+
+  /** True when the user is the WAITER of a live rejoin window — i.e. still
+   * in a connected call whose peer briefly dropped. Used by the precheck
+   * self-heal to avoid trusting a bogus "I'm idle" claim in that state. */
+  static isWaiterOfOpenWindow(userId: string): boolean {
+    if (!userId) return false;
+    const now = Date.now();
+    for (const w of this.rejoinByCid.values()) {
+      if (w.waiter_id === userId && w.expires_at > now) return true;
     }
-    return null;
+    return false;
+  }
+
+  /**
+   * Verify a Stream user token we minted earlier: signature must check out
+   * against our API secret and the `user_id` claim must match. Expiry is
+   * deliberately IGNORED — a genuine-but-expired token still proves the
+   * device once held credentials for this user, which is all the
+   * unauthenticated cold-decline endpoint needs (and >7-day-idle devices
+   * would otherwise lose killed-state decline).
+   */
+  static verifyUserToken(token: string | undefined, userId: string): boolean {
+    if (!token || !userId || !this.isConfigured()) return false;
+    try {
+      const payload = jwt.verify(token, STREAM_API_SECRET, {
+        ignoreExpiration: true,
+      }) as { user_id?: string };
+      return payload?.user_id === userId;
+    } catch {
+      return false;
+    }
   }
 
   /** Find the newest live rejoin window where `userId` is the dropped party —
@@ -383,11 +594,15 @@ export class StreamCallService {
           });
           // Refresh both — accept may arrive before ring if the caller and
           // callee come up out of order during a coordinator hiccup.
+          // Tombstone-guarded: a DELAYED accepted webhook landing after the
+          // call already terminated must NOT resurrect the busy pairing —
+          // that was the "recipient is on another call" stuck state (both
+          // users online → liveness heal can't fire).
           this.markUserBusy(createdById, cid);
           this.markUserBusy(calleeId, cid);
           // The call is now live — a subsequent disconnect of either party is a
           // recoverable mid-call drop, so a rejoin window may be opened.
-          this.connectedCids.add(cid);
+          if (!this.isRecentlyEnded(cid)) this.connectedCids.add(cid);
           return true;
 
         case 'call.rejected':
@@ -404,9 +619,8 @@ export class StreamCallService {
           // didn't initiate the reject. We push to BOTH sides because the
           // event itself doesn't tell us which device was killed.
           await this.broadcastDismissCallFcm(cid, [createdById, calleeId]);
-          this.clearUserBusy(createdById, cid);
-          this.clearUserBusy(calleeId, cid);
-          this.connectedCids.delete(cid);
+          // clearCall (not bare clearUserBusy) so the cid is tombstoned too.
+          this.clearCall(cid, [createdById, calleeId]);
           return true;
 
         case 'call.missed':
@@ -423,9 +637,7 @@ export class StreamCallService {
           // notification — Stream's own ring timeout (~30s) doesn't fire a
           // dismiss FCM on its own.
           await this.broadcastDismissCallFcm(cid, [calleeId]);
-          this.clearUserBusy(createdById, cid);
-          this.clearUserBusy(calleeId, cid);
-          this.connectedCids.delete(cid);
+          this.clearCall(cid, [createdById, calleeId]);
           return true;
 
         case 'call.ended':
@@ -458,9 +670,7 @@ export class StreamCallService {
           // reported. We push to both ends so whichever side was killed
           // gets the dismiss too.
           await this.broadcastDismissCallFcm(cid, [createdById, calleeId]);
-          this.clearUserBusy(createdById, cid);
-          this.clearUserBusy(calleeId, cid);
-          this.connectedCids.delete(cid);
+          this.clearCall(cid, [createdById, calleeId]);
           return true;
         }
 

@@ -4,7 +4,7 @@ import { redis } from "@/config/redis";
 import db from "@/config/db";
 import { missed_ws_messages_model } from "@/models/message.model";
 import { VITAL_WS_EVENTS_CONST, VitalWSMessage, VitalWSMessageEventsType, WSMessage, WSMessageEventsType } from "@/types/socket.types";
-import { eq, and, lt, asc, gt } from "drizzle-orm";
+import { eq, and, lt, asc, gt, inArray } from "drizzle-orm";
 import Snowflake from "@/utils/snowflake.utils";
 import { randomUUIDv7 } from "bun";
 
@@ -14,10 +14,19 @@ import { randomUUIDv7 } from "bun";
 //   Tier 2: Redis                   → 1 week TTL
 //   Tier 3: PostgreSQL DB           → 1 month (cleaned by cron/scheduled task)
 //
-// Deduplication strategy:
-//   Tier 1: Map<message_id, CachedPollMessage> — keyed by message_id
-//   Tier 2: Redis Hash keyed by message_id (HSET/HGETALL/HDEL)
-//   Tier 3: DB onConflictDoUpdate (upsert by id)
+// Deduplication strategy — DETERMINISTIC correlation keys (see
+// correlation_key below): `{user_id}:{event_type}:{natural_id}`.
+//   Tier 1: Map<correlation_key, CachedPollMessage>
+//   Tier 2: Redis Hash keyed by correlation_key (HSET/HGETALL/HDEL)
+//   Tier 3: DB onConflictDoUpdate (upsert by id = correlation_key)
+// Two properties fall out of the key shape:
+//   • self-compaction — a re-broadcast of the same logical event (duplicate
+//     re-ack after a client resend, LWW state like pin/user:update)
+//     OVERWRITES its previous pending entry instead of piling up a new
+//     random-keyed copy;
+//   • targeted drain — the delivery-ack path can compute the exact key a
+//     message was stored under and delete it (impossible with the old
+//     randomUUIDv7 keys, which forced delete-on-poll as the ONLY drain).
 // ============================================================================
 
 interface CachedPollMessage {
@@ -37,9 +46,12 @@ const MAX_MESSAGES_PER_USER = 500;            // cap per-user queue in Redis/LRU
 const polling_lru = new LRUCache<string, Map<string, CachedPollMessage>>(5000, LRU_TTL_MS);
 
 // --- Delayed DB write timers ---
-// Key: "user_id:message_id" → timer handle. If remove_pending_message is called
-// before the timer fires, clearTimeout() cancels the DB write entirely.
-// This means truly online users (who ACK within 10s) never touch the DB.
+// Key: "user_id:message_id" → timer handle. If remove_pending_message(s) is
+// called before the timer fires, clearTimeout() cancels the DB write entirely.
+// With drain-on-ack (handle_message_status_ack → remove_pending_messages_batch)
+// reachable users who ack within 10s now genuinely never touch the DB — under
+// the old random keys nothing could cancel these timers except a poll, so for
+// pure-WS recipients EVERY deferred insert always fired.
 const DB_WRITE_DELAY_MS = 10_000; // 10 seconds
 const pending_db_timers = new Map<string, ReturnType<typeof setTimeout>>();
 const db_timer_key = (user_id: string, message_id: string) => `${user_id}:${message_id}`;
@@ -53,63 +65,83 @@ const is_allowed_event = (event_type: WSMessageEventsType): event_type is VitalW
   return (VITAL_WS_EVENTS_CONST as readonly string[]).includes(event_type);
 };
 
+// --- Deterministic correlation keys ---
+// Natural per-type ids. Types with a stable natural id get a deterministic
+// key (self-compacting + ack-drainable); types where every event is a
+// distinct fact (conversation:action, batched status acks, deletes, ...)
+// fall through to a random key — overwriting a sibling there would LOSE an
+// event for an offline user, so they keep today's append semantics.
+const natural_event_id = (ws_message: VitalWSMessage): string | undefined => {
+  const p = ws_message.payload as any;
+  switch (ws_message.type) {
+    case "message:new":
+      return p?.id ?? p?.message_id;
+    case "message:sent:ack":
+      return p?.msg_id ?? p?.message_id ?? p?.id;
+    case "message:pin": // LWW: only the latest pin state per chat matters
+      return p?.conv_id ?? p?.chat_id;
+    case "message:react": // LWW per (message, reactor): final reaction wins
+      return p?.message_id && p?.sender_id
+        ? `${p.message_id}:${p.sender_id}`
+        : undefined;
+    case "conversation:disappearing": // LWW per chat
+      return p?.conv_id ?? p?.chat_id;
+    case "conversation:join":
+      return p?.conv_id && p?.user_id ? `${p.conv_id}:${p.user_id}` : undefined; // LWW per (conv, reader).
+    case "user:update": // LWW per user snapshot (payload field is user_id)
+      return p?.user_id ?? p?.id;
+    case "auth:force_logout": // only the latest matters
+      return "singleton";
+    default:
+      return undefined;
+  }
+};
+
+const correlation_key = (user_id: string, ws_message: VitalWSMessage): string =>
+  Snowflake.correlationId(
+    user_id,
+    ws_message.type,
+    natural_event_id(ws_message) ?? randomUUIDv7(),
+  );
+
 // ============================================================================
 // WRITE PATH — store a missed WS message for an offline user
 // Writes to ALL three tiers simultaneously (fan-out).
 // ============================================================================
-async function store_pending_message(
-  user_id: string,
-  ws_message: VitalWSMessage,
-): Promise<void> {
-  if (!is_allowed_event(ws_message.type)) {
-    return; // silently ignore non-cacheable events
-  }
-
-  // const pending_message_id = Snowflake.correlationId(user_id, ws_message.type, (ws_message.payload as any).id || (ws_message.payload as any).message_id);
-  const pending_message_id = randomUUIDv7();
-  const now = Date.now();
-
-  const entry: CachedPollMessage = {
-    message_id: pending_message_id,
-    ws_message,
-    created_at: now,
-  };
-
-  // --- Tier 1: LRU (Map keyed by message_id — O(1) dedup) ---
+// --- Tier 1 helper: LRU store with cap trim ---
+const lru_store = (user_id: string, entry: CachedPollMessage): void => {
   const existing = polling_lru.get(user_id) ?? new Map<string, CachedPollMessage>();
-  existing.set(pending_message_id, entry); // overwrites if same ID (idempotent)
-  // Trim oldest entries if over cap
+  existing.set(entry.message_id, entry); // overwrites if same key (idempotent)
   if (existing.size > MAX_MESSAGES_PER_USER) {
     const sorted = Array.from(existing.entries()).sort((a, b) => a[1].created_at - b[1].created_at);
     const excess = existing.size - MAX_MESSAGES_PER_USER;
     sorted.slice(0, excess).forEach(([id]) => existing.delete(id));
   }
   polling_lru.set(user_id, existing, LRU_TTL_MS);
+};
 
-  // --- Tier 2: Redis (immediate) ---
+// --- Tier 2 helper: trim a user's Redis hash back to cap (rare path) ---
+const trim_redis_queue = async (user_id: string, hash_len: number): Promise<void> => {
   try {
     const key = redis_poll_key(user_id);
-    await redis.hset(key, pending_message_id, JSON.stringify(entry));
-    // Trim to cap (remove oldest by created_at)
-    const hash_len = await redis.hlen(key);
-    if (hash_len > MAX_MESSAGES_PER_USER) {
-      const all = await redis.hgetall(key);
-      const sorted = Object.entries(all).sort((a, b) => {
-        const pa = JSON.parse(a[1]) as CachedPollMessage;
-        const pb = JSON.parse(b[1]) as CachedPollMessage;
-        return pa.created_at - pb.created_at;
-      });
-      const to_delete = sorted.slice(0, hash_len - MAX_MESSAGES_PER_USER).map(([id]) => id);
-      if (to_delete.length > 0) {
-        await redis.hdel(key, ...to_delete);
-      }
+    const all = await redis.hgetall(key);
+    const sorted = Object.entries(all).sort((a, b) => {
+      const pa = JSON.parse(a[1]) as CachedPollMessage;
+      const pb = JSON.parse(b[1]) as CachedPollMessage;
+      return pa.created_at - pb.created_at;
+    });
+    const to_delete = sorted.slice(0, hash_len - MAX_MESSAGES_PER_USER).map(([id]) => id);
+    if (to_delete.length > 0) {
+      await redis.hdel(key, ...to_delete);
     }
-    await redis.expire(key, REDIS_TTL_SECONDS);
   } catch (err) {
-    console.error(`[POLL-CACHE] Redis write error for user ${user_id}:`, err);
+    console.error(`[POLL-CACHE] Redis trim error for user ${user_id}:`, err);
   }
+};
 
-  // --- Tier 3: DB (delayed — skip if user comes online within 10s) ---
+// --- Tier 3 helper: delayed DB write (cancelled by drain within 10s) ---
+const schedule_db_write = (user_id: string, entry: CachedPollMessage): void => {
+  const { message_id: pending_message_id, ws_message } = entry;
   const tk = db_timer_key(user_id, pending_message_id);
   if (pending_db_timers.has(tk)) clearTimeout(pending_db_timers.get(tk)!);
   const timer = setTimeout(async () => {
@@ -136,18 +168,62 @@ async function store_pending_message(
     }
   }, DB_WRITE_DELAY_MS);
   pending_db_timers.set(tk, timer);
+};
+
+async function store_pending_message(
+  user_id: string,
+  ws_message: VitalWSMessage,
+): Promise<void> {
+  await store_pending_message_for_users([user_id], ws_message);
 }
 
-// Store for multiple users at once (batch convenience)
+// Store for multiple users at once — THE fan-out path (broadcast_message).
+// One Redis pipeline covers the entire recipient list: hset + expire + hlen
+// per user, single round trip. The old per-recipient version awaited 3
+// sequential round trips per user (≈450 commands one-by-one for a
+// 150-member group message, on the shared connection).
 async function store_pending_message_for_users(
   user_ids: string[],
   ws_message: VitalWSMessage,
 ): Promise<void> {
-  if (!is_allowed_event(ws_message.type)) return;
+  if (user_ids.length === 0 || !is_allowed_event(ws_message.type)) return;
 
-  await Promise.allSettled(
-    user_ids.map(uid => store_pending_message(uid, ws_message))
-  );
+  const now = Date.now();
+  const pipeline = redis.pipeline();
+  const entries: { user_id: string; entry: CachedPollMessage; }[] = [];
+
+  for (const user_id of user_ids) {
+    const entry: CachedPollMessage = {
+      message_id: correlation_key(user_id, ws_message),
+      ws_message,
+      created_at: now,
+    };
+    entries.push({ user_id, entry });
+
+    // Tier 1 + Tier 3 are local (Map / setTimeout) — do them inline.
+    lru_store(user_id, entry);
+    schedule_db_write(user_id, entry);
+
+    // Tier 2 queued into the shared pipeline.
+    const key = redis_poll_key(user_id);
+    pipeline.hset(key, entry.message_id, JSON.stringify(entry));
+    pipeline.expire(key, REDIS_TTL_SECONDS);
+    pipeline.hlen(key);
+  }
+
+  try {
+    const results = await pipeline.exec();
+    // Every 3rd result is the user's hlen — trim the (rare) over-cap queues.
+    for (let i = 0; i < entries.length; i++) {
+      const hlen_result = results?.[i * 3 + 2];
+      const hash_len = typeof hlen_result?.[1] === "number" ? hlen_result[1] : 0;
+      if (hash_len > MAX_MESSAGES_PER_USER) {
+        await trim_redis_queue(entries[i].user_id, hash_len);
+      }
+    }
+  } catch (err) {
+    console.error(`[POLL-CACHE] Redis pipeline write error (${user_ids.length} users):`, err);
+  }
 }
 
 // ============================================================================
@@ -212,10 +288,10 @@ async function fetch_pending_messages(
     }
   }
 
-  // Remove from all 3 tiers upon fetching success (await all removals)
-  await Promise.allSettled(
-    Array.from(messages.keys()).map(msg_id => remove_pending_message(user_id, msg_id))
-  );
+  // Remove from all 3 tiers upon fetching success — batched: one variadic
+  // HDEL + one IN-list DB delete instead of 2 round trips per entry (a
+  // 500-entry backlog used to cost ~1000 sequential ops per poll).
+  await remove_pending_messages_batch(user_id, Array.from(messages.keys()));
 
   // Filter by after_message_id if provided (cursor-based pagination)
   let result = Array.from(messages.values()).sort((a, b) => a.created_at - b.created_at);
@@ -227,6 +303,51 @@ async function fetch_pending_messages(
   }
 
   return result;
+}
+
+// Batch removal from all 3 tiers. Used by the poll drain and by
+// drain-on-ack (handle_message_status_ack / mark_message_delivered), which
+// can now compute the exact correlation keys to delete. Keys that don't
+// exist (e.g. pre-deploy random-keyed entries) miss harmlessly.
+async function remove_pending_messages_batch(user_id: string, message_ids: string[]): Promise<void> {
+  if (message_ids.length === 0) return;
+
+  // Cancel delayed DB writes that haven't fired yet
+  for (const message_id of message_ids) {
+    const tk = db_timer_key(user_id, message_id);
+    const timer = pending_db_timers.get(tk);
+    if (timer) {
+      clearTimeout(timer);
+      pending_db_timers.delete(tk);
+    }
+  }
+
+  // LRU
+  try {
+    const lru_map = polling_lru.get(user_id);
+    if (lru_map) {
+      for (const message_id of message_ids) lru_map.delete(message_id);
+      if (lru_map.size === 0) polling_lru.delete(user_id);
+    }
+  } catch (e) {
+    console.error(`[POLL-CACHE] LRU batch remove error for user ${user_id}:`, e);
+  }
+
+  // Redis — one variadic HDEL
+  try {
+    await redis.hdel(redis_poll_key(user_id), ...message_ids);
+  } catch (err) {
+    console.error(`[POLL-CACHE] Redis batch remove error for user ${user_id}:`, err);
+  }
+
+  // DB — one IN-list delete
+  try {
+    await db
+      .delete(missed_ws_messages_model)
+      .where(inArray(missed_ws_messages_model.id, message_ids));
+  } catch (err) {
+    console.error(`[POLL-CACHE] DB batch remove error for user ${user_id}:`, err);
+  }
 }
 
 // Remove pending message from 3 tiers after successful delivery
@@ -348,6 +469,7 @@ export {
   store_pending_message_for_users,
   fetch_pending_messages,
   remove_pending_message,
+  remove_pending_messages_batch,
   cleanup_expired_messages,
   start_cleanup_cron,
   stop_cleanup_cron,

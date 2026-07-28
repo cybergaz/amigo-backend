@@ -3,6 +3,7 @@ import { WSMessageSchema } from "@/types/socket.elysia-schema";
 import Elysia, { t } from "elysia";
 import { broadcast_message, get_ws_data, set_ws_data, socket_message_handler } from "./socket.handlers";
 import { handle_user_disconnected_midcall } from "./socket.service";
+import { StreamCallService } from "@/services/stream-call.service";
 import { ConnectionStatusPayload, PollingConnection, UserConnection, WSMessage } from "@/types/socket.types";
 import { update_user_details } from "@/services/user.services";
 // import { sync_missed_messages } from "@/services/chat.services";
@@ -15,6 +16,14 @@ import { AuthError } from "@/constants/auth-codes";
 // Connection maps for different transport types
 const socket_connections = new Map<string, UserConnection>(); // user_id -> UserConnection (WebSocket)
 const polling_connections = new Map<string, PollingConnection>(); // user_id -> PollingConnection
+
+// Give the Stream busy-registry a socket-liveness probe so it can lazily
+// clear leaked "user is on a call" entries (see StreamCallService.isUserBusy).
+// Injected here — the service must not import socket internals (cycle).
+StreamCallService.setLivenessProbe((user_id: string) => {
+  const conn = socket_connections.get(user_id);
+  return !!conn && conn.ws.readyState === 1;
+});
 
 // configuration
 // Heartbeat: client pings every 12s, server checks every 15s, 2 missed = ~24-27s detection

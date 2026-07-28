@@ -21,6 +21,8 @@ import StreamCallService from "@/services/stream-call.service";
 import { get_user_peers } from "@/cache-management/user-peer.cache";
 import { set_last_read, get_receipt } from "@/cache-management/chat-member.cache";
 import { batch_mark_status } from "@/cache-management/message.cache";
+import { remove_pending_messages_batch } from "@/cache-management/polling.cache";
+import Snowflake from "@/utils/snowflake.utils";
 
 const handle_connection_status = async (payload: ConnectionStatusPayload): Promise<ResultType> => {
   try {
@@ -769,6 +771,20 @@ const handle_message_status_ack = async (payload: MessageStatusAckPayload, user_
 
     // collect all msg_ids, one PK lookup to get sender_id per message
     const all_msg_ids = payload.acks.flatMap(g => g.msg_ids);
+
+    // Drain-on-ack: the acker has provably received these messages, so their
+    // pending-queue copies (stored under deterministic keys
+    // `{user}:message:new:{id}`) are dead weight — delete them and cancel
+    // their 10s deferred DB writes. Entries stored before this deploy carry
+    // random keys, miss harmlessly, and still drain via poll/TTL.
+    // Fire-and-forget: never on the ack critical path.
+    if (all_msg_ids.length > 0) {
+      remove_pending_messages_batch(
+        recipient_id,
+        all_msg_ids.map(id => Snowflake.correlationId(recipient_id, "message:new", id)),
+      ).catch(err => console.error("[STATUS-ACK] pending drain failed:", err));
+    }
+
     if (all_msg_ids.length > 0) {
       const rows = await db
         .select({ id: message_model.id, sender_id: message_model.sender_id })
@@ -811,6 +827,16 @@ const handle_message_status_ack = async (payload: MessageStatusAckPayload, user_
             ws_timestamp: new Date(),
           },
         });
+
+        // A delivery receipt for message X also proves the sender's own
+        // sent-ack lifecycle for X completed — drain the sender's pending
+        // `ack:{X}` copy too (same deterministic-key mechanics as above).
+        remove_pending_messages_batch(
+          sender_id,
+          acks
+            .flatMap(g => g.msg_ids)
+            .map(id => Snowflake.correlationId(sender_id, "message:sent:ack", id)),
+        ).catch(err => console.error("[STATUS-ACK] sender ack drain failed:", err));
       }
     }
 
@@ -1627,6 +1653,13 @@ const terminate_rejoin_window = async (w: { cid: string; dropped_id: string; wai
  * trigger; the client's leaver-open is now only a best-effort fast path.
  */
 const handle_user_disconnected_midcall = async (user_id: string): Promise<void> => {
+  // REJOIN-DISABLED (2026-07-25): ghost-call recovery is switched off — a
+  // mid-call socket drop opens NO window and terminates nothing (a chat-WS
+  // blip must not kill a healthy call; Stream's own media path handles call
+  // survival). Busy hygiene is covered by call:terminate + webhook clears +
+  // the tombstone/liveness heals in StreamCallService. Flip REJOIN_ENABLED
+  // to restore the full flow below.
+  if (!StreamCallService.REJOIN_ENABLED) return;
   try {
     const info = StreamCallService.getConnectedCallPeer(user_id);
     if (!info) return; // idle or still-ringing → not a recoverable mid-call drop
@@ -1674,6 +1707,12 @@ const handle_user_disconnected_midcall = async (user_id: string): Promise<void> 
  * peer_name/peer_pfp always describe the WAITER (who the dropped party rejoins).
  */
 const handle_call_rejoin_open = async (payload: CallPayload, user_id: string): Promise<ResultType> => {
+  // REJOIN-DISABLED (2026-07-25): never open windows — see
+  // handle_user_disconnected_midcall for the rationale. Old app builds that
+  // still send leaver-opens get a success no-op.
+  if (!StreamCallService.REJOIN_ENABLED) {
+    return { success: true, code: 200, message: "rejoin disabled" };
+  }
   try {
     const cid = payload.call_id;
     if (!cid) {
@@ -1733,6 +1772,11 @@ const handle_call_rejoin_open = async (payload: CallPayload, user_id: string): P
  * `payload.data`: { outcome: 'rejoined' | 'ended' }.
  */
 const handle_call_rejoin_resolved = async (payload: CallPayload, user_id: string): Promise<ResultType> => {
+  // REJOIN-DISABLED (2026-07-25): no windows exist to resolve; success no-op
+  // keeps old app builds happy.
+  if (!StreamCallService.REJOIN_ENABLED) {
+    return { success: true, code: 200, message: "rejoin disabled" };
+  }
   try {
     const cid = payload.call_id;
     if (!cid) {

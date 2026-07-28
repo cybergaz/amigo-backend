@@ -48,23 +48,35 @@ const call_routes = new Elysia({ prefix: "/call" })
     { parse: 'text' }
   )
 
-  // ---- Cold-state Stream-call decline (unauthenticated; auth is the JWT) ----
+  // ---- Cold-state Stream-call decline ----
   // When a user taps the Decline button on an incoming-call notification while
   // the app is in killed state, no Flutter isolate is alive to invoke
   // `call.reject()` against Stream's coordinator — so the caller stays in
   // a ringing limbo until Stream's own ring timeout fires (~20-30s) and the
   // call ends as "missed" rather than "declined". This endpoint bridges
   // that gap: the native Kotlin BroadcastReceiver fires a fire-and-forget
-  // POST here with the call cid + the user's Stream JWT (cached in
-  // SharedPreferences at last token-fetch). We re-sign a short-lived JWT
-  // for the same user (we have the API secret) and call Stream's reject API
-  // server-side, no cookie auth required.
+  // POST here with the call cid + user id + the user's cached Stream JWT
+  // (written to SharedPreferences by the Dart token loader). The JWT is the
+  // authentication: we verify its signature against our own Stream API
+  // secret and require the user_id claim to match — expiry is ignored
+  // (signature alone proves identity; see verifyUserToken). Then we re-sign
+  // a fresh short-lived JWT and call Stream's reject API server-side.
   .post("/stream/decline-cold", async ({ set, body }) => {
     try {
-      const { call_cid, user_id } = (body || {}) as { call_cid?: string; user_id?: string };
+      const { call_cid, user_id, stream_token } = (body || {}) as {
+        call_cid?: string;
+        user_id?: string;
+        stream_token?: string;
+      };
       if (!call_cid || !user_id) {
         set.status = 400;
         return { success: false, message: "call_cid and user_id are required" };
+      }
+      if (!StreamCallService.verifyUserToken(stream_token, user_id)) {
+        console.warn(`[CALL ROUTES] decline-cold REJECTED — bad/missing token `
+          + `user=${user_id} cid=${call_cid}`);
+        set.status = 401;
+        return { success: false, message: "Invalid credentials" };
       }
       await StreamCallService.rejectCallAsUser(call_cid, user_id);
       set.status = 200;
@@ -298,6 +310,13 @@ const call_routes = new Elysia({ prefix: "/call" })
   // is the dropped party, or null.
   .get("/stream/rejoinable", async ({ set, store }) => {
     try {
+      // REJOIN-DISABLED (2026-07-25): always report "nothing to rejoin" so
+      // shipped app builds that still hydrate on open/resume never surface
+      // the rejoin popup/dot again.
+      if (!StreamCallService.REJOIN_ENABLED) {
+        set.status = 200;
+        return { success: true, data: null, message: "Rejoin disabled" };
+      }
       const w = StreamCallService.getRejoinFor(store.id);
       set.status = 200;
       return {
@@ -370,7 +389,10 @@ const call_routes = new Elysia({ prefix: "/call" })
   // etc.) without parsing English strings.
   .post("/stream/precheck", async ({ set, body, store }) => {
     try {
-      const { callee_id } = body as { callee_id: string };
+      const { callee_id, client_active_cid } = body as {
+        callee_id: string;
+        client_active_cid?: string | null;
+      };
       if (!callee_id) {
         set.status = 400;
         return { success: false, code: "bad_request", message: "callee_id is required" };
@@ -380,7 +402,26 @@ const call_routes = new Elysia({ prefix: "/call" })
       // UI (chat row's call button is hidden while a call is up), but we
       // gate here too in case the UI race-condition slips through (e.g.
       // user taps call right as another incoming starts ringing).
-      const selfBusy = StreamCallService.isUserBusy(store.id);
+      let selfBusy = StreamCallService.isUserBusy(store.id);
+      if (selfBusy) {
+        // Self-heal for a leaked registry entry. Single-device architecture
+        // → the requesting client is authoritative about its OWN engagement.
+        // If it declares itself idle (`client_active_cid` empty), it isn't
+        // the waiter of a live rejoin window (peer briefly dropped from a
+        // call it is still in), and it has no window it could itself rejoin,
+        // then the entry is stale — clear it instead of bricking outgoing
+        // calls until a backend restart. The callee-side busy check below is
+        // untouched: we never unblock somebody ELSE's slot on a client claim.
+        const clientSaysIdle = !client_active_cid;
+        const isWaiter = StreamCallService.isWaiterOfOpenWindow(store.id);
+        const canRejoin = StreamCallService.getRejoinFor(store.id) !== null;
+        if (clientSaysIdle && !isWaiter && !canRejoin) {
+          console.warn(`[STREAM] precheck self-heal: clearing stale busy `
+            + `user=${store.id} cid=${selfBusy} (client reports idle)`);
+          StreamCallService.clearUserBusy(store.id, selfBusy);
+          selfBusy = null;
+        }
+      }
       if (selfBusy) {
         set.status = 409;
         return {
@@ -417,7 +458,12 @@ const call_routes = new Elysia({ prefix: "/call" })
       return { success: false, code: "server_error", message: "Internal server error" };
     }
   }, {
-    body: t.Object({ callee_id: t.String() }),
+    body: t.Object({
+      callee_id: t.String(),
+      // Client's own live call cid, or null/absent when it knows it's idle.
+      // Drives the stale-busy self-heal above.
+      client_active_cid: t.Optional(t.Union([t.String(), t.Null()])),
+    }),
   });
 
 // .get("/status", async ({ set, store, query }) => {
