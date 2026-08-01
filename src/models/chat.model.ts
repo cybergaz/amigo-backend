@@ -50,6 +50,14 @@ const chat_member_model = pgTable("chat_members", {
   // past is treated as not muted (lets us avoid a cron sweep — the send-path
   // ZRANGEBYSCORE filters by score > now()).
   muted_until: timestamp({ withTimezone: true }),
+  // Per-user "clear chat" watermark ("delete for me", but for the whole chat
+  // while keeping the membership). NULL = never cleared. When set, every read
+  // path serves this user only messages created AFTER it: history,
+  // messages-around, and the chat-list last-message/pinned enrichment. This is
+  // the group analogue of the DM delete-for-me tombstones — a single timestamp
+  // instead of one message_info row per message, because a group can have
+  // hundreds of members × tens of thousands of messages.
+  cleared_at: timestamp({ withTimezone: true }),
   // deleted: boolean().default(false).notNull(), -- use removed_at instead
   // unread_count: integer().default(0),
 }, (table) => [

@@ -17,7 +17,7 @@ import FCMService from "./fcm.service";
 import { queue_message_fcm } from "./fcm-batch.service";
 import { get_conversation_members, invalidate_conversation, invalidate_user_conversations } from "@/cache-management/conv.cache";
 import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
-import { get_chat_metas, get_all_unread } from "@/cache-management/chat-meta.cache";
+import { get_chat_metas, get_all_unread, reset_unread } from "@/cache-management/chat-meta.cache";
 import { get_message_statuses_bulk } from "@/cache-management/message.cache";
 import { generate_unique_id } from "@/utils/general.utils";
 import { randomUUIDv7 } from "bun";
@@ -347,6 +347,11 @@ const get_chat_list = async (user_id: string, type: string) => {
         // Per-user mute end time. Null when not muted. Far-future timestamp
         // represents "forever" (see mute.service.ts MUTED_FOREVER).
         mutedUntil: chat_member_model.muted_until,
+        // Per-user "clear chat" watermark. Everything at or before it is
+        // invisible to this user, so the last-message / pinned-message
+        // enrichment below must not hand back a pre-clear message (the Redis
+        // chat_meta hash is chat-global and knows nothing about it).
+        clearedAt: chat_member_model.cleared_at,
 
         // DM peer info (null for groups)
         userId: user_model.id,
@@ -405,6 +410,33 @@ const get_chat_list = async (user_id: string, type: string) => {
       // whatever it had locally before leaving (insertOrIgnore won't overwrite).
       const is_active_member = chat.status === "active";
 
+      // "Clear chat" (per-user, keeps membership). The Redis chat_meta hash is
+      // chat-global, so a cleared user would otherwise get their pre-clear last
+      // message handed straight back on the next chat-list sync — the client
+      // re-inserts it into local SQLite, resurrecting a single ghost bubble in
+      // a chat the user just emptied. Suppress unless the cache holds a message
+      // NEWER than the watermark. Same for the pinned message, whose body the
+      // payload also ships; an unresolvable pin on a cleared chat is suppressed
+      // too, since it can only be pre-clear.
+      const cleared_at = chat.clearedAt ? new Date(chat.clearedAt) : null;
+      // Fail CLOSED: anything we can't prove is newer than the watermark is
+      // treated as pre-clear and withheld. Showing one message too few in a
+      // chat the user just emptied is invisible; showing one too many un-does
+      // the thing they asked for.
+      const is_after_clear = (sent_at: Date | string | null | undefined) => {
+        if (!cleared_at) return true;
+        if (!sent_at) return false;
+        const t = new Date(sent_at).getTime();
+        return Number.isFinite(t) && t > cleared_at.getTime();
+      };
+      const last_msg_cleared = !is_after_clear(meta?.sent_at);
+      const pinned_raw = chat.pinnedMsgId
+        ? pinned_messages.get(chat.pinnedMsgId) as { sent_at?: Date | string | null } | undefined
+        : undefined;
+      const pinned_cleared = !is_after_clear(pinned_raw?.sent_at);
+      const show_last_msg = is_active_member && !last_msg_cleared;
+      const show_pinned = is_active_member && !pinned_cleared;
+
       return {
         ...chat,
         // Clear DM peer fields for groups (they come back null anyway but be explicit)
@@ -414,17 +446,17 @@ const get_chat_list = async (user_id: string, type: string) => {
         userProfilePic: chat.type === "dm" ? chat.userProfilePic : null,
         lastSeen: chat.type === "dm" ? chat.lastSeen : null,
         // Don't advance a shell's last-message pointer to a post-leave message.
-        lastMsgId: is_active_member ? chat.lastMsgId : null,
-        pinnedMsgId: is_active_member ? chat.pinnedMsgId : null,
+        lastMsgId: show_last_msg ? chat.lastMsgId : null,
+        pinnedMsgId: show_pinned ? chat.pinnedMsgId : null,
         // Redis enrichment — withheld for shells (would leak post-leave content).
-        lastMessage: is_active_member ? (meta ?? null) : null,
+        lastMessage: show_last_msg ? (meta ?? null) : null,
         // Full pinned message (body, sender, attachments) so the client renders
         // the pinned pill without resolving the id against its local store —
         // which fails for any pin older than its synced message window.
-        pinnedMessage: is_active_member && chat.pinnedMsgId
+        pinnedMessage: show_pinned && chat.pinnedMsgId
           ? pinned_messages.get(chat.pinnedMsgId) ?? null
           : null,
-        unreadCount: is_active_member ? unread : 0,
+        unreadCount: is_active_member && !last_msg_cleared ? unread : 0,
       };
     });
 
@@ -644,6 +676,71 @@ const soft_delete_chat = async (conversation_id: string, user_id: string) => {
       success: false,
       code: 500,
       message: "ERROR : soft_delete_conversation",
+    };
+  }
+};
+
+/**
+ * "Clear chat" — delete-for-me for a whole conversation, WITHOUT leaving it.
+ *
+ * The group counterpart of the DM's soft-delete (`dm_delete_status`), but the
+ * two are deliberately different mechanisms:
+ *
+ *   - A DM delete REMOVES the chat from the user's list (`removed_at`), so it
+ *     can afford to tombstone every message individually in `message_info`.
+ *   - A clear KEEPS the membership — the user stays in the group and keeps
+ *     receiving new messages. Writing one `message_info` row per message per
+ *     member doesn't scale for a 500-member group with 50k messages, so we
+ *     stamp a single per-member watermark instead. Every read path
+ *     (`get_conversation_history`, `get_messages_around`, and the chat-list
+ *     last-message / pinned-message enrichment) floors on it, exactly the way
+ *     they already floor on `joined_at`.
+ *
+ * Only the caller's own membership row is touched — other members are
+ * unaffected and keep their full history. Any member row that hasn't been
+ * removed can clear, including `left` / `pending` shells: their old history is
+ * still theirs to drop.
+ */
+const clear_chat_for_user = async (conversation_id: string, user_id: string) => {
+  try {
+    const cleared_at = new Date();
+
+    const [membership] = await db
+      .update(chat_member_model)
+      .set({ cleared_at })
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at)
+        )
+      )
+      .returning({ id: chat_member_model.id });
+
+    if (!membership) {
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
+
+    // Nothing is left to be unread. Without this the chat-list's Redis unread
+    // counter would keep a badge alive for messages the user can no longer see.
+    await reset_unread(user_id, conversation_id);
+
+    return {
+      success: true,
+      code: 200,
+      message: "Chat cleared successfully",
+      data: { conversation_id, cleared_at: cleared_at.toISOString() },
+    };
+  } catch (error) {
+    console.error("clear_chat_for_user error:", error);
+    return {
+      success: false,
+      code: 500,
+      message: "ERROR : clear_chat_for_user",
     };
   }
 };
@@ -1028,6 +1125,7 @@ const get_conversation_history = async (
     const [membership] = await db
       .select({
         joining_date: chat_member_model.joined_at,
+        cleared_at: chat_member_model.cleared_at,
         last_read_msg_id: chat_member_model.last_read_msg_id,
         last_delivered_msg_id: chat_member_model.last_delivered_msg_id,
       })
@@ -1104,6 +1202,13 @@ const get_conversation_history = async (
           isNull(delete_for_me.message_id), // exclude delete-for-me
           membership.joining_date
             ? gt(message_model.created_at, membership.joining_date)
+            : undefined,
+          // "Clear chat" watermark — same shape as the joining-date floor.
+          // This is what makes a cleared chat stay cleared: the client can
+          // re-sync, re-install, or scroll for older history and the server
+          // simply has nothing before it to give.
+          membership.cleared_at
+            ? gt(message_model.created_at, membership.cleared_at)
             : undefined,
           // Cursor conditions
           anchor_created_at && before_message_id
@@ -1417,7 +1522,27 @@ const get_messages_around = async (
       };
     }
 
-    // 2. Get the target message
+    // 1b. This user's "clear chat" watermark. Fetched separately rather than
+    // selected into `members` above — that list is returned to the caller, and
+    // every member's clear timestamp is nobody else's business.
+    const [my_membership] = await db
+      .select({ cleared_at: chat_member_model.cleared_at })
+      .from(chat_member_model)
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conversation_id),
+          eq(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at)
+        )
+      )
+      .limit(1);
+    const cleared_at = my_membership?.cleared_at ?? null;
+    const cleared_filter = cleared_at
+      ? gt(message_model.created_at, cleared_at)
+      : undefined;
+
+    // 2. Get the target message. A pre-clear anchor (an old reply target or a
+    // stale deep link) resolves to "not found" for this user, same as history.
     const [targetMessage] = await db
       .select({
         id: message_model.id,
@@ -1427,7 +1552,8 @@ const get_messages_around = async (
       .where(
         and(
           eq(message_model.id, message_id),
-          isNull(message_model.deleted_at)
+          isNull(message_model.deleted_at),
+          cleared_filter
         )
       )
       .limit(1);
@@ -1483,6 +1609,7 @@ const get_messages_around = async (
           isNull(message_model.deleted_at),
           lt(message_model.created_at, target_created_at),
           deleteFilter,
+          cleared_filter,
         )
       )
       .orderBy(desc(message_model.created_at))
@@ -1512,6 +1639,7 @@ const get_messages_around = async (
           isNull(message_model.deleted_at),
           gt(message_model.created_at, target_created_at),
           deleteFilter,
+          cleared_filter,
         )
       )
       .orderBy(asc(message_model.created_at))
@@ -1632,6 +1760,7 @@ export {
   get_chat_list,
   update_conversation,
   soft_delete_chat,
+  clear_chat_for_user,
   revive_chat,
   soft_delete_message,
   broadcast_deletion,

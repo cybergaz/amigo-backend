@@ -1,6 +1,6 @@
 import { Elysia, t } from "elysia";
 import { app_middleware } from "@/middleware";
-import { get_chat_list, get_chat_members, get_conversation_history, get_message_statuses, get_messages_around, soft_delete_chat, soft_delete_message } from "@/services/chat.services";
+import { clear_chat_for_user, get_chat_list, get_chat_members, get_conversation_history, get_message_statuses, get_messages_around, soft_delete_chat, soft_delete_message } from "@/services/chat.services";
 import { set_chat_disappearing } from "@/services/disappearing.service";
 import { set_user_chat_mute, clear_user_chat_mute } from "@/services/mute.service";
 
@@ -109,6 +109,21 @@ const chat_routes = new Elysia({ prefix: "/chat" })
     const delete_result = await soft_delete_chat(params.conversation_id, store.id);
     set.status = delete_result.code;
     return delete_result;
+  }, {
+    params: t.Object({
+      conversation_id: t.String()
+    })
+  })
+
+  // "Clear chat" — drops the caller's own view of the conversation's history
+  // while keeping their membership. Delete-for-me at chat scope; every other
+  // member is untouched. Contrast /soft-delete-chat (deletes the chat for
+  // EVERYONE, owner/master only) and /chat/dm/soft-delete-dm (removes the DM
+  // from the caller's list entirely).
+  .delete("/clear-chat/:conversation_id", async ({ set, store, params }) => {
+    const clear_result = await clear_chat_for_user(params.conversation_id, store.id);
+    set.status = clear_result.code;
+    return clear_result;
   }, {
     params: t.Object({
       conversation_id: t.String()
