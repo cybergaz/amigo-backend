@@ -294,6 +294,7 @@ const WS_MESSAGE_EVENTS_CONST = [
   'call:init:ack',
   'call:ringing',
   'call:accept',
+  'call:accept:ack',
   'call:offer',
   'call:answer',
   'call:ice',
