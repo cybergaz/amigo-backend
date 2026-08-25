@@ -478,43 +478,4 @@ const livekit_routes = new Elysia({
   })
 
 
-  // call-history of a user:
-  .get(
-    "/history",
-    async ({ set, store, query }) => {
-      try {
-        const limit = Math.min(parseInt(query.limit as string) || 20, 100); // Max 100 calls
-
-        const result = await LivekitService.get_call_history(store.id, limit);
-
-        if (result.success) {
-          set.status = 200;
-          return {
-            success: true,
-            data: result.data,
-            message: "Call history retrieved successfully",
-          };
-        } else {
-          set.status = 500;
-          return {
-            success: false,
-            message: result.error || "Failed to get call history",
-          };
-        }
-      } catch (error) {
-        console.error("[CALL ROUTES] Error getting call history:", error);
-        set.status = 500;
-        return {
-          success: false,
-          message: "Internal server error",
-        };
-      }
-    },
-    {
-      query: t.Object({
-        limit: t.Optional(t.String()),
-      }),
-    },
-  )
-
 export default livekit_routes;
