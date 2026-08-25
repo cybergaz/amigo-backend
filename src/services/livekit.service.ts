@@ -279,13 +279,13 @@ export class LivekitService {
     user_id: string,
   ): Promise<ResultType> {
     try {
-      console.log("calling accept call function...");
+      // console.log("calling accept call function...");
       const parsedActiveCall = (await this.get_active_call(call_id)).data;
 
-      console.log(
-        "parsedActiveCall:",
-        JSON.stringify(parsedActiveCall, null, 2),
-      );
+      // console.log(
+      //   "parsedActiveCall:",
+      //   JSON.stringify(parsedActiveCall, null, 2),
+      // );
 
       if (!parsedActiveCall) {
         return {
@@ -303,7 +303,7 @@ export class LivekitService {
         };
       }
 
-      console.log("accepting call with id:", call_id, "for user:", user_id);
+      // console.log("accepting call with id:", call_id, "for user:", user_id);
 
       // Update call status to 'answered' in the database
       await db
@@ -352,7 +352,7 @@ export class LivekitService {
     reason: CallEndReasonsType,
   ): Promise<ResultType> {
     try {
-      console.log("terminating call with id:", call_id, "by user:", user_id);
+      // console.log("terminating call with id:", call_id, "by user:", user_id);
 
       // The cache may already be gone (timeout swept it, or the other party
       // hung up a moment earlier). Falling back to the row keeps a second
@@ -561,9 +561,9 @@ export class LivekitService {
 
       await redis.del(...keys_to_delete);
 
-      console.log(
-        `[CALL] Cleared cache for call ID: ${call_id} (${keys_to_delete.length} keys)`,
-      );
+      // console.log(
+      //   `[CALL] Cleared cache for call ID: ${call_id} (${keys_to_delete.length} keys)`,
+      // );
 
       return {
         success: true,
@@ -584,10 +584,10 @@ export class LivekitService {
   // <-------------------Get Active Call------------------->
   static async get_active_call(call_id: string): Promise<ResultType> {
     try {
-      console.log("received call id: ", call_id);
+      // console.log("received call id: ", call_id);
       const activeCall = await redis.hgetall(`calls:active_calls:${call_id}`);
 
-      console.log("[CALL] Active call fetched from cache:", activeCall);
+      // console.log("[CALL] Active call fetched from cache:", activeCall);
 
       // const parsedActiveCall = parse_call_cache_row(
       //   activeCall as Record<string, string>,
@@ -638,7 +638,7 @@ export class LivekitService {
     user_id: string,
   ): Promise<ResultType> {
     try {
-      console.log("[CALL] Fetching active call for user ID:", user_id);
+      // console.log("[CALL] Fetching active call for user ID:", user_id);
       const call_id = await redis.get(`calls:user:${user_id}`);
       if (!call_id) {
         return {
@@ -647,7 +647,7 @@ export class LivekitService {
           message: "No active call found for this user",
         };
       }
-      console.log("[CALL] Found active call ID for user:", call_id);
+      // console.log("[CALL] Found active call ID for user:", call_id);
 
       return await this.get_active_call(call_id);
     } catch (error) {
@@ -780,10 +780,10 @@ export class LivekitService {
 
       const generatedToken = await token.toJwt();
 
-      console.log(
-        `generated token for user ${user_id} in room ${room_id}:`,
-        generatedToken,
-      );
+      // console.log(
+      //   `generated token for user ${user_id} in room ${room_id}:`,
+      //   generatedToken,
+      // );
 
       return {
         success: true,

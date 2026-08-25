@@ -1105,9 +1105,7 @@ const handle_call_init = async (
     // didn't.
     const caller_id = user_id;
 
-    console.log(
-      `[WS] Handling call initiation: caller=${caller_id}, callee=${payload.callee_id}`,
-    );
+    // console.log( `[WS] Handling call initiation: caller=${caller_id}, callee=${payload.callee_id}`,);
 
     // The caller asks for 'video' by pressing the video button; anything else
     // is an audio call. Normalised here rather than trusted verbatim so a
@@ -1120,7 +1118,7 @@ const handle_call_init = async (
       call_type,
     );
 
-    console.log(`[WS] Call initiation result:`, result);
+    // console.log(`[WS] Call initiation result:`, result);
     // acknowledgment payload
     const call_init_payload: CallPayload = {
       call_id: result.data?.call_id,
@@ -1136,7 +1134,6 @@ const handle_call_init = async (
     };
 
     if (result.success && result.data?.call_id) {
-      console.log("result success");
       // create a livekit room for the call:
       const room = await LivekitService.create_livekit_room(
         result.data.call_id,
@@ -1158,14 +1155,14 @@ const handle_call_init = async (
         };
       }
 
-      console.log("room success");
+      // console.log("room success");
       // Generate token for the caller:
       const callerToken = await LivekitService.create_livekit_token(
         result.data.call_id,
         caller_id,
       );
 
-      console.log("callerToken", callerToken);
+      // console.log("callerToken", callerToken);
 
       if (!callerToken.success) {
         await abandon_failed_call(
@@ -1182,9 +1179,9 @@ const handle_call_init = async (
 
       const token = callerToken.data?.token;
 
-      console.log(
-        `[WS] Call initiation successful: call_id=${result.data.call_id}, token=${token}`,
-      );
+      // console.log(
+      //   `[WS] Call initiation successful: call_id=${result.data.call_id}, token=${token}`,
+      // );
 
       // The caller's token goes ONLY to the caller. `call_init_payload` is the
       // same object that gets broadcast to the callee (WS) and pushed to their
@@ -1411,7 +1408,7 @@ const handle_call_accept = async (
       const active_call =
         await LivekitService.get_active_call_by_user_id(user_id);
 
-      console.log("active call", JSON.stringify(active_call, null, 2));
+      // console.log("active call", JSON.stringify(active_call, null, 2));
 
       // NB `get_active_call_by_user_id` answers with a ResultType object even
       // on a miss, so this condition is always true — minting proceeds off the
@@ -1485,16 +1482,16 @@ const handle_call_accept = async (
         // a numeric one loses the token with no error on either side. Log the
         // frame we actually put on the wire, token redacted, so a silent loss
         // can be diagnosed from this end.
-        console.log(
-          `[WS] call:accept → ${user_id}:`,
-          JSON.stringify({
-            ...accept_frame,
-            data: {
-              ...accept_frame.data,
-              token: `<jwt len=${callee_token.length}>`,
-            },
-          }),
-        );
+        // console.log(
+        //   `[WS] call:accept → ${user_id}:`,
+        //   JSON.stringify({
+        //     ...accept_frame,
+        //     data: {
+        //       ...accept_frame.data,
+        //       token: `<jwt len=${callee_token.length}>`,
+        //     },
+        //   }),
+        // );
 
         // send the token to the callee
         await broadcast_message({
@@ -1865,9 +1862,9 @@ register_call_timeout_notifier(async (call) => {
     timestamp: new Date(),
   };
 
-  console.log(
-    `[WS] ring timeout for call ${call.call_id} — notifying both ends`,
-  );
+  // console.log(
+  //   `[WS] ring timeout for call ${call.call_id} — notifying both ends`,
+  // );
 
   await Promise.allSettled([
     fan_out_to_user(call.caller_id, "call:terminate", payload),

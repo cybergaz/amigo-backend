@@ -489,7 +489,7 @@ const socket_message_handler = async (
       // ----------------------------------------------------
       case "call:init": {
         // --------------------------------------------------
-        console.log("call:init payload -> ", message.payload);
+        // console.log("call:init payload -> ", message.payload);
         const result = await handle_call_init(
           message.payload as CallPayload,
           user_id,
@@ -593,7 +593,7 @@ const socket_message_handler = async (
       // ----------------------------------------------------
       case "call:terminate": {
         // --------------------------------------------------
-        console.log("call:terminate payload -> ", message.payload);
+        // console.log("call:terminate payload -> ", message.payload);
         const result = await handle_call_termination(
           message.payload as CallPayload,
           message.type,
