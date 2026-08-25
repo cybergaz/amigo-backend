@@ -1278,6 +1278,10 @@ const handle_call_init = async (
             error: {
               code: result.code,
               message: result.message,
+              // Stable machine code ('callee_busy', 'self_busy', …) the app
+              // maps to its own copy. The prose above stays as the fallback
+              // for anything that doesn't carry one.
+              reason: result.error?.reason,
               error: result.error,
             },
           },

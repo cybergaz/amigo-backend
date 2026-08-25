@@ -73,17 +73,32 @@ export class LivekitService {
           success: false,
           code: 400,
           message: "You cannot call yourself",
+          error: { reason: "self_call" },
         };
       }
 
       const isCallerInCall = await redis.get(getUserCallKey(caller_id));
       const isCalleeInCall = await redis.get(getUserCallKey(callee_id));
 
-      if (isCallerInCall || isCalleeInCall) {
+      // Split, because the caller's app has to say something different for
+      // each: one is "you're already on a call", the other is "they are". The
+      // old combined message could only be shown verbatim, so the app said
+      // nothing at all and the call just vanished.
+      if (isCallerInCall) {
         return {
           success: false,
           code: 400,
-          message: "Either caller or callee is already in a call.",
+          message: "You are already in a call",
+          error: { reason: "self_busy" },
+        };
+      }
+
+      if (isCalleeInCall) {
+        return {
+          success: false,
+          code: 400,
+          message: "Recipient is on another call",
+          error: { reason: "callee_busy" },
         };
       }
 
@@ -99,6 +114,7 @@ export class LivekitService {
           success: false,
           code: 404,
           message: "Callee not found",
+          error: { reason: "callee_not_found" },
         };
       }
 
@@ -107,6 +123,7 @@ export class LivekitService {
           success: false,
           code: 401,
           message: "Callee does not have call access enabled",
+          error: { reason: "no_call_access" },
         };
       }
 
