@@ -9,7 +9,7 @@ import { redis } from "@/config/redis";
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
 import { eq, or } from "drizzle-orm";
-import { livekit_call_model } from "@/models/call.model";
+import { call_model, livekit_call_model } from "@/models/call.model";
 import {
   setActiveCallsCache,
   setUserCallCache,
@@ -705,6 +705,60 @@ export class LivekitService {
         code: 500,
         message: "Error fetching call info",
         error,
+      };
+    }
+  }
+
+  // <---------------------Get call history for a user---------------------->
+  static async get_call_history(user_id: string, limit: number): Promise<ResultType> {
+    try {
+      if (!user_id) {
+        return {
+          success: false,
+          code: 404,
+          message: "User id is required",
+        };
+      }
+
+
+      const user = await db
+        .select()
+        .from(user_model)
+        .where(eq(user_model.id, user_id))
+        .limit(limit);
+
+      if (!user) {
+        return {
+          success: false,
+          code: 404,
+          message: "User not found",
+        };
+      }
+
+      const calls = await db
+        .select()
+        .from(livekit_call_model)
+        .where(
+          or(
+            eq(livekit_call_model.caller_id, user_id),
+            eq(livekit_call_model.callee_id, user_id),
+          )
+        )
+
+      return {
+        success: true,
+        code: 201,
+        message: "Call history fetched",
+        data: calls
+      };
+
+    } catch (error) {
+      console.error("[BACKEND] Error fetching call history:", error);
+      return {
+        success: false,
+        code: 404,
+        message: "Error fetching call history",
+        error
       };
     }
   }
