@@ -1,9 +1,9 @@
 import "dotenv/config";
 import LRUCache from "@/utils/cache.utils";
-import { redis } from "@/config/redis";
+import { redis, get_new_redis_client } from "@/config/redis";
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
-import { eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 
 // ============================================================================
 // Three-tier FCM Token Cache
@@ -24,8 +24,63 @@ const fcm_token_lru = new LRUCache<string, string>(5000, LRU_TTL_MS);
 const redis_fcm_key = (user_id: string) => `fcm:user:${user_id}:token`;
 
 // ============================================================================
+// CROSS-WORKER LRU INVALIDATION
+//
+// Tier 1 is per-PROCESS with a 10-minute TTL, and PM2 runs us in cluster mode
+// (ecosystem.config.js instances:'max'). So a worker that never handled the
+// write keeps serving a stale user→token mapping for up to 10 minutes. That is
+// exactly the privacy leak this cache had to begin with: after a device changes
+// hands, a stale entry keeps pushing the PREVIOUS owner's notifications to the
+// new owner's handset. Every write path therefore publishes the affected
+// user_id here and every worker drops its local entry, falling back to Redis
+// (which is already authoritative by the time we publish).
+//
+// ioredis cannot mix subscribe-mode with normal commands on one connection, so
+// the subscriber gets its own client — same pattern as user-peer.cache.ts.
+// ============================================================================
+
+const INVALIDATE_CHANNEL = "fcm:invalidate";
+// payload format: user_id
+
+let _sub_started = false;
+const start_invalidation_subscriber = (): void => {
+  if (_sub_started) return;
+  _sub_started = true;
+  try {
+    const sub = get_new_redis_client();
+    sub.subscribe(INVALIDATE_CHANNEL, (err) => {
+      if (err) console.error("[FCM-CACHE] invalidation subscribe failed:", err);
+    });
+    sub.on("message", (channel, message) => {
+      if (channel !== INVALIDATE_CHANNEL) return;
+      fcm_token_lru.delete(message);
+    });
+  } catch (err) {
+    // A broken pub/sub must never break token storage — the LRU just stays
+    // process-local (pre-existing behaviour) until the next restart.
+    console.error("[FCM-CACHE] invalidation subscriber setup failed:", err);
+  }
+};
+
+start_invalidation_subscriber();
+
+const publish_fcm_invalidation = async (user_id: string): Promise<void> => {
+  try {
+    await redis.publish(INVALIDATE_CHANNEL, user_id);
+  } catch (err) {
+    console.error(`[FCM-CACHE] publish_fcm_invalidation failed (${user_id}):`, err);
+  }
+};
+
+// ============================================================================
 // WRITE PATH — store/update FCM token for a user
 // Writes to ALL three tiers simultaneously (fan-out).
+//
+// A device token is EXCLUSIVE to one user: it identifies a handset, not an
+// account. Before claiming it we steal it from anybody else still holding it,
+// otherwise two users' rows point at the same device and the previous owner's
+// pushes keep landing on it forever (there is no unique constraint on
+// users.fcm_token to stop that — see scripts/apply-fcm-token-unique.ts).
 // ============================================================================
 async function store_fcm_token(
   user_id: string,
@@ -35,6 +90,29 @@ async function store_fcm_token(
   if (fcm_token === null) {
     await remove_fcm_token(user_id);
     return;
+  }
+
+  // --- Tier 0: exclusive ownership — evict this token from every OTHER user ---
+  // Each hit here is a handset that WAS leaking one account's pushes to another,
+  // so the warn line is the field-confirmation signal for this fix.
+  try {
+    const stolen = await db
+      .update(user_model)
+      .set({ fcm_token: null })
+      .where(and(eq(user_model.fcm_token, fcm_token), ne(user_model.id, user_id)))
+      .returning({ id: user_model.id });
+
+    if (stolen.length > 0) {
+      const ids = stolen.map((u) => u.id);
+      console.warn('[FCM-CACHE] token reassigned from', ids, '->', user_id);
+      // Clear the losers' LRU + Redis too — the DB row is already NULL above,
+      // but Redis (1 month TTL) would otherwise resurrect the stale mapping.
+      for (const u of stolen) await remove_fcm_token(u.id);
+    }
+  } catch (err) {
+    // Non-fatal: a failed steal degrades to the old (leaky) behaviour rather
+    // than losing the new owner's token entirely.
+    console.error(`[FCM-CACHE] token steal failed for user ${user_id}:`, err);
   }
 
   // --- Tier 1: LRU ---
@@ -63,6 +141,12 @@ async function store_fcm_token(
   })();
 
   await Promise.allSettled([redis_promise, db_promise]);
+
+  // Tell the other workers to drop their (now stale) entry for this user. Done
+  // AFTER the Redis write so anyone re-reading immediately gets the new token.
+  // This process drops its own fresh entry too — one extra Redis GET on the
+  // next read, which is the cheap price for never serving a superseded token.
+  await publish_fcm_invalidation(user_id);
 }
 
 // ============================================================================
@@ -158,6 +242,10 @@ async function remove_fcm_token(user_id: string): Promise<void> {
   })();
 
   await Promise.allSettled([redis_promise, db_promise]);
+
+  // Tier 1 lives in THIS process only — without this every other worker keeps
+  // pushing to the removed token for up to LRU_TTL_MS (the logout leak).
+  await publish_fcm_invalidation(user_id);
 }
 
 // ============================================================================

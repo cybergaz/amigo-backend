@@ -77,6 +77,14 @@ export class FCMService {
               data: {
                 type: payload.type,
                 ...payload.data,
+                // Recipient assertion — the id of the user whose token we are
+                // sending to (NOT payload.user_ids[0]; this map is iterated per
+                // recipient). A handset that changed hands, or a token that is
+                // briefly stale in some cache tier, can still receive a push
+                // addressed to the PREVIOUS owner; the app drops any push whose
+                // to_user_id isn't the signed-in user. FCM data values must be
+                // strings.
+                to_user_id: String(user_id),
                 ...(payload.ws_message
                   ? { ws_message: JSON.stringify(payload.ws_message) }
                   : {}),
@@ -204,7 +212,9 @@ export class FCMService {
           const message: admin.messaging.Message = {
             token: row.fcm_token as string,
             notification: { title: input.title, body: input.body },
-            data: { ...(input.data ?? {}) },
+            // Same recipient assertion as send_notification, so a token that has
+            // since moved to another handset can be dropped app-side.
+            data: { ...(input.data ?? {}), to_user_id: String(row.id) },
             android: {
               priority: 'high',
               ttl: 2419200000,

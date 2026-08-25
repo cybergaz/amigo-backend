@@ -25,6 +25,7 @@ import { randomUUIDv7 } from "bun";
 import {
   get_disappearing_after_sec,
   set_disappearing_after_sec,
+  set_last_message,
 } from "@/cache-management/chat-meta.cache";
 
 // Resolve the disappearing-messages duration for a chat with read-through
@@ -432,11 +433,18 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: string) =
       })
       .returning();
 
-    // Update conversation's last_msg_at
-    await db
-      .update(chat_model)
-      .set({ last_msg_at: new Date(), last_msg_id: replyMessage?.id })
-      .where(eq(chat_model.id, request.conversation_id));
+    // Update the conversation's last-message pointer. Was Postgres-only, which
+    // left the Redis preview showing the message this reply superseded; the
+    // single writer keeps both halves in step. The insert above doesn't stamp
+    // sent_at, so fall back to created_at (defaultNow) for the timestamp.
+    await set_last_message(request.conversation_id, {
+      id: replyMessage.id,
+      body: replyMessage.body ?? "",
+      type: (replyMessage.type ?? "text") as MessageType,
+      sender_id: replyMessage.sender_id ?? user_id,
+      sent_at: (replyMessage.sent_at ?? replyMessage.created_at ?? new Date()).toISOString(),
+      attachments: replyMessage.attachments ?? null,
+    });
 
     return {
       success: true,

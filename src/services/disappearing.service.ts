@@ -10,7 +10,7 @@ import { get_conversation_members } from "@/cache-management/conv.cache";
 import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
 import {
   set_disappearing_after_sec,
-  update_chat_meta,
+  set_last_message,
 } from "@/cache-management/chat-meta.cache";
 import {
   ChatMessagePayload,
@@ -113,11 +113,9 @@ const set_chat_disappearing = async (
   }).returning();
 
   // Update chat last_msg pointers + chat_meta so the chat list reflects the
-  // system message as the most recent entry.
-  await db.update(chat_model)
-    .set({ last_msg_id: stored.id, last_msg_at: stored.sent_at })
-    .where(eq(chat_model.id, chat_id));
-  await update_chat_meta(chat_id, {
+  // system message as the most recent entry. One writer keeps the Postgres
+  // pointer and the Redis preview from drifting apart.
+  await set_last_message(chat_id, {
     id: stored.id,
     body: stored.body ?? "",
     type: "system",

@@ -51,6 +51,13 @@ async function main(): Promise<void> {
         SELECT DISTINCT ON (chat_id) chat_id, id, sent_at, created_at
         FROM messages
         WHERE deleted_at IS NULL
+          -- Disappearing messages are swept ASYNCHRONOUSLY, so "not deleted
+          -- yet" is not the same as "still visible". Without this the backfill
+          -- can elect an already-expired message as the chat-list preview —
+          -- and the cache path trusts whatever sits in the hash, so it would
+          -- stay on screen until the next send. Mirrors the read path in
+          -- get_chat_list.
+          AND (expires_at IS NULL OR expires_at > now())
         ORDER BY chat_id, sent_at DESC NULLS LAST, created_at DESC NULLS LAST
       ) m
       WHERE c.id = m.chat_id
@@ -69,6 +76,9 @@ async function main(): Promise<void> {
       FROM messages m
       JOIN chats c ON c.id = m.chat_id AND c.deleted_at IS NULL
       WHERE m.deleted_at IS NULL
+        -- Same expiry filter as pass 1 (see there): an unswept disappearing
+        -- message must not be warmed into chat_meta as the preview.
+        AND (m.expires_at IS NULL OR m.expires_at > now())
       ORDER BY m.chat_id, m.sent_at DESC NULLS LAST, m.created_at DESC NULLS LAST
     `),
   ) as Array<{

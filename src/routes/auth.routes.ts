@@ -539,7 +539,13 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   .get("/logout", async ({ cookie, set, headers }) => {
     const existing_token = cookie["refresh_token"].value;
     const access_token = cookie["access_token"].value;
-    if (!existing_token && !access_token) {
+    // Mobile is Bearer-only — the app ships no CookieManager at all — so reading
+    // identity from cookies alone made logout a NO-OP there: the FCM token stayed
+    // registered against the leaving user, and the next account to sign in on that
+    // handset kept receiving their pushes. Resolve the same credential set the
+    // middleware does (src/middleware/index.ts) so mobile gets cleaned up too.
+    const bearer_token = headers["authorization"]?.replace("Bearer ", "") ?? "";
+    if (!existing_token && !access_token && !bearer_token) {
       set.status = 404;
       console.log(`[SERVER] Already Logged Out : ${new Date().toLocaleString()}`);
       return {
@@ -548,26 +554,37 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       };
     }
 
-    // clean up after logout
-    const info = authenticate_jwt(cookie["refresh_token"].value as string);
-    if (info.success && info.data?.id) {
+    // clean up after logout — first credential that verifies wins. All three token
+    // kinds are signed with the same access key (see generate_*_jwt), so the
+    // verification path itself is unchanged; only WHICH credential we look at is.
+    let user_id: string | undefined;
+    for (const candidate of [existing_token, access_token, bearer_token]) {
+      if (!candidate) continue;
+      const info = authenticate_jwt(String(candidate));
+      if (info.success && info.data?.id) {
+        user_id = info.data.id;
+        break;
+      }
+    }
+
+    if (user_id) {
       // Remove FCM token from all 3 tiers (LRU, Redis, DB)
-      await remove_fcm_token(info.data.id);
+      await remove_fcm_token(user_id);
 
       // Server-side session kill: drop the user's sessions (single-device, so this
       // is the active one) and clear the legacy column. Without this the token would
       // stay refreshable until expiry even after logout.
-      await revoke_user_sessions(info.data.id);
+      await revoke_user_sessions(user_id);
       await db
         .update(user_model)
         .set({ refresh_token: null })
-        .where(eq(user_model.id, info.data.id));
+        .where(eq(user_model.id, user_id));
 
       // Update online status in DB
       // await db
       //   .update(user_model)
       //   .set({ online_status: false })
-      //   .where(eq(user_model.id, info.data.id));
+      //   .where(eq(user_model.id, user_id));
     }
 
     const userAgent = headers['user-agent'];

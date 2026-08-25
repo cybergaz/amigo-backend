@@ -398,6 +398,19 @@ const add_new_member = async (
       inserted = [...inserted, ...revived];
     }
 
+    // 5. Hydrate the Redis membership set + invalidate the LRU across instances
+    //    RIGHT HERE, in the same breath as the DB write — NOT after the
+    //    broadcasts below. conv:{chat_id}:members is what live fan-out, the
+    //    offline pending queue and FCM all read, and get_conversation_members
+    //    trusts any non-empty cached set with no DB fallback. If anything
+    //    further down throws, the membership rows are already committed (there
+    //    is no surrounding transaction) but a stale cache would keep excluding
+    //    the new members from all three paths until a full get_chat_list (app
+    //    restart) rebuilt their state. Cache truth is written with DB truth.
+    if (eligibleIds.length > 0) {
+      await add_members(eligibleIds, conversation_id);
+    }
+
     const [conv_details] = await db
       .select()
       .from(chat_model)
@@ -412,83 +425,110 @@ const add_new_member = async (
       };
     }
 
-    const actor_details = actor_id ? await get_user_details(actor_id) : null;
+    // Everything below is NOTIFICATION ONLY — the membership rows and the
+    // membership cache are already committed. A throw in here must NOT turn
+    // into a 500, or the caller retries an add that actually succeeded (and the
+    // admin panel / app shows a failure for a group the users are now in). So
+    // it gets its own try/catch that logs and falls through to the success
+    // return with `notified: false`.
+    let notified = true;
+    try {
+      const actor_details = actor_id ? await get_user_details(actor_id) : null;
 
-    const creater_info = conv_details.creater_id ? await get_user_details(conv_details.creater_id) : { success: false, data: null };
-    const members_res = await get_group_members(conversation_id);
-    const members = members_res.success ? members_res.data : [];
+      const creater_info = conv_details.creater_id ? await get_user_details(conv_details.creater_id) : { success: false, data: null };
+      const members_res = await get_group_members(conversation_id);
+      const members = members_res.success ? members_res.data : [];
 
-    if (!creater_info.success || !creater_info.data) {
-      throw new Error("Admin info not found");
-    }
+      // chats.creater_id is onDelete:'set null' and the admin panel hard-deletes
+      // user rows, so a perfectly healthy group can end up with NO creator. This
+      // used to `throw new Error("Admin info not found")`, which skipped every
+      // broadcast below AND the cache hydrate — the new members were silently
+      // excluded from fan-out. Fall back to the current owner / actor instead.
+      // NOTE: every field here must be a REAL string. The Flutter payload model
+      // declares creater_id / creater_name / creater_phone as required non-null
+      // Strings and json_serializable THROWS on null, which drops the frame
+      // client-side and reproduces the exact bug this fallback exists to fix.
+      const creater = creater_info.data ?? {
+        id: conv_details.owner_id ?? actor_id ?? "",
+        name: actor_details?.data?.name ?? conv_details.title ?? "Group",
+        phone: "",
+        profile_pic: null as string | null,
+      };
 
-    const new_conversation_payload: NewConversationPayload = {
-      conv_id: conversation_id,
-      conv_type: "group",
-      creater_id: creater_info.data.id,
-      title: conv_details.title || "",
-      creater_name: creater_info.data.name,
-      creater_phone: creater_info.data.phone || "",
-      creater_pfp: creater_info.data.profile_pic || undefined,
-      members: members,
-      joined_at: new Date(),
-    };
-    // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    await broadcast_message({
-      to: "users",
-      user_ids: user_ids,
-      message: {
-        type: "conversation:new",
-        payload: new_conversation_payload,
-        ws_timestamp: new Date()
-      },
-    });
-    if (eligibleIds.length > 0) {
-      const users_meta = await db
-        .select({
-          id: user_model.id,
-          name: user_model.name,
-          profile_pic: user_model.profile_pic,
-        })
-        .from(user_model)
-        .where(inArray(user_model.id, eligibleIds));
-
-      const members_for_action: MembersType[] = eligibleIds.map((id) => {
-        const meta = users_meta.find((m) => m.id === id);
-        const memberRow = inserted.find((row) => row.user_id === id);
-        const joinedAt = memberRow?.joined_at
-          ? new Date(memberRow.joined_at)
-          : new Date();
-
-        return {
-          user_id: id,
-          user_name: meta?.name || "Member",
-          user_pfp: meta?.profile_pic || undefined,
-          role: (memberRow?.role as ChatRoleType) || role,
-          joined_at: joinedAt,
-        };
-      });
-
-      await broadcast_conversation_action({
+      const new_conversation_payload: NewConversationPayload = {
         conv_id: conversation_id,
-        conv_type: (conv_details.type as ChatType) || "group",
-        action: "member_added",
-        members: members_for_action,
-        actor_id,
-        actor_name: actor_details?.data?.name,
-        actor_pfp: actor_details?.data?.profile_pic || undefined,
+        conv_type: "group",
+        creater_id: creater.id || "",
+        title: conv_details.title || "",
+        creater_name: creater.name || "Group",
+        creater_phone: creater.phone || "",
+        creater_pfp: creater.profile_pic || undefined,
+        members: members,
+        joined_at: new Date(),
+      };
+      // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+      await broadcast_message({
+        to: "users",
+        user_ids: user_ids,
+        message: {
+          type: "conversation:new",
+          payload: new_conversation_payload,
+          ws_timestamp: new Date()
+        },
       });
-    }
+      if (eligibleIds.length > 0) {
+        const users_meta = await db
+          .select({
+            id: user_model.id,
+            name: user_model.name,
+            profile_pic: user_model.profile_pic,
+          })
+          .from(user_model)
+          .where(inArray(user_model.id, eligibleIds));
 
-    // hydrate new members + invalidate LRU across instances
-    if (eligibleIds.length > 0) {
-      await add_members(eligibleIds, conversation_id);
+        const members_for_action: MembersType[] = eligibleIds.map((id) => {
+          const meta = users_meta.find((m) => m.id === id);
+          const memberRow = inserted.find((row) => row.user_id === id);
+          const joinedAt = memberRow?.joined_at
+            ? new Date(memberRow.joined_at)
+            : new Date();
+
+          return {
+            user_id: id,
+            user_name: meta?.name || "Member",
+            user_pfp: meta?.profile_pic || undefined,
+            role: (memberRow?.role as ChatRoleType) || role,
+            joined_at: joinedAt,
+          };
+        });
+
+        await broadcast_conversation_action({
+          conv_id: conversation_id,
+          conv_type: (conv_details.type as ChatType) || "group",
+          action: "member_added",
+          members: members_for_action,
+          actor_id,
+          actor_name: actor_details?.data?.name,
+          actor_pfp: actor_details?.data?.profile_pic || undefined,
+          // member_added fans out `to: "conversation"`, i.e. off the CACHED
+          // member set — and the add_members() hydrate above only reaches other
+          // instances through pub/sub, so there is a small window where a peer
+          // instance still holds a member set without the new users. Naming them
+          // explicitly guarantees they get their own member_added even if the
+          // set they're supposed to be in hasn't landed there yet.
+          extra_user_ids: eligibleIds,
+        });
+      }
+    } catch (notify_error) {
+      notified = false;
+      console.error('[add-members] notify failed', conversation_id, user_ids, notify_error);
     }
 
     return {
       success: true,
       code: 200,
       message: "Processed members",
+      notified,
       data: {
         inserted,
         existing: activeIds,
@@ -497,6 +537,9 @@ const add_new_member = async (
       },
     };
   } catch (error) {
+    // There was NO log line here at all — an add that committed rows and then
+    // blew up was completely invisible in the logs (500 with a generic message).
+    console.error('[add-members] failed', conversation_id, user_ids, error);
     return {
       success: false,
       code: 500,
@@ -976,11 +1019,20 @@ const bulk_add_members_to_groups = async (
     });
   }
 
+  // Partial failure used to be indistinguishable from full success: `some()`
+  // reported success:true as long as ONE group worked, and the caller had no
+  // way to tell which of the others didn't. Report the exact per-group
+  // breakdown and let `success` mean what it says. Still HTTP 200 — a group
+  // that failed is a business outcome the client renders, not a server error.
+  const failed = results.filter((r) => !r.success).map((r) => r.conversation_id);
+
   return {
-    success: results.some((r) => r.success),
+    success: results.every((r) => r.success),
     code: 200,
-    message: "Bulk add processed",
-    data: { results },
+    message: failed.length > 0
+      ? `Bulk add processed with ${failed.length} failed group(s)`
+      : "Bulk add processed",
+    data: { results, failed },
   };
 };
 

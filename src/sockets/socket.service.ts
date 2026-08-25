@@ -6,7 +6,7 @@ import { socket_connections } from "./socket.server";
 import { forward_messages, store_message_with_retry } from "@/services/message.services";
 import { mark_read_upto } from "@/services/message-status.service";
 import { add_members, is_member } from "@/cache-management/conv.cache";
-import { update_chat_meta, batch_increment_unread, reset_unread } from "@/cache-management/chat-meta.cache";
+import { set_last_message, batch_increment_unread, reset_unread } from "@/cache-management/chat-meta.cache";
 import db from "@/config/db";
 import { chat_model, chat_member_model } from "@/models/chat.model";
 import { message_model } from "@/models/message.model";
@@ -610,8 +610,14 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       // const conv_members = await get_conversation_members(payload.conv_id);
       const now = new Date();
 
-      // 1. Update Redis chat_meta (last message display data)
-      update_chat_meta(payload.conv_id, {
+      // 1. Update the last-message pointer — Redis chat_meta (display data)
+      //    AND the durable Postgres pointer, in one writer. chat_meta alone is
+      //    a cache that is never flushed, so on any wipe the pointer vanished
+      //    and every chat list blanked (the app hides chats whose last_msg_id
+      //    is null). Fire-and-forget, exactly like the old cache-only call:
+      //    set_last_message never rejects, and this runs AFTER the sender's
+      //    message:sent:ack above — nothing here may re-enter the ack path.
+      set_last_message(payload.conv_id, {
         id: store_msg_result.data.id,
         body: payload.body ?? "",
         type: payload.msg_type,
@@ -693,24 +699,9 @@ const handle_message_new = async (payload: ChatMessagePayload, user_name: string
       // }
     }
 
-    // // 5. Persist the last-message pointer to Postgres (fire-and-forget).
-    // //    chat_meta in Redis holds this for display, but it's a CACHE and is
-    // //    never flushed to PG — so without this write the pointer is lost on any
-    // //    cache wipe/flush, which blanks every DM list (the app hides chats whose
-    // //    last_msg_id is null). Runs after the sender ack, so it's off the
-    // //    latency path; failures are logged, not thrown.
-    // if (store_msg_result.data) {
-    //   db
-    //     .update(chat_model)
-    //     .set({
-    //       last_msg_id: store_msg_result.data.id,
-    //       last_msg_at: store_msg_result.data.sent_at ?? new Date(),
-    //     })
-    //     .where(eq(chat_model.id, payload.conv_id))
-    //     .catch((err) =>
-    //       console.error(`[WS] last_msg_id persist failed (${payload.conv_id}):`, err),
-    //     );
-    // }
+    // 5. (The Postgres last-message pointer used to be written here, commented
+    //     out. It now happens inside set_last_message in step 1, which writes
+    //     both halves — see the note there.)
 
     // 6. Queue FCM for offline AND backgrounded users. Backgrounded users keep
     //    a live WS (so they also received the frame above), but the OS may have
@@ -933,14 +924,11 @@ const handle_message_forward = async (payload: MessageForwardPayload, username: 
           }
         });
 
-        // update the conversation's last message
+        // Update the conversation's last message — both the Redis preview and
+        // the durable Postgres pointer (the latter was commented out here, so
+        // a forward-only chat lost its pointer on every cache wipe).
         const last_msg = all_msgs_for_conv[all_msgs_for_conv.length - 1];
-        // await update_conversation({
-        //   id: conv_id,
-        //   last_msg_id: last_msg.id,
-        //   last_msg_at: new Date()
-        // });
-        update_chat_meta(conv_id, {
+        set_last_message(conv_id, {
           id: last_msg.id,
           body: last_msg.body ?? "",
           type: last_msg.type,

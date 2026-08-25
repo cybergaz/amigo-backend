@@ -1,5 +1,5 @@
 import { pgTable, text, timestamp, char, varchar, boolean, jsonb, bigserial, uuid, uniqueIndex, index, } from "drizzle-orm/pg-core";
-import { InferInsertModel, InferSelectModel } from "drizzle-orm";
+import { InferInsertModel, InferSelectModel, sql } from "drizzle-orm";
 import { ROLE_CONST, REQUEST_STATUS_CONST } from "@/types/user.types";
 
 const user_model = pgTable("users", {
@@ -36,6 +36,20 @@ const user_model = pgTable("users", {
   uniqueIndex("idx_users_phone").on(table.phone),
   index("idx_user_name").on(table.name),
   index("idx_user_created").on(table.created_at),
+  // An FCM token identifies a DEVICE, so at most ONE user may own it — a second
+  // owner means every push for that device is delivered to both accounts (the
+  // cross-account notification leak). store_fcm_token() steals the token from
+  // any previous owner, and scripts/apply-fcm-token-unique.ts dedupes history;
+  // this index is the last-resort backstop that makes a double-owner
+  // IMPOSSIBLE rather than merely unlikely.
+  // Declared here (not only in the script) so drizzle-kit doesn't read the
+  // live index as drift and DROP it on the next db:push. Partial, because
+  // fcm_token is NULL for every user who has never registered a device and
+  // NULLs must stay non-unique. Predicate is written unqualified to match the
+  // CREATE INDEX the script issues.
+  uniqueIndex("idx_users_fcm_token_unique")
+    .on(table.fcm_token)
+    .where(sql`fcm_token IS NOT NULL`),
 ]);
 
 const signup_request_model = pgTable("signup_requests", {

@@ -208,6 +208,20 @@ const get_user_details = async (id: string) => {
       .where(eq(user_model.id, id))
       .limit(1);
 
+    // A missing row used to come back as success:true with data undefined, so
+    // every caller that only checks `.success` believed it had a user and then
+    // read fields off nothing. Deleted accounts are real here — creater_id /
+    // owner_id are onDelete:'set null' and the admin panel hard-deletes users —
+    // so a miss must be an explicit, checkable 404 with data:null.
+    if (!user_details) {
+      return {
+        success: false,
+        code: 404,
+        message: "User not found",
+        data: null,
+      };
+    }
+
     return {
       success: true,
       code: 200,

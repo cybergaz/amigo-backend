@@ -31,6 +31,7 @@ const HEARTBEAT_INTERVAL_MS = 15000;
 const MAX_MISSED_PINGS = 2;
 const STATS_LOGGING_INTERVAL_MS = 60000;
 const OFFLINE_STATUS_BROADCAST_DELAY_MS = 8000;
+const SOCKET_PORT = parseInt(process.env.SOCKET_PORT || "5002");
 
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let statsInterval: ReturnType<typeof setInterval> | null = null;
@@ -137,7 +138,7 @@ const web_socket_server = new Elysia({
           ws.send({
             type: 'socket:error',
             error_code: 'AUTH_INVALID',
-            auth_error: (auth_result as { auth_error?: string }).auth_error ?? AuthError.TOKEN_INVALID,
+            auth_error: (auth_result as { auth_error?: string; }).auth_error ?? AuthError.TOKEN_INVALID,
             message: 'Invalid or expired authentication token',
             timestamp: new Date().toISOString()
           }, true);
@@ -348,8 +349,7 @@ const web_socket_server = new Elysia({
       }
     }
   })
-
-  .listen(process.env.SOCKET_PORT || 5002);
+  .listen({ port: SOCKET_PORT || 5002, reusePort: true });
 
 console.log(`🔌 WebSocket server is running at port ${process.env.SOCKET_PORT || 5002}`);
 

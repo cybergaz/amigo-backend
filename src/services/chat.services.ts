@@ -9,6 +9,7 @@ import { user_model } from "@/models/user.model";
 import {
   ChatRoleType,
   ChatType,
+  MessageType,
 } from "@/types/chat.types";
 import { and, arrayContains, asc, desc, eq, gt, lt, inArray, isNotNull, isNull, ne, not, or, sql } from "drizzle-orm";
 import { broadcast_message } from "@/sockets/socket.handlers";
@@ -17,7 +18,7 @@ import FCMService from "./fcm.service";
 import { queue_message_fcm } from "./fcm-batch.service";
 import { get_conversation_members, invalidate_conversation, invalidate_user_conversations } from "@/cache-management/conv.cache";
 import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
-import { get_chat_metas, get_all_unread, reset_unread } from "@/cache-management/chat-meta.cache";
+import { get_chat_meta, get_chat_metas, get_all_unread, reset_unread, set_last_message, clear_chat_meta_message } from "@/cache-management/chat-meta.cache";
 import { get_message_statuses_bulk } from "@/cache-management/message.cache";
 import { generate_unique_id } from "@/utils/general.utils";
 import { randomUUIDv7 } from "bun";
@@ -93,11 +94,26 @@ const broadcast_conversation_action = async (data: {
   // requester-only events (join_request:resolved) that must not leak to the
   // whole group.
   direct_user_ids?: string[];
-}) => {
+  // Users who must receive this event even though the cached conversation
+  // member set doesn't (yet) contain them — e.g. a member added in this very
+  // request, whose cache entry has been invalidated but not repopulated. These
+  // are ADDED to the normal fan-out, they don't replace it.
+  extra_user_ids?: string[];
+},
+  // Same list, accepted positionally so a caller can tack it on without
+  // rebuilding the options object. Both forms are merged.
+  extra_user_ids?: string[],
+) => {
   // Member-action events require at least one member in the list (otherwise
   // there's nothing to announce). chat_details:update is the exception — it
   // describes the chat itself, not a member.
   if (data.action !== "chat_details:update" && !data.members.length) return;
+
+  // Union of both ways of passing the extras. Empty for every existing caller,
+  // in which case broadcast_message's recipient set is exactly what it was.
+  const extras = Array.from(
+    new Set([...(data.extra_user_ids ?? []), ...(extra_user_ids ?? [])]),
+  ).filter(Boolean);
 
   const action_at = new Date();
   const payload: ConversationActionPayload = {
@@ -136,7 +152,7 @@ const broadcast_conversation_action = async (data: {
   if (data.direct_user_ids && data.direct_user_ids.length > 0) {
     await broadcast_message({
       to: "users",
-      user_ids: data.direct_user_ids,
+      user_ids: Array.from(new Set([...data.direct_user_ids, ...extras])),
       message: {
         type: "conversation:action",
         payload,
@@ -154,6 +170,10 @@ const broadcast_conversation_action = async (data: {
     await broadcast_message({
       to: "conversation",
       conv_id: data.conv_id,
+      // broadcast_message unions the cached member set with user_ids, so the
+      // extras ride along on the same fan-out (and get the same offline
+      // persistence) without a second pass.
+      user_ids: extras,
       message: {
         type: "conversation:action",
         payload,
@@ -174,7 +194,13 @@ const broadcast_conversation_action = async (data: {
   ) {
     await broadcast_message({
       to: "users",
-      user_ids: data.members.map(m => m.user_id),
+      user_ids: Array.from(new Set([
+        ...data.members.map(m => m.user_id),
+        // chat_delete skips the conversation fan-out above, so this is the
+        // extras' only chance to hear about it. The other two actions already
+        // reached them there — don't send twice.
+        ...(data.action === "chat_delete" ? extras : []),
+      ])),
       message: {
         type: "conversation:action",
         payload,
@@ -296,14 +322,24 @@ const get_chat_list = async (user_id: string, type: string) => {
     // dm_peer matches the *other* member of the DM. The peer's row should be
     // active (their removed_at is null) — even for the deleted_dm case where
     // it's the *current* user's row that has removed_at set.
+    //
+    // Restricted to type='dm'. Without that predicate the CTE also emitted a
+    // row for every member of every GROUP, and the unconditional LEFT JOIN
+    // below then multiplied each group into (member_count - 1) duplicate
+    // chat-list rows — a 100-member group shipped 99 copies of itself, which
+    // is why a cold group chat-list could blow the client's 25s timeout.
+    // Groups need no peer at all: their peer columns are explicitly nulled out
+    // in the enrichment below, so nothing downstream can starve on this.
     const dm_peer = db.$with("dm_peer").as(
       db.select({
         chat_id: chat_member_model.chat_id,
         user_id: chat_member_model.user_id,
       })
         .from(chat_member_model)
+        .innerJoin(chat_model, eq(chat_model.id, chat_member_model.chat_id))
         .where(
           and(
+            eq(chat_model.type, "dm"),
             ne(chat_member_model.user_id, user_id),
             isNull(chat_member_model.removed_at),
           )
@@ -380,10 +416,18 @@ const get_chat_list = async (user_id: string, type: string) => {
             : undefined,
         )
       )
+      // NOTE: deliberately no LIMIT. This response is the client's full
+      // reconciliation set — it deletes every local chat that is absent from
+      // it — so truncating the tail would silently wipe real conversations
+      // off the device. The row count is now one-per-membership again (see
+      // the dm_peer note above), which is the fix that actually mattered.
       .orderBy(desc(chat_model.last_msg_at));
 
     if (chats.length === 0) {
-      return { success: false, code: 404, message: "No chats found" };
+      // Zero chats is a legitimate state (brand-new account, every DM deleted),
+      // not a failure. The old 404 propagated into set.status, so the client
+      // saw an error result with no `data` and had to special-case it.
+      return { success: true, code: 200, data: [] as typeof chats };
     }
 
     // ── Enrich from Redis: last message + unread counts ──────────────────
@@ -398,6 +442,100 @@ const get_chat_list = async (user_id: string, type: string) => {
       get_all_unread(user_id),
       get_pinned_message_map(pinned_ids),
     ]);
+
+    // ── Read-through fallback: resolve missing previews from Postgres ─────
+    // chat_meta has no TTL, but it is still a CACHE — a flush, an eviction or
+    // a brand-new Valkey wipes it. Before this, a miss shipped
+    // lastMessage:null and the list rendered blank (and DMs vanished entirely,
+    // since the client hides chats with no last-message id) until someone sent
+    // a new message. Resolve the newest still-visible message for the missing
+    // chats in ONE query instead.
+    //
+    // The visibility predicate must mirror the cache path EXACTLY or deleted /
+    // expired messages resurface as previews:
+    //   - soft-deleted rows are excluded (same predicate as the pinned lookup)
+    //   - disappearing messages past expires_at are excluded — the sweeper
+    //     deletes them asynchronously, so "not swept yet" must not mean
+    //     "still visible".
+    // The per-user "clear chat" watermark is NOT applied here on purpose: the
+    // fallback rows go through the very same is_after_clear gate below as the
+    // cached ones, so there is one implementation of that rule, not two.
+    //
+    // Two ways in, one query. For a chat that HAS a Postgres pointer we look
+    // the message up by primary key — that is the whole point of maintaining
+    // last_msg_id, and it keeps the post-cache-wipe cost flat no matter how
+    // much history a chat holds. Only pointer-less chats (rows predating the
+    // pointer writeback) fall back to scanning for their newest message.
+    const pointer_ids: string[] = [];
+    const scan_chat_ids: string[] = [];
+    for (const chat of chats) {
+      if (chat_metas.get(chat.conversationId)) continue; // cache hit
+      if (chat.lastMsgId) pointer_ids.push(chat.lastMsgId);
+      else scan_chat_ids.push(chat.conversationId);
+    }
+
+    if (pointer_ids.length > 0 || scan_chat_ids.length > 0) {
+      const now = new Date();
+      const fallback_rows = await db
+        .selectDistinctOn([message_model.chat_id], {
+          chat_id: message_model.chat_id,
+          id: message_model.id,
+          body: message_model.body,
+          type: message_model.type,
+          sender_id: message_model.sender_id,
+          sent_at: message_model.sent_at,
+          created_at: message_model.created_at,
+          attachments: message_model.attachments,
+        })
+        .from(message_model)
+        .where(
+          and(
+            // A pointed-at message that is itself deleted/expired yields no row
+            // and therefore no preview — deliberately. The delete + sweeper
+            // paths repoint the pointer (broadcast_deletion), so that state is
+            // transient and self-healing; guessing a replacement here would
+            // mean rescanning every chat's history on every cache miss.
+            or(
+              pointer_ids.length > 0 ? inArray(message_model.id, pointer_ids) : undefined,
+              scan_chat_ids.length > 0 ? inArray(message_model.chat_id, scan_chat_ids) : undefined,
+            ),
+            isNull(message_model.deleted_at),
+            or(isNull(message_model.expires_at), gt(message_model.expires_at, now)),
+          )
+        )
+        // NULLS LAST matches scripts/backfill-last-msg.ts: sent_at is nullable
+        // on older rows and Postgres sorts NULLs FIRST on DESC, which would
+        // otherwise elect a stamp-less row as "newest". Only matters for the
+        // scan half — the pointer half returns exactly one row per chat.
+        .orderBy(
+          message_model.chat_id,
+          sql`${message_model.sent_at} DESC NULLS LAST`,
+          sql`${message_model.created_at} DESC NULLS LAST`,
+        );
+
+      for (const row of fallback_rows) {
+        // Same shape parse_chat_meta_row hands back, field for field, so the
+        // enrichment below cannot tell a cached row from a fallback row.
+        chat_metas.set(row.chat_id, {
+          id: row.id,
+          body: row.body ?? "",
+          type: row.type as MessageType,
+          sender_id: row.sender_id ?? "",
+          // sent_at is nullable on legacy rows; fall back to created_at rather
+          // than now(), which would date the message "just sent" and sail it
+          // past the clear-chat watermark below.
+          sent_at: (row.sent_at ?? row.created_at ?? now).toISOString(),
+          attachments: row.attachments ?? null,
+        });
+      }
+
+      // Deliberately NOT hydrating chat_meta from here. This is a read path
+      // that can race a concurrent handle_message_new which has already put a
+      // NEWER message in the hash — a blind update_chat_meta would rewind the
+      // preview for everyone. The cache re-fills itself on the chat's next
+      // send (set_last_message), which is the only writer that knows it holds
+      // the newest message.
+    }
 
     const enriched = chats.map(chat => {
       const meta = chat_metas.get(chat.conversationId);
@@ -446,7 +584,12 @@ const get_chat_list = async (user_id: string, type: string) => {
         userProfilePic: chat.type === "dm" ? chat.userProfilePic : null,
         lastSeen: chat.type === "dm" ? chat.lastSeen : null,
         // Don't advance a shell's last-message pointer to a post-leave message.
-        lastMsgId: show_last_msg ? chat.lastMsgId : null,
+        // When Postgres has no pointer at all (chats written before the
+        // last-message writeback existed) fall back to the id of the message
+        // we just resolved — the client filters DMs on lastMsgId IS NOT NULL,
+        // so a null here hides the chat outright. Never overrides a pointer
+        // Postgres does have.
+        lastMsgId: show_last_msg ? (chat.lastMsgId ?? meta?.id ?? null) : null,
         pinnedMsgId: show_pinned ? chat.pinnedMsgId : null,
         // Redis enrichment — withheld for shells (would leak post-leave content).
         lastMessage: show_last_msg ? (meta ?? null) : null,
@@ -871,23 +1014,67 @@ const broadcast_deletion = async (
   if (!conversation) return;
 
   const deleted_set = new Set(message_ids);
-  const last_msg_hit = conversation.last_msg_id && deleted_set.has(conversation.last_msg_id);
+  // The Redis preview is checked independently of the Postgres pointer: the two
+  // could historically drift apart (only one of them was written), and a stale
+  // chat_meta is exactly what makes a DELETED message keep showing as the
+  // chat-list preview.
+  const cached_meta = await get_chat_meta(chat_id);
+  const last_msg_hit =
+    (conversation.last_msg_id && deleted_set.has(conversation.last_msg_id)) ||
+    (cached_meta?.id && deleted_set.has(cached_meta.id));
   const pinned_hit = conversation.pinned_msg_id && deleted_set.has(conversation.pinned_msg_id);
 
   const updates: DBUpdateConversationType = {};
 
   if (last_msg_hit) {
     const [next] = await db
-      .select({ id: message_model.id, sent_at: message_model.sent_at })
+      .select({
+        id: message_model.id,
+        body: message_model.body,
+        type: message_model.type,
+        sender_id: message_model.sender_id,
+        sent_at: message_model.sent_at,
+        created_at: message_model.created_at,
+        attachments: message_model.attachments,
+      })
       .from(message_model)
       .where(and(
         eq(message_model.chat_id, chat_id),
         isNull(message_model.deleted_at),
+        // Same visibility rule the chat-list read path uses — an expired but
+        // not-yet-swept message must not be promoted to the preview.
+        or(isNull(message_model.expires_at), gt(message_model.expires_at, new Date())),
       ))
-      .orderBy(desc(message_model.created_at))
+      // Ordering mirrors get_chat_list's read-through fallback so the pointer
+      // and the preview can never disagree on which message is "newest".
+      .orderBy(
+        sql`${message_model.sent_at} DESC NULLS LAST`,
+        sql`${message_model.created_at} DESC NULLS LAST`,
+      )
       .limit(1);
-    updates.last_msg_id = next ? next.id : null;
-    updates.last_msg_at = next ? next.sent_at : conversation.last_msg_at;
+
+    if (next) {
+      // Writes BOTH halves. allow_rewind because this is the one legitimate
+      // backwards move: the newest message is gone and the pointer has to fall
+      // back to an OLDER one, which the monotonic guard would otherwise drop.
+      await set_last_message(chat_id, {
+        id: next.id,
+        body: next.body ?? "",
+        type: next.type as MessageType,
+        sender_id: next.sender_id ?? "",
+        // created_at before now(): a legacy row with no sent_at must not be
+        // stamped "just now" and jump the chat to the top of the list.
+        sent_at: (next.sent_at ?? next.created_at ?? new Date()).toISOString(),
+        attachments: next.attachments ?? null,
+      }, { allow_rewind: true });
+    } else {
+      // Nothing visible left in the chat. Keep last_msg_at so the chat holds
+      // its position in the list, but drop the id and the cached preview —
+      // otherwise chat_meta keeps serving the message we just deleted.
+      updates.last_msg_id = null;
+      updates.last_msg_at = conversation.last_msg_at;
+      await clear_chat_meta_message(chat_id);
+    }
   }
   if (pinned_hit) {
     updates.pinned_msg_id = null;
