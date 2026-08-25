@@ -7,7 +7,8 @@ import user_routes from "./routes/user.routes";
 import chat_routes from "./routes/chat.routes";
 import media_routes from "./routes/media.routes";
 import community_routes from "./routes/community.routes";
-import call_routes from "./routes/call.routes";
+// import call_routes from "./routes/call.routes.ts.bak";
+import livekit_routes from "./routes/livekit.routes";
 import admin_routes from "./routes/admin.routes";
 import sub_admin_routes from "./routes/sub-admin.routes";
 import app_version_routes from "./routes/app-version.routes";
@@ -19,7 +20,7 @@ import { message_routes } from "./routes/message.routes";
 import { start_receipts_flush } from "./cache-management/receipt-flush";
 import { start_message_status_flush } from "./cache-management/message-status-flush";
 import { start_disappearing_sweeper } from "./cache-management/disappearing-sweeper";
-
+import { LivekitService } from "./services/livekit.service";
 const SERVER_PORT = parseInt(process.env.SERVER_PORT || "5000");
 
 if (!SERVER_PORT || isNaN(SERVER_PORT)) {
@@ -43,7 +44,7 @@ const app = new Elysia({ prefix: "/api" })
             valueError: {
               field: err.valueError?.path,
               message: err.valueError?.message,
-            }
+            },
           },
         };
     }
@@ -51,13 +52,20 @@ const app = new Elysia({ prefix: "/api" })
 
   .get("/", ({ set }) => {
     set.status = 200;
-    return { success: true, code: 200, message: "Welcome to AmigoChats API", };
+    return { success: true, code: 200, message: "Welcome to AmigoChats API" };
   })
 
-  .use(cors({
-    origin: [process.env.FRONTEND_URL || "http://localhost:3000", "https://amigochats.com", "https://www.amigochats.com", "https://admin.amigochats.com"],
-    credentials: true,
-  }))
+  .use(
+    cors({
+      origin: [
+        process.env.FRONTEND_URL || "http://localhost:3000",
+        "https://amigochats.com",
+        "https://www.amigochats.com",
+        "https://admin.amigochats.com",
+      ],
+      credentials: true,
+    }),
+  )
 
   .use(auth_routes)
   .use(user_routes)
@@ -68,7 +76,12 @@ const app = new Elysia({ prefix: "/api" })
   .use(message_routes)
   .use(community_routes)
   .use(media_routes)
-  .use(call_routes)
+  // .use(call_routes)
+  // LiveKit calling: status/accept/decline/end (used by the native
+  // Android call screen when Flutter isn't running) + the protected
+  // join-token and active-call endpoints. Without this mount every one
+  // of them 404s, which silently breaks answering from a killed app.
+  .use(livekit_routes)
   .use(admin_routes)
   .use(sub_admin_routes)
   .use(app_version_routes)
@@ -76,6 +89,8 @@ const app = new Elysia({ prefix: "/api" })
   .listen({ port: SERVER_PORT, reusePort: true });
 
 console.log(`🦊 Elysia is running at port ${app.server?.url} (PID: ${process.pid})`);
+
+LivekitService.get_all_active_calls();
 
 const receipts_flush_stop = start_receipts_flush();
 const message_status_flush_stop = start_message_status_flush();
@@ -91,8 +106,8 @@ process.on('SIGTERM', async () => {
   process.exit(0);
 });
 
-process.on('SIGINT', () => {
-  console.log('SIGINT received, shutting down gracefully');
+process.on("SIGINT", () => {
+  console.log("SIGINT received, shutting down gracefully");
   receipts_flush_stop();
   message_status_flush_stop();
   disappearing_sweeper_stop();

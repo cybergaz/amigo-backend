@@ -26,6 +26,7 @@
     "ioredis": "^5.7.0",
     "jsonwebtoken": "^9.0.2",
     "libphonenumber-js": "^1.12.17",
+    "livekit-server-sdk": "^2.17.0",
     "nanoid": "^5.1.5",
     "postgres": "^3.4.7"
   },

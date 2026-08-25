@@ -1,13 +1,26 @@
 import { authenticate_jwt } from "@/middleware";
 import { WSMessageSchema } from "@/types/socket.elysia-schema";
 import Elysia, { t } from "elysia";
-import { broadcast_message, get_ws_data, set_ws_data, socket_message_handler } from "./socket.handlers";
-import { handle_user_disconnected_midcall } from "./socket.service";
-import { StreamCallService } from "@/services/stream-call.service";
-import { ConnectionStatusPayload, PollingConnection, UserConnection, WSMessage } from "@/types/socket.types";
+import {
+  broadcast_message,
+  get_ws_data,
+  set_ws_data,
+  socket_message_handler,
+} from "./socket.handlers";
+// import { handle_user_disconnected_midcall } from "./socket.service";
+// import { StreamCallService } from "@/services/stream-call.service";
+import {
+  ConnectionStatusPayload,
+  PollingConnection,
+  UserConnection,
+  WSMessage,
+} from "@/types/socket.types";
 import { update_user_details } from "@/services/user.services";
 // import { sync_missed_messages } from "@/services/chat.services";
-import { start_cleanup_cron, stop_cleanup_cron } from "@/cache-management/polling.cache";
+import {
+  start_cleanup_cron,
+  stop_cleanup_cron,
+} from "@/cache-management/polling.cache";
 import { get_user_peers } from "@/cache-management/user-peer.cache";
 import { get_auth_device } from "@/services/session.service";
 import { redis } from "@/config/redis";
@@ -20,10 +33,10 @@ const polling_connections = new Map<string, PollingConnection>(); // user_id -> 
 // Give the Stream busy-registry a socket-liveness probe so it can lazily
 // clear leaked "user is on a call" entries (see StreamCallService.isUserBusy).
 // Injected here — the service must not import socket internals (cycle).
-StreamCallService.setLivenessProbe((user_id: string) => {
-  const conn = socket_connections.get(user_id);
-  return !!conn && conn.ws.readyState === 1;
-});
+// StreamCallService.setLivenessProbe((user_id: string) => {
+//   const conn = socket_connections.get(user_id);
+//   return !!conn && conn.ws.readyState === 1;
+// });
 
 // configuration
 // Heartbeat: client pings every 12s, server checks every 15s, 2 missed = ~24-27s detection
@@ -42,14 +55,17 @@ const web_socket_server = new Elysia({
     idleTimeout: 60, // x seconds of inactivity before closing the connection
     sendPings: true,
     perMessageDeflate: true, // RFC 7692 compression — reduces mobile fragmentation risk
-  }
+  },
 })
   .onError(({ error, path }) => {
     const err = error as any;
     switch (err.code) {
       case "NOT_FOUND":
         console.error("[SOCKET] WebSocket server endpoint not found");
-        return { type: "socket:error", message: "WebSocket endpoint not found" };
+        return {
+          type: "socket:error",
+          message: "WebSocket endpoint not found",
+        };
 
       case "VALIDATION":
         console.error("[SOCKET] WebSocket server validation error at", path);
@@ -63,17 +79,20 @@ const web_socket_server = new Elysia({
             valueError: {
               field: err.valueError?.path,
               message: err.valueError?.message,
-            }
+            },
           },
         };
 
       case "INTERNAL_SERVER_ERROR":
         console.error("[SOCKET] WebSocket server internal server error");
-        return { type: "socket:error", message: "WebSocket internal server error" };
+        return {
+          type: "socket:error",
+          message: "WebSocket internal server error",
+        };
     }
   })
 
-  .ws('/chat', {
+  .ws("/chat", {
     // schema validations
     body: WSMessageSchema,
     query: t.Object({ token: t.String() }),
@@ -88,7 +107,7 @@ const web_socket_server = new Elysia({
             valueError: {
               field: err.valueError?.path,
               message: err.valueError?.message,
-            }
+            },
           });
           // console.log(err);
           return {
@@ -100,8 +119,8 @@ const web_socket_server = new Elysia({
               valueError: {
                 field: err.valueError?.path,
                 message: err.valueError?.message,
-              }
-            }
+              },
+            },
           };
       }
     },
@@ -110,7 +129,7 @@ const web_socket_server = new Elysia({
       try {
         // Extract and validate JWT token
         const url = new URL(ws.data.request.url);
-        const token = url.searchParams.get('token');
+        const token = url.searchParams.get("token");
 
         if (token == "websocket-connectivity-check") {
           ws.close(4200, "Connectivity check - no authentication needed");
@@ -119,13 +138,16 @@ const web_socket_server = new Elysia({
         }
 
         if (!token) {
-          ws.send({
-            type: 'socket:error',
-            error_code: 'AUTH_REQUIRED',
-            auth_error: AuthError.TOKEN_MISSING,
-            message: 'Authentication token is required',
-            timestamp: new Date().toISOString()
-          }, true);
+          ws.send(
+            {
+              type: "socket:error",
+              error_code: "AUTH_REQUIRED",
+              auth_error: AuthError.TOKEN_MISSING,
+              message: "Authentication token is required",
+              timestamp: new Date().toISOString(),
+            },
+            true,
+          );
           ws.close(4001, "Missing authentication token");
           return;
         }
@@ -163,7 +185,10 @@ const web_socket_server = new Elysia({
           } else {
             const row = await get_auth_device(uid, device_id);
             if (row) {
-              await redis.set(`authver:${uid}:${device_id}`, String(row.token_version));
+              await redis.set(
+                `authver:${uid}:${device_id}`,
+                String(row.token_version),
+              );
               ok = row.token_version === token_version;
             }
           }
@@ -171,12 +196,15 @@ const web_socket_server = new Elysia({
             // Terminal: single-device supersede. Send the labeled frame before the
             // close so a client reading it gets the reason; close(4003) remains the
             // primary logout trigger.
-            ws.send({
-              type: 'socket:error',
-              auth_error: AuthError.DEVICE_SUPERSEDED,
-              message: 'Session superseded on another device',
-              timestamp: new Date().toISOString()
-            }, true);
+            ws.send(
+              {
+                type: "socket:error",
+                auth_error: AuthError.DEVICE_SUPERSEDED,
+                message: "Session superseded on another device",
+                timestamp: new Date().toISOString(),
+              },
+              true,
+            );
             ws.close(4003, "Session superseded on another device");
             return;
           }
@@ -187,19 +215,19 @@ const web_socket_server = new Elysia({
         set_ws_data(ws, { user_id });
 
         // update the online status of user in the DB
-        const user_res = await update_user_details(
-          user_id,
-          { last_seen: new Date() }
-        );
+        const user_res = await update_user_details(user_id, {
+          last_seen: new Date(),
+        });
 
         // insert user_name into WebSocket data using type-safe helper
         set_ws_data(ws, { user_name: user_res.data?.name });
 
         // Extract client IP for logging/diagnostics
         const request = ws.data.request;
-        const client_ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-          || request.headers.get('x-real-ip')
-          || 'unknown';
+        const client_ip =
+          request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+          request.headers.get("x-real-ip") ||
+          "unknown";
 
         // Add to active socket connections with new tracking fields.
         // A fresh connection always starts foreground (is_background:false); a
@@ -217,7 +245,9 @@ const web_socket_server = new Elysia({
         // removing from polling connections if exists (in case user switched transport without closing previous connection properly)
         if (polling_connections.has(user_id)) {
           polling_connections.delete(user_id);
-          console.log(`[WS] User ${user_id} switched from polling to WebSocket, removed from polling connections`);
+          console.log(
+            `[WS] User ${user_id} switched from polling to WebSocket, removed from polling connections`,
+          );
         }
 
         // notify all connected users about this user being online
@@ -225,7 +255,7 @@ const web_socket_server = new Elysia({
 
         const message_payload: ConnectionStatusPayload = {
           sender_id: user_id,
-          status: 'online',
+          status: "online",
         };
 
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -235,7 +265,7 @@ const web_socket_server = new Elysia({
           message: {
             type: "connection:status",
             payload: message_payload,
-            ws_timestamp: new Date()
+            ws_timestamp: new Date(),
           },
         });
 
@@ -248,13 +278,22 @@ const web_socket_server = new Elysia({
           const peer_conn = socket_connections.get(peer_id);
           if (peer_conn && peer_conn.ws.readyState === 1) {
             try {
-              ws.send({
-                type: "connection:status",
-                payload: { sender_id: peer_id, status: "online" } as ConnectionStatusPayload,
-                ws_timestamp: snapshot_at,
-              }, true);
+              ws.send(
+                {
+                  type: "connection:status",
+                  payload: {
+                    sender_id: peer_id,
+                    status: "online",
+                  } as ConnectionStatusPayload,
+                  ws_timestamp: snapshot_at,
+                },
+                true,
+              );
             } catch (err) {
-              console.error(`[WS] presence snapshot send failed for peer ${peer_id}:`, err);
+              console.error(
+                `[WS] presence snapshot send failed for peer ${peer_id}:`,
+                err,
+              );
             }
           }
         }
@@ -267,25 +306,27 @@ const web_socket_server = new Elysia({
         // Sync missed messages to the user (this also marks them as delivered)
         // This is critical for users who temporarily lost connection
         // await sync_missed_messages(user_id);
-
       } catch (error) {
         const request = ws.data.request;
-        const client_ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim()
-          || request.headers.get('x-real-ip')
-          || 'unknown';
-        logConnectionError('ws_open', undefined, client_ip, error);
+        const client_ip =
+          request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+          request.headers.get("x-real-ip") ||
+          "unknown";
+        logConnectionError("ws_open", undefined, client_ip, error);
         ws.close(4000, "Connection error");
       }
     },
 
     message: async (ws, message) => {
-
       // heavy lifting is done in the handler
-      await socket_message_handler({
-        user_id: get_ws_data(ws, "user_id") as string,
-        user_name: get_ws_data(ws, "user_name") as string,
-        // user_pfp: get_ws_data(ws, "user_pfp") as string,
-      }, message as WSMessage);
+      await socket_message_handler(
+        {
+          user_id: get_ws_data(ws, "user_id") as string,
+          user_name: get_ws_data(ws, "user_name") as string,
+          // user_pfp: get_ws_data(ws, "user_pfp") as string,
+        },
+        message as WSMessage,
+      );
     },
     // idleTimeout: 60, // x seconds of inactivity before closing the connection
     // sendPings: true,
@@ -308,14 +349,16 @@ const web_socket_server = new Elysia({
         // here: a debounce would stack on top of itself and delay the peer's
         // "Reconnecting" by 8s+. The 30s rejoin window is the only timer that
         // governs a mid-call drop. No-op if the user wasn't in a connected call.
-        await handle_user_disconnected_midcall(user_id);
+        // await handle_user_disconnected_midcall(user_id);
 
         // PRESENCE (non-call) — keep the reconnect-grace debounce so a brief WS
         // restart doesn't flap the user's online/offline status to peers.
         setTimeout(async () => {
           // If user has reconnected, a new entry will be in socket_connections
           if (socket_connections.has(user_id)) {
-            console.log(`[CONNECTION-DISCONNECT] User ${user_id} reconnected within ${OFFLINE_STATUS_BROADCAST_DELAY_MS}, skipping offline broadcast`);
+            console.log(
+              `[CONNECTION-DISCONNECT] User ${user_id} reconnected within ${OFFLINE_STATUS_BROADCAST_DELAY_MS}, skipping offline broadcast`,
+            );
             return;
           }
 
@@ -323,7 +366,7 @@ const web_socket_server = new Elysia({
           const connected_users = await get_user_peers(user_id);
           const message_payload: ConnectionStatusPayload = {
             sender_id: user_id,
-            status: 'offline',
+            status: "offline",
           };
           // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
           await broadcast_message({
@@ -332,9 +375,9 @@ const web_socket_server = new Elysia({
             message: {
               type: "connection:status",
               payload: message_payload,
-              ws_timestamp: new Date()
+              ws_timestamp: new Date(),
             },
-            exclude_user_ids: [user_id]
+            exclude_user_ids: [user_id],
           });
 
           // update the online status of user in the DB
@@ -347,11 +390,13 @@ const web_socket_server = new Elysia({
           // })}`);
         }, OFFLINE_STATUS_BROADCAST_DELAY_MS);
       }
-    }
+    },
   })
   .listen({ port: SOCKET_PORT || 5002, reusePort: true });
 
-console.log(`🔌 WebSocket server is running at port ${process.env.SOCKET_PORT || 5002}`);
+console.log(
+  `🔌 WebSocket server is running at port ${process.env.SOCKET_PORT || 5002}`,
+);
 
 // =============================================================================
 // Heartbeat Mechanism for Connection Health Monitoring
@@ -368,8 +413,13 @@ function startHeartbeat() {
 
     socket_connections.forEach(async (connection, user_id) => {
       // Check if connection missed too many pings or Check if WebSocket is still open
-      if (connection.missed_pings >= MAX_MISSED_PINGS || connection.ws.readyState !== 1) {
-        console.log(`[WS-HEARTBEAT] User ${user_id} missed ${connection.missed_pings} pings, closing connection`);
+      if (
+        connection.missed_pings >= MAX_MISSED_PINGS ||
+        connection.ws.readyState !== 1
+      ) {
+        console.log(
+          `[WS-HEARTBEAT] User ${user_id} missed ${connection.missed_pings} pings, closing connection`,
+        );
 
         try {
           connection.ws.close(4000, "Connection timeout - no pong response");
@@ -380,7 +430,7 @@ function startHeartbeat() {
           const connected_users = await get_user_peers(user_id);
           const message_payload: ConnectionStatusPayload = {
             sender_id: user_id,
-            status: 'offline',
+            status: "offline",
           };
           await broadcast_message({
             to: "users",
@@ -388,37 +438,50 @@ function startHeartbeat() {
             message: {
               type: "connection:status",
               payload: message_payload,
-              ws_timestamp: new Date()
+              ws_timestamp: new Date(),
             },
             // exclude_user_ids: [user_id]
           });
         } catch (e) {
-          console.error(`[WS-HEARTBEAT] Error notifying about stale connection for user ${user_id}:`, e);
+          console.error(
+            `[WS-HEARTBEAT] Error notifying about stale connection for user ${user_id}:`,
+            e,
+          );
         }
 
         await update_user_details(user_id, { last_seen: new Date() });
-        console.log(`[WS-HEARTBEAT] Cleaned up stale connection for user ${user_id}. Total connections: ${socket_connections.size}`);
+        console.log(
+          `[WS-HEARTBEAT] Cleaned up stale connection for user ${user_id}. Total connections: ${socket_connections.size}`,
+        );
 
         return;
       }
 
       // Send ping to client
       try {
-        connection.ws.send({
-          type: 'socket:ping',
-          ws_timestamp: now.toISOString()
-        }, true);
+        connection.ws.send(
+          {
+            type: "socket:ping",
+            ws_timestamp: now.toISOString(),
+          },
+          true,
+        );
         // connection.last_ping_sent = now;
         connection.missed_pings++;
         // console.log(`[WS-HEARTBEAT] Sent ping to user ${user_id}, missed_pings: ${connection.missed_pings}`);
       } catch (error) {
-        console.error(`[WS-HEARTBEAT] Error sending ping to user ${user_id}:`, error);
+        console.error(
+          `[WS-HEARTBEAT] Error sending ping to user ${user_id}:`,
+          error,
+        );
         // connection.connection_status = "stale";
       }
     });
   }, HEARTBEAT_INTERVAL_MS);
 
-  console.log(`[WS-HEARTBEAT] Started heartbeat interval (${HEARTBEAT_INTERVAL_MS}ms)`);
+  console.log(
+    `[WS-HEARTBEAT] Started heartbeat interval (${HEARTBEAT_INTERVAL_MS}ms)`,
+  );
 }
 
 // Stop the heartbeat mechanism
@@ -426,7 +489,7 @@ function stopHeartbeat() {
   if (heartbeatInterval) {
     clearInterval(heartbeatInterval);
     heartbeatInterval = null;
-    console.log('[WS-HEARTBEAT] Stopped heartbeat interval');
+    console.log("[WS-HEARTBEAT] Stopped heartbeat interval");
   }
 }
 
@@ -449,7 +512,7 @@ function logConnectionError(
   user_id: string | undefined,
   client_ip: string | undefined,
   error: any,
-  additional_info?: Record<string, any>
+  additional_info?: Record<string, any>,
 ) {
   const errorLog = {
     timestamp: new Date().toISOString(),
@@ -474,14 +537,16 @@ function startStatsLogging() {
   }
 
   statsInterval = setInterval(() => {
-    console.log(`[CONNECTION-STATS] ${JSON.stringify({
-      timestamp: new Date().toISOString(),
-      total_ws_cnx: socket_connections.size,
-      total_polling_cnx: polling_connections.size,
-    })}`);
+    console.log(
+      `[CONNECTION-STATS] ${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        total_ws_cnx: socket_connections.size,
+        total_polling_cnx: polling_connections.size,
+      })}`,
+    );
   }, STATS_LOGGING_INTERVAL_MS);
 
-  console.log('[CONNECTION-STATS] Started periodic stats logging');
+  console.log("[CONNECTION-STATS] Started periodic stats logging");
 }
 
 function stopStatsLogging() {
@@ -490,7 +555,6 @@ function stopStatsLogging() {
     statsInterval = null;
   }
 }
-
 
 // =============================================================================
 // Starting services and graceful shutdown
@@ -505,12 +569,12 @@ startStatsLogging();
 start_cleanup_cron();
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
+process.on("SIGTERM", () => {
   stopHeartbeat();
   stopStatsLogging();
   stop_cleanup_cron();
 });
-process.on('SIGINT', () => {
+process.on("SIGINT", () => {
   stopHeartbeat();
   stopStatsLogging();
   stop_cleanup_cron();
@@ -522,5 +586,5 @@ export {
   polling_connections,
   startHeartbeat,
   stopHeartbeat,
-  handlePongResponse
+  handlePongResponse,
 };
