@@ -4,7 +4,8 @@ import { user_model } from "@/models/user.model";
 import { create_signup_request, get_signup_request_status, handle_login, handle_login_device, handle_login_pin, handle_refresh_token, handle_refresh_token_mobile, validate_refresh_token } from "@/services/auth.service";
 import { revoke_user_sessions } from "@/services/session.service";
 import { generate_otp, verify_otp } from "@/services/otp.services";
-import { get_phone_pin_status } from "@/services/pin.service";
+import { OTP_CHANNELS } from "@/services/otp-providers";
+import { get_phone_pin_status, reset_password_pin } from "@/services/pin.service";
 import { raise_pin_reset_request } from "@/services/pin-reset.service";
 import { create_user, find_user_by_phone } from "@/services/user.services";
 import { to_e164 } from "@/utils/general.utils";
@@ -56,8 +57,18 @@ function getCookieConfig(userAgent?: string) {
   };
 }
 
+// Which transport carries the code. WhatsApp is the default everywhere; SMS is
+// offered for Indian numbers only and is REJECTED server-side for anything else
+// (see is_channel_allowed) — the client hiding the option is a convenience, not
+// the enforcement.
+const ChannelSchema = t.Optional(
+  t.Object({
+    channel: t.Optional(t.Union(OTP_CHANNELS.map((c) => t.Literal(c)))),
+  })
+);
+
 const auth_routes = new Elysia({ prefix: "/auth" })
-  .post("/generate-signup-otp/:phone", async ({ set, params }) => {
+  .post("/generate-signup-otp/:phone", async ({ set, params, body }) => {
     const existing_user_res = await find_user_by_phone(to_e164(params.phone));
     if (existing_user_res.success) {
       set.status = 409;
@@ -68,7 +79,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       };
     }
 
-    const otp_res = await generate_otp(params.phone);
+    const otp_res = await generate_otp(params.phone, "signup", body?.channel ?? "whatsapp");
 
     set.status = otp_res.code;
     return otp_res;
@@ -77,17 +88,18 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       params: t.Object({
         phone: t.String(),
       }),
+      body: ChannelSchema,
     }
   )
 
-  .post("/generate-login-otp/:phone", async ({ set, params }) => {
+  .post("/generate-login-otp/:phone", async ({ set, params, body }) => {
     const existing_user_res = await find_user_by_phone(to_e164(params.phone));
     if (!existing_user_res?.success) {
       set.status = existing_user_res?.code;
       return existing_user_res;
     }
 
-    const otp_res = await generate_otp(params.phone);
+    const otp_res = await generate_otp(params.phone, "login", body?.channel ?? "whatsapp");
 
     set.status = otp_res.code;
     return otp_res;
@@ -96,6 +108,36 @@ const auth_routes = new Elysia({ prefix: "/auth" })
       params: t.Object({
         phone: t.String(),
       }),
+      body: ChannelSchema,
+    }
+  )
+
+  // Forgot-PIN, step 1: send a code scoped to `pin_reset`. The scoping is the
+  // point — this code CANNOT be replayed against verify-login-otp to obtain a
+  // session, so a reset flow can never be turned into a login bypass.
+  //
+  // Mirrors generate-login-otp's 404-on-unknown-number. That is an existence
+  // oracle, but an identical one already exists on generate-login-otp and
+  // phone-status, and the app reaches this screen only after phone-status has
+  // already answered the same question — closing it here alone would change
+  // nothing.
+  .post("/generate-reset-otp/:phone", async ({ set, params, body }) => {
+    const existing_user_res = await find_user_by_phone(to_e164(params.phone));
+    if (!existing_user_res?.success) {
+      set.status = existing_user_res?.code ?? 404;
+      return existing_user_res;
+    }
+
+    const otp_res = await generate_otp(params.phone, "pin_reset", body?.channel ?? "whatsapp");
+
+    set.status = otp_res.code;
+    return otp_res;
+  },
+    {
+      params: t.Object({
+        phone: t.String(),
+      }),
+      body: ChannelSchema,
     }
   )
 
@@ -118,7 +160,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
   .post("/verify-signup-otp", async ({ body, set, cookie, headers }) => {
     const { phone, name, password, role, otp } = body;
 
-    const otpResponse = await verify_otp(otp, phone);
+    const otpResponse = await verify_otp(otp, phone, "signup");
     if (otpResponse.success == false) {
       set.status = otpResponse.code;
       return otpResponse;
@@ -205,7 +247,7 @@ const auth_routes = new Elysia({ prefix: "/auth" })
 
     // For testing purposes, allow OTP bypass for specific test numbers
     if (!body.phone.startsWith("+91100100100")) {
-      const otpResponse = await verify_otp(body.otp, body.phone);
+      const otpResponse = await verify_otp(body.otp, body.phone, "login");
 
       if (!otpResponse.success) {
         set.status = otpResponse.code;
@@ -301,9 +343,27 @@ const auth_routes = new Elysia({ prefix: "/auth" })
     }
   )
 
-  // Forgot-PIN is admin-fulfilled ONLY — the OTP self-service reset was removed
-  // (see /auth/request-pin-reset below + /admin/user/set-password-pin). Users can no
-  // longer reset their own login PIN without an admin.
+  // Forgot-PIN, step 2 (unauthenticated): spend the `pin_reset` code and set a new
+  // login PIN. This is the PRIMARY recovery path — /auth/request-pin-reset below
+  // stays as the fallback for a user who can no longer receive a code on their
+  // registered number (lost SIM, no WhatsApp), and for admin-created accounts.
+  //
+  // Deliberately returns NO session: a successful reset means "log in with your new
+  // PIN", not "you are logged in". Keeps the reset flow entirely outside the token
+  // mint, so it cannot become a login bypass.
+  .post("/reset-pin", async ({ body, set }) => {
+    const res = await reset_password_pin(body.phone, body.otp, body.new_pin);
+    set.status = res.code;
+    return res;
+  },
+    {
+      body: t.Object({
+        phone: t.String(),
+        otp: t.Number(),
+        new_pin: t.String({ pattern: "^\\d{4}$" }),
+      }),
+    }
+  )
 
   // Forgot-PIN (unauthenticated, from the login screen): raise a request for an
   // admin to reset this phone's login PIN. Returns a GENERIC success regardless of

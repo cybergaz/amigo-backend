@@ -323,6 +323,7 @@ const broadcast_user_update = async (args: {
   profile_pic?: string | null;
   previous_profile_pic?: string | null;
   role?: string;
+  phone?: string;
   include_self?: boolean;
 }) => {
   const conv_ids = Array.from(await get_user_conversations(args.user_id));
@@ -347,6 +348,7 @@ const broadcast_user_update = async (args: {
     profile_pic: args.profile_pic,
     previous_profile_pic: args.previous_profile_pic ?? null,
     role: args.role,
+    phone: args.phone,
     updated_at: new Date(),
   };
 
@@ -1285,82 +1287,147 @@ const admin_set_user_admin_pin = async (user_id: string, pin: string) => {
   }
 };
 
-const admin_update_user_phone_number = async (user_id: string, new_phone: string) => {
-  // const parsed_new_phone = parse_phone(new_phone)
+// ─── Phone-number change ────────────────────────────────────────────────────
+// `users.phone` is a LOGIN HANDLE, not an identity key: nothing else in the
+// schema references it (chats, chat_members, messages, auth_devices,
+// pin_reset_requests, calls and FCM tokens all key on users.id), and the device
+// JWT carries only { id, role, device_id, token_version }. A number change is
+// therefore a single column write — no session invalidation, no forced
+// re-login, no data migration.
+//
+// This is the shared core. The ONLY difference between the self-serve flow and
+// the admin panel is WHO proved ownership of the new number, and that is
+// settled by the caller before it gets here.
+const apply_phone_change = async (user_id: string, new_phone: string) => {
+  // Canonicalise FIRST. Storing anything other than E.164 quietly bricks the
+  // account: login resolves through find_user_by_phone(to_e164(...)) and
+  // contact matching compares against the canonical form, so a stray space or a
+  // doubled country code ("+9191…") yields a user who can neither log in nor be
+  // discovered by their contacts.
+  const parsed = parse_phone(new_phone);
+  if (!parsed.country || !parsed.valid) {
+    return {
+      success: false,
+      code: 400,
+      message:
+        "Invalid phone number. Please enter your number without the country code in the number field.",
+      data: null,
+    };
+  }
+
+  const canonical_phone = parsed.e164;
+
   try {
-    const [existingUser] = await db
-      .select()
+    const [existing] = await db
+      .select({ id: user_model.id, phone: user_model.phone })
       .from(user_model)
       .where(eq(user_model.id, user_id))
       .limit(1);
 
-    if (!existingUser || existingUser.phone === null) {
+    if (!existing) {
+      return { success: false, code: 404, message: "User not found", data: null };
+    }
+
+    // No-op. Report success (a retried request, or an admin re-saving the same
+    // value, is not a failure) but skip the peer fanout.
+    if (existing.phone === canonical_phone) {
       return {
-        success: false,
-        code: 404,
-        message: "Either user or phone number for user not found",
-        data: null,
+        success: true,
+        code: 200,
+        message: "Phone number is already set to this value",
+        data: { id: existing.id, phone: canonical_phone },
       };
     }
 
+    const previous_phone = existing.phone;
 
-    // Check if new phone number already exists for another user
-    const phoneExists = await db
-      .select()
-      .from(user_model)
-      .where(
-        and(
-          eq(user_model.phone, new_phone.replace(" ", "")),
-          ne(user_model.id, user_id),
-        ),
-      )
-      .limit(1);
-
-    if (phoneExists.length > 0) {
-      return {
-        success: false,
-        code: 409,
-        message: "Phone number already in use by another user",
-        data: null,
-      };
+    // Deliberately NO select-then-update pre-check: it races — two accounts can
+    // both pass it for the same free number and the second write still fails.
+    // idx_users_phone is the authority; translate its violation instead.
+    let updated_user;
+    try {
+      const rows = await db
+        .update(user_model)
+        .set({ phone: canonical_phone })
+        .where(eq(user_model.id, user_id))
+        .returning({
+          id: user_model.id,
+          name: user_model.name,
+          phone: user_model.phone,
+          email: user_model.email,
+          role: user_model.role,
+          profile_pic: user_model.profile_pic,
+          created_at: user_model.created_at,
+          last_seen: user_model.last_seen,
+          call_access: user_model.call_access,
+          location: user_model.location,
+          ip_address: user_model.ip_address,
+        });
+      updated_user = rows[0];
+    } catch (err) {
+      // drizzle/postgres-js wraps the driver error, so the SQLSTATE lives on
+      // `.cause` — checking only `.code` would let a unique violation fall
+      // through as a 500. Both are read, matching store_message_with_retry.
+      const pg_code = (err as any)?.cause?.code ?? (err as any)?.code;
+      if (pg_code === "23505") {
+        return {
+          success: false,
+          code: 409,
+          message: "That phone number is already in use by another account.",
+          data: null,
+        };
+      }
+      throw err;
     }
 
-    // Update user's phone number
-    const updatedUser = await db
-      .update(user_model)
-      .set({ phone: new_phone.replace(" ", "") })
-      .where(eq(user_model.id, user_id))
-      .returning({
-        id: user_model.id,
-        name: user_model.name,
-        phone: user_model.phone,
-        email: user_model.email,
-        role: user_model.role,
-        profile_pic: user_model.profile_pic,
-        created_at: user_model.created_at,
-        last_seen: user_model.last_seen,
-        call_access: user_model.call_access,
-        location: user_model.location,
-        ip_address: user_model.ip_address,
-      });
+    // PIN lockout counters are keyed by NUMBER, not by user. Clear both sides so
+    // the user neither carries a lockout onto a number they no longer own nor
+    // INHERITS one that the new number accumulated before they claimed it —
+    // inheriting would lock them out of their own PIN login.
+    await Promise.all([
+      previous_phone ? clear_pin_attempts(previous_phone) : Promise.resolve(),
+      clear_pin_attempts(canonical_phone),
+    ]).catch((err) => console.error("[PHONE-CHANGE] lockout clear failed:", err));
+
+    // Peers cache the number locally and the chat-list sync only INSERTS users
+    // it has never seen, so without this fanout an existing peer's copy stays
+    // stale forever. include_self so the owner's own device applies it too —
+    // that is the only signal an ADMIN-driven change gives them.
+    broadcast_user_update({
+      user_id,
+      phone: canonical_phone,
+      include_self: true,
+    }).catch((err) => console.error("[PHONE-CHANGE] broadcast failed:", err));
 
     return {
       success: true,
       code: 200,
-      message: "User phone number updated successfully",
-      data: updatedUser[0],
+      message: "Phone number updated successfully",
+      data: updated_user,
     };
-  }
-  catch (error) {
+  } catch (error) {
     console.error("Error changing user phone number:", error);
     return {
       success: false,
       code: 500,
-      message: "Failed to change user phone number",
+      message: "Failed to change phone number",
       data: null,
     };
   }
 };
+
+// Self-serve change (POST /user/confirm-phone-change). Ownership of the NEW
+// number is proved by an OTP delivered to it, and possession of the account by
+// the PASSWORD PIN — both verified in the route before this is reached.
+const change_own_phone_number = async (user_id: string, new_phone: string) =>
+  apply_phone_change(user_id, new_phone);
+
+// Admin panel (POST /admin/user/update-phone-number). No OTP: the operator is
+// the trusted party. Previously wrote `new_phone.replace(" ", "")`, which
+// replaces only the FIRST space and never canonicalises — the resulting
+// non-E.164 rows could not log in or be matched by contacts.
+const admin_update_user_phone_number = async (user_id: string, new_phone: string) =>
+  apply_phone_change(user_id, new_phone);
 
 export {
   create_user,
@@ -1384,6 +1451,7 @@ export {
   get_user_permissions,
   delete_user_permanently,
   admin_update_user_phone_number,
+  change_own_phone_number,
   admin_create_user,
   admin_set_user_password_pin,
   admin_set_user_admin_pin,

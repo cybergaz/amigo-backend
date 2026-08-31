@@ -1,8 +1,13 @@
 // ─── PIN management (set / update / reset / status) ─────────────────────────
-// Authenticated set/update (Settings + the enforcement create-PINs screen) and the
+// Authenticated set/update (Settings + the app-lock admin-PIN setup) and the
 // unauthenticated OTP-gated reset for a forgotten login PIN. Login verification lives
 // in auth.service.ts (handle_login_pin). All hashing goes through hash_pin/compare_pin
 // (HMAC pepper + bcrypt) — plaintext PINs never touch the DB.
+//
+// There are THREE ways to authorize writing a PIN, in order of precedence:
+//   1. a fresh OTP for this account's phone   → proves possession of the number
+//   2. the current PASSWORD PIN               → proves knowledge of the credential
+//   3. nothing, when the target PIN is unset  → the authed session is enough
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
 import { eq } from "drizzle-orm";
@@ -20,7 +25,8 @@ const set_user_pin = async (
   user_id: string,
   kind: PinKind,
   pin: string,
-  current_pin?: string
+  current_pin?: string,
+  otp?: number
 ) => {
   try {
     if (!is_valid_pin(pin)) {
@@ -29,6 +35,7 @@ const set_user_pin = async (
 
     const [user] = await db
       .select({
+        phone: user_model.phone,
         password_pin_hash: user_model.password_pin_hash,
         admin_pin_hash: user_model.admin_pin_hash,
         must_reset_pin: user_model.must_reset_pin,
@@ -50,6 +57,38 @@ const set_user_pin = async (
     // Treated like a first-time set. Clearing the flag happens in the update below.
     const forced_password_reset = kind === "password" && user.must_reset_pin === true;
 
+    // The two PINs must be different — checked BEFORE any authorization runs, so a
+    // rejected PIN never burns the user's OTP (verify_otp consumes it) and they
+    // don't have to request a fresh code just to fix a bad choice. Safe to do
+    // pre-auth: the caller is already authenticated as this user, and /user/verify-pin
+    // already tells them which of their own PINs a candidate matches.
+    if (other_hash && (await compare_pin(pin, other_hash))) {
+      return {
+        success: false,
+        code: 409,
+        message: "Your two PINs must be different",
+        data: null,
+      };
+    }
+
+    // OTP authorization — the app-lock "turn on App Lock" flow. The user proves
+    // possession of their registered number instead of knowing an existing PIN,
+    // which is what makes a FORGOTTEN admin PIN recoverable and what lets a
+    // first-time admin PIN be set with a real identity check behind it.
+    // Consumed here (verify_otp deletes it), scoped to `admin_pin` so a login or
+    // pin-reset code can never be spent on this.
+    let otp_authorized = false;
+    if (otp != null) {
+      if (!user.phone) {
+        return { success: false, code: 400, message: "This account has no phone number", data: null };
+      }
+      const otp_res = await verify_otp(otp, user.phone, "admin_pin");
+      if (!otp_res.success) {
+        return { success: false, code: otp_res.code, message: otp_res.message, data: null };
+      }
+      otp_authorized = true;
+    }
+
     // Authorization to CHANGE an already-set PIN. The authorizing credential is
     // ALWAYS the password PIN:
     //   - changing the password PIN → prove the current password PIN
@@ -57,7 +96,7 @@ const set_user_pin = async (
     //     admin PIN), so a FORGOTTEN admin PIN is recoverable by anyone who knows
     //     the password PIN (their login PIN). This is the forgot-admin-PIN path.
     // A first-time set (target_hash null) needs no proof — the authed session suffices.
-    if (target_hash && !forced_password_reset) {
+    if (target_hash && !forced_password_reset && !otp_authorized) {
       const auth_hash = user.password_pin_hash;
       if (!auth_hash) {
         return { success: false, code: 400, message: "Set your password PIN first", data: null };
@@ -81,16 +120,6 @@ const set_user_pin = async (
           data: null,
         };
       }
-    }
-
-    // The two PINs must be different.
-    if (other_hash && (await compare_pin(pin, other_hash))) {
-      return {
-        success: false,
-        code: 409,
-        message: "Your two PINs must be different",
-        data: null,
-      };
     }
 
     const new_hash = await hash_pin(pin);
@@ -124,15 +153,18 @@ const set_user_pin = async (
   }
 };
 
-// Forgot-PIN: OTP proves ownership of the phone, then the login (password) PIN is
-// reset. Rides the EXISTING OTP path unchanged (out of scope to harden OTP here).
+// Forgot-PIN (unauthenticated): an OTP scoped to `pin_reset` proves ownership of
+// the phone, then the login (password) PIN is replaced. This is the self-service
+// path; /auth/request-pin-reset (admin-fulfilled) remains as the fallback for
+// anyone who can no longer receive a code on their registered number.
 const reset_password_pin = async (phone: string, otp: number, new_pin: string) => {
   try {
     if (!is_valid_pin(new_pin)) {
       return { success: false, code: 400, message: "PIN must be exactly 4 digits" };
     }
 
-    const otp_res = await verify_otp(otp, phone);
+    // Scoped to `pin_reset` — a login code must not be spendable as a PIN reset.
+    const otp_res = await verify_otp(otp, phone, "pin_reset");
     if (!otp_res.success) {
       return otp_res;
     }
@@ -157,9 +189,12 @@ const reset_password_pin = async (phone: string, otp: number, new_pin: string) =
     }
 
     const new_hash = await hash_pin(new_pin);
+    // Clearing must_reset_pin matters: an admin-created account carries the flag
+    // until the user picks their OWN PIN, and this IS them picking it. Leaving it
+    // set would re-prompt them forever after a self-service reset.
     await db
       .update(user_model)
-      .set({ password_pin_hash: new_hash })
+      .set({ password_pin_hash: new_hash, must_reset_pin: false })
       .where(eq(user_model.id, user.id));
 
     // A successful reset clears any brute-force lock on the phone.

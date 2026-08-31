@@ -261,6 +261,11 @@ type UserUpdatePayload = {
   // App-level role: "user" | "admin" | "sub_admin" | "staff". Included only
   // on role-change broadcasts; absent on regular name/pfp updates.
   role?: string;
+  // Canonical E.164 number, included only on phone-change broadcasts. Peers
+  // need it because the chat-list sync only INSERTS users it has never seen
+  // (see chat.provider.dart), so an existing peer's cached phone would
+  // otherwise stay stale forever.
+  phone?: string;
   updated_at: Date;
 };
 
