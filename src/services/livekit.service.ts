@@ -8,8 +8,8 @@ import Redis from "ioredis";
 import { redis } from "@/config/redis";
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
-import { eq, or } from "drizzle-orm";
-import { call_model, livekit_call_model } from "@/models/call.model";
+import { eq } from "drizzle-orm";
+import { livekit_call_model } from "@/models/call.model";
 import {
   setActiveCallsCache,
   setUserCallCache,
@@ -21,7 +21,6 @@ import { CALL_TIMEOUT_MS } from "@/constants/calls.constants";
 import { ResultType } from "@/types/core.types";
 import { livekit } from "@/config/livekit.config";
 import { AccessToken, VideoGrant } from "livekit-server-sdk";
-import { ConvJoinPayloadSchema } from "@/types/socket.elysia-schema";
 
 /**
  * Called when a call rings past {@link CALL_TIMEOUT_MS} without being
@@ -258,7 +257,7 @@ export class LivekitService {
           duration_seconds:
             Math.floor(
               new Date().getTime() -
-              new Date(parsedActiveCall.started_at).getTime(),
+                new Date(parsedActiveCall.started_at).getTime(),
             ) / 1000,
           reason: "timeout",
         },
@@ -440,15 +439,15 @@ export class LivekitService {
 
       const duration_seconds = was_answered
         ? Math.max(
-          0,
-          Math.floor(
-            (ended_at.getTime() -
-              new Date(
-                parsed_call.answered_at ?? parsed_call.started_at,
-              ).getTime()) /
-            1000,
-          ),
-        )
+            0,
+            Math.floor(
+              (ended_at.getTime() -
+                new Date(
+                  parsed_call.answered_at ?? parsed_call.started_at,
+                ).getTime()) /
+                1000,
+            ),
+          )
         : 0;
 
       // Don't rewrite a call that already has a terminal state — the first
@@ -674,7 +673,6 @@ export class LivekitService {
         message: "Calls fetched successfully from cache",
         data: activeCalls,
       };
-
     } catch (error) {
       console.error("[CALL] Error fetching active calls:", error);
       return {
@@ -726,12 +724,9 @@ export class LivekitService {
     }
   }
 
-
   // -----------------------------------LIVEKIT SDK SERVICES--------------------------------
   // 1. Create a livekit room:
-  static async create_livekit_room(
-    room_id: string,
-  ): Promise<ResultType> {
+  static async create_livekit_room(room_id: string): Promise<ResultType> {
     try {
       const room = await livekit.room.createRoom({
         name: room_id,

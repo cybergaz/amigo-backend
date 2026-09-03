@@ -124,7 +124,7 @@ const livekit_routes = new Elysia({
       // check says "offline" and the whole broadcast used to be skipped. Since
       // `call:accept` is not a vital event it was never queued for replay
       // either, so the token was simply lost and the callee sat on
-      // "Configuring call" until the join watchdog gave up.
+      // "Connecting Call" until the join watchdog gave up.
       // `broadcast_message` already no-ops safely for a user with no live
       // socket, and the FCM push below is the real fallback.
       await broadcast_message({
