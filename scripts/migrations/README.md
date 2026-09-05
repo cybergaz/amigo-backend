@@ -31,22 +31,22 @@ after a `git pull`. `DB_URL` in that box's `.env` decides the target, and the ru
 prints it before doing anything.
 
 ```bash
-bun run migrate status         # what this DB has run, and what it still owes
-bun run migrate up             # run everything pending, oldest first
-bun run migrate up otp-hard    # run one (partial name is fine)
+bun run script:migrate status         # what this DB has run, and what it still owes
+bun run script:migrate up             # run everything pending, oldest first
+bun run script:migrate up otp-hard    # run one (partial name is fine)
 ```
 
 Typical cycle:
 
 ```
-laptop           bun run migrate status   →  1 pending
-                 bun run migrate up       →  applied on dev
-                 git add . && git commit && git push
+laptop     bun run script:migrate status   →  1 pending
+           bun run script:migrate up       →  applied on dev
+           git add . && git commit && git push
 
-prod box         git pull
-                 bun run migrate status   →  1 pending   ← same commit, different answer
-                 bun run migrate up       →  applied on prod
-                 bun run migrate status   →  nothing to do
+prod box   git pull
+           bun run script:migrate status   →  1 pending   ← same commit, different answer
+           bun run script:migrate up       →  applied on prod
+           bun run script:migrate status   →  nothing to do
 ```
 
 `up` against a non-local `DB_URL` makes you type the database name first. `--yes`
@@ -55,10 +55,10 @@ skips that for scripted deploys.
 ## Escape hatches
 
 ```bash
-bun run migrate mark <name>      # record as applied WITHOUT running it
-bun run migrate mark --all       # baseline: everything on disk is already applied here
-bun run migrate unmark <name>    # drop from the ledger → shows PENDING again
-bun run migrate up <name> --force  # run it again even though it's applied
+bun run script:migrate mark <name>      # record as applied WITHOUT running it
+bun run script:migrate mark --all       # baseline: everything on disk is already applied here
+bun run script:migrate unmark <name>    # drop from the ledger → shows PENDING again
+bun run script:migrate up <name> --force  # run it again even though it's applied
 ```
 
 `mark` is how you tell a database about work that predates the ledger, or that you
@@ -70,12 +70,12 @@ A DB with no `script_migrations` table reports **everything** as pending, which 
 lie for any environment that has been running for a while. Tell it the truth once,
 before you ever run `up` there:
 
-- Everything on disk has already been applied here → `bun run migrate mark --all`
-- Only some of it → `bun run migrate mark <name>` per applied script, then `up` the rest
+- Everything on disk has already been applied here → `bun run script:migrate mark --all`
+- Only some of it → `bun run script:migrate mark <name>` per applied script, then `up` the rest
 
-Both dev and prod were baselined this way on 2026-08-31 (all 10 scripts already applied
-in both). Any *new* environment — a fresh staging DB, say — starts empty and correctly
-wants a plain `up`.
+Both dev (2026-08-31) and prod (2026-09-05) were baselined this way — all 10 scripts
+had already been applied in both. Any *new* environment — a fresh staging DB, say —
+starts empty and correctly wants a plain `up`.
 
 ## Writing a new one
 
