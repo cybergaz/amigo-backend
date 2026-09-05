@@ -39,7 +39,7 @@ const user_model = pgTable("users", {
   // An FCM token identifies a DEVICE, so at most ONE user may own it — a second
   // owner means every push for that device is delivered to both accounts (the
   // cross-account notification leak). store_fcm_token() steals the token from
-  // any previous owner, and scripts/apply-fcm-token-unique.ts dedupes history;
+  // any previous owner, and scripts/migrations/20260825-fcm-token-unique.ts dedupes history;
   // this index is the last-resort backstop that makes a double-owner
   // IMPOSSIBLE rather than merely unlikely.
   // Declared here (not only in the script) so drizzle-kit doesn't read the

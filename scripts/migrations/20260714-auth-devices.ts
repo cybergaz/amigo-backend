@@ -5,9 +5,13 @@
 // The SQL is idempotent (CREATE TABLE/INDEX IF NOT EXISTS + guarded FK), so this
 // is safe to re-run. bun auto-loads .env, so DB_URL is available.
 //
-//   bun run scripts/apply-auth-devices.ts
+//   bun run scripts/migrate.ts up 20260714-auth-devices
 import postgres from "postgres";
 import { readFileSync } from "node:fs";
+import { skipIfApplied, recordApplied } from "../lib/migration";
+
+// Already run against this environment's DB? Nothing to do. (--force overrides.)
+await skipIfApplied(import.meta.path);
 
 const url = process.env.DB_URL;
 if (!url) throw new Error("DB_URL is not set — check your .env");
@@ -23,3 +27,9 @@ try {
 } finally {
   await sql.end();
 }
+
+// Record the run in THIS database's `script_migrations` ledger — the only place
+// applied-vs-pending lives. Nothing on disk moves; `bun run scripts/migrate.ts
+// status` on any box answers what that box still owes.
+if (process.exitCode !== 1) await recordApplied(import.meta.path);
+process.exit(process.exitCode === 1 ? 1 : 0);

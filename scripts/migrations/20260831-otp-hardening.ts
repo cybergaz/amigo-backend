@@ -23,18 +23,15 @@
  *
  * Idempotent — ADD COLUMN IF NOT EXISTS throughout, safe to re-run.
  *
- * Two-stage archive: on a successful run the script moves itself one stage along
- * scripts/ → scripts/applied-dev/ → scripts/applied-archive/, so after the dev run
- * it stays runnable for prod:
- *
- *   dev:   bun run scripts/apply-otp-hardening.ts
- *   prod:  bun run scripts/applied-dev/apply-otp-hardening.ts
  */
 
 import db from "@/config/db";
 import { sql } from "drizzle-orm";
-import { mkdirSync, renameSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+
+import { skipIfApplied, recordApplied } from "../lib/migration";
+
+// Already run against this environment's DB? Nothing to do. (--force overrides.)
+await skipIfApplied(import.meta.path);
 
 const as_rows = (res: unknown): any[] =>
   Array.isArray(res) ? res : ((res as { rows?: any[] })?.rows ?? []);
@@ -95,23 +92,8 @@ const succeeded = await main().catch((err) => {
   return false;
 });
 
-// Self-archive one stage along on success. The stage is inferred from where this
-// file lives, so the same script runs unchanged on dev and prod:
-//   scripts/             → applied-dev/      (dev run done, prod pending)
-//   scripts/applied-dev/ → applied-archive/  (prod run done, fully applied)
-if (succeeded) {
-  try {
-    const self = import.meta.path;
-    const dir = dirname(self);
-    const target = basename(dir) === "applied-dev"
-      ? join(dir, "..", "applied-archive", basename(self))
-      : join(dir, "applied-dev", basename(self));
-    mkdirSync(dirname(target), { recursive: true });
-    renameSync(self, target);
-    console.log(`📦 Archived to ${target}`);
-  } catch (e) {
-    console.warn("⚠️ Could not self-archive (harmless):", e);
-  }
-}
-
+// Record the run in THIS database's `script_migrations` ledger — the only place
+// applied-vs-pending lives. Nothing on disk moves; `bun run scripts/migrate.ts
+// status` on any box answers what that box still owes.
+if (succeeded) await recordApplied(import.meta.path);
 process.exit(succeeded ? 0 : 1);

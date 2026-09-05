@@ -31,19 +31,16 @@
  * index only ever rejects a write the old code should not have been making,
  * and store_fcm_token already swallows/logs DB write errors).
  *
- * Two-stage archive: on a successful run the script moves itself one stage
- * along scripts/ → scripts/applied-dev/ → scripts/applied-archive/, so after
- * the dev run it stays runnable for prod:
- *
- *   dev:   bun run scripts/apply-fcm-token-unique.ts
- *   prod:  bun run scripts/applied-dev/apply-fcm-token-unique.ts
  */
 
 import db from "@/config/db";
 import { remove_fcm_token } from "@/cache-management/fcm-token.cache";
 import { sql } from "drizzle-orm";
-import { mkdirSync, renameSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+
+import { skipIfApplied, recordApplied } from "../lib/migration";
+
+// Already run against this environment's DB? Nothing to do. (--force overrides.)
+await skipIfApplied(import.meta.path);
 
 // drizzle's db.execute returns the postgres.js RowList (array) for SELECT/RETURNING,
 // but normalize defensively in case the driver wraps it in { rows }.
@@ -199,25 +196,8 @@ const succeeded = await main().catch((err) => {
   return false;
 });
 
-// Self-archive one stage along on success. The stage is inferred from where
-// this file lives, so the same script runs unchanged on dev and prod:
-//   scripts/             → applied-dev/      (dev run done, prod pending)
-//   scripts/applied-dev/ → applied-archive/  (prod run done, fully applied)
-if (succeeded) {
-  try {
-    const self = import.meta.path;
-    const dir = dirname(self);
-    const target = basename(dir) === "applied-dev"
-      ? join(dir, "..", "applied-archive", basename(self))
-      : join(dir, "applied-dev", basename(self));
-    mkdirSync(dirname(target), { recursive: true });
-    renameSync(self, target);
-    console.log(`📦 Archived to ${target}`);
-  } catch (e) {
-    console.warn("⚠️ Could not self-archive (harmless):", e);
-  }
-}
-
-// The pg pool and the fcm-cache's Redis subscriber keep the loop alive; every
-// write above is already awaited, so nothing is buffered.
+// Record the run in THIS database's `script_migrations` ledger — the only place
+// applied-vs-pending lives. Nothing on disk moves; `bun run scripts/migrate.ts
+// status` on any box answers what that box still owes.
+if (succeeded) await recordApplied(import.meta.path);
 process.exit(succeeded ? 0 : 1);

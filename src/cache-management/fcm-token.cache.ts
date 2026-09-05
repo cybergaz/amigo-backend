@@ -80,7 +80,7 @@ const publish_fcm_invalidation = async (user_id: string): Promise<void> => {
 // account. Before claiming it we steal it from anybody else still holding it,
 // otherwise two users' rows point at the same device and the previous owner's
 // pushes keep landing on it forever (there is no unique constraint on
-// users.fcm_token to stop that — see scripts/apply-fcm-token-unique.ts).
+// users.fcm_token to stop that — see scripts/migrations/20260825-fcm-token-unique.ts).
 // ============================================================================
 async function store_fcm_token(
   user_id: string,

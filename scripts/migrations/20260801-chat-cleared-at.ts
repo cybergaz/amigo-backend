@@ -11,16 +11,11 @@
 // Idempotent — safe to re-run (ADD COLUMN IF NOT EXISTS).
 // Backward-compatible — the column is nullable with no default, so the running
 // backend is unaffected and this can be applied BEFORE the new build ships.
-//
-// Two-stage archive: on a successful run the script moves itself one stage
-// along scripts/ → scripts/applied-dev/ → scripts/applied-archive/, so after
-// the dev run it stays runnable for prod:
-//
-//   dev:   bun run scripts/apply-chat-cleared-at.ts
-//   prod:  bun run scripts/applied-dev/apply-chat-cleared-at.ts
 import postgres from "postgres";
-import { mkdirSync, renameSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { skipIfApplied, recordApplied } from "../lib/migration";
+
+// Already run against this environment's DB? Nothing to do. (--force overrides.)
+await skipIfApplied(import.meta.path);
 
 const url = process.env.DB_URL;
 if (!url) throw new Error("DB_URL is not set — check your .env");
@@ -48,21 +43,8 @@ try {
   await sql.end();
 }
 
-// Self-archive one stage along on success. The stage is inferred from where
-// this file lives, so the same script runs unchanged on dev and prod:
-//   scripts/             → applied-dev/      (dev run done, prod pending)
-//   scripts/applied-dev/ → applied-archive/  (prod run done, fully applied)
-if (succeeded) {
-  try {
-    const self = import.meta.path;
-    const dir = dirname(self);
-    const target = basename(dir) === "applied-dev"
-      ? join(dir, "..", "applied-archive", basename(self))
-      : join(dir, "applied-dev", basename(self));
-    mkdirSync(dirname(target), { recursive: true });
-    renameSync(self, target);
-    console.log(`📦 Archived to ${target}`);
-  } catch (e) {
-    console.warn("⚠️ Could not self-archive (harmless):", e);
-  }
-}
+// Record the run in THIS database's `script_migrations` ledger — the only place
+// applied-vs-pending lives. Nothing on disk moves; `bun run scripts/migrate.ts
+// status` on any box answers what that box still owes.
+if (succeeded) await recordApplied(import.meta.path);
+process.exit(succeeded ? 0 : 1);
