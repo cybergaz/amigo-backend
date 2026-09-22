@@ -362,7 +362,7 @@ const verify_message_ids = async (
   conversation_id: string,
   sender_id: string
 ): Promise<ResultType<{
-  found: Record<string, { delivered_to: string[]; read_by: string[]; }>;
+  found: Record<string, { delivered_to: string[]; read_by: string[]; sent_at: Date | null; }>;
   not_found: string[];
 }>> => {
   try {
@@ -396,7 +396,7 @@ const verify_message_ids = async (
     }
 
     const rows = await db
-      .select({ id: message_model.id })
+      .select({ id: message_model.id, sent_at: message_model.sent_at })
       .from(message_model)
       .where(
         and(
@@ -410,9 +410,12 @@ const verify_message_ids = async (
     const foundIds = new Set(rows.map((r) => r.id));
     const not_found = message_ids.filter((id) => !foundIds.has(id));
 
-    const found: Record<string, { delivered_to: string[]; read_by: string[]; }> = {};
+    // sent_at = the canonical stored value (store_message may have rewritten
+    // the client's claim — clock clamp, or server-arrival time for uploaded
+    // media). A sender whose message:sent:ack was lost adopts it from here.
+    const found: Record<string, { delivered_to: string[]; read_by: string[]; sent_at: Date | null; }> = {};
     if (rows.length > 0) {
-      for (const r of rows) found[r.id] = { delivered_to: [], read_by: [] };
+      for (const r of rows) found[r.id] = { delivered_to: [], read_by: [], sent_at: r.sent_at };
 
       const statusRows = await db
         .select({

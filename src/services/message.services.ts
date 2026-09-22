@@ -80,6 +80,18 @@ const get_user_info = async (user_id: string) => {
   return user;
 };
 
+// Message types whose payload is a file the client uploads BEFORE emitting
+// message:new (the app's MediaUploadManager). store_message orders these by
+// server arrival — see the sent_at comment there.
+const UPLOADED_MEDIA_TYPES: ReadonlySet<string> = new Set<MessageType>([
+  "image",
+  "video",
+  "audio",
+  "document",
+  "media",
+  "attachment",
+]);
+
 // Result of storing a message. `duplicate` = a row with this exact client id
 // already existed (an idempotent re-send), so the caller must NOT fan it out again.
 interface StoreMessageResultType extends ResultType<DBInsertMessageType> {
@@ -98,10 +110,22 @@ const store_message = async (payload: ChatMessagePayload): Promise<StoreMessageR
     // Server time is the authority for the upper bound: never store a future
     // or unparseable sent_at. Past values are kept — offline-queued messages
     // legitimately carry an older client stamp.
+    //
+    // Uploaded media is the exception: it is stamped with the time the SERVER
+    // received it, not the client's tap-send time. The client stamps sent_at
+    // before the upload, so a slow upload landed at its old tap time — above
+    // every message sent while it uploaded — and recipients never saw it
+    // arrive. Every reader orders by sent_at (history, pagination, read
+    // cursors, last-message pointer), so stamping it here makes all of them
+    // order media by arrival with no query changes. The ack and the fan-out
+    // both carry this stored value, so the sender's bubble moves to the same
+    // place recipients see it.
     const now = new Date();
     const client_sent_at = new Date(payload.sent_at);
     const sent_at_date =
-      Number.isNaN(client_sent_at.getTime()) || client_sent_at > now
+      UPLOADED_MEDIA_TYPES.has(payload.msg_type) ||
+      Number.isNaN(client_sent_at.getTime()) ||
+      client_sent_at > now
         ? now
         : client_sent_at;
     const duration_sec = await resolve_disappearing_after_sec(payload.conv_id);

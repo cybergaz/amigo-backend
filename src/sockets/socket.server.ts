@@ -22,8 +22,7 @@ import {
   stop_cleanup_cron,
 } from "@/cache-management/polling.cache";
 import { get_user_peers } from "@/cache-management/user-peer.cache";
-import { get_auth_device } from "@/services/session.service";
-import { redis } from "@/config/redis";
+import { is_device_token_current } from "@/services/session.service";
 import { AuthError } from "@/constants/auth-codes";
 
 // Connection maps for different transport types
@@ -178,20 +177,9 @@ const web_socket_server = new Elysia({
         const token_version = auth_result.data.token_version;
         if (device_id != null && token_version != null) {
           const uid = auth_result.data.id;
-          let ok = false;
-          const cached = await redis.get(`authver:${uid}:${device_id}`);
-          if (cached != null) {
-            ok = Number(cached) === token_version;
-          } else {
-            const row = await get_auth_device(uid, device_id);
-            if (row) {
-              await redis.set(
-                `authver:${uid}:${device_id}`,
-                String(row.token_version),
-              );
-              ok = row.token_version === token_version;
-            }
-          }
+          // Shared with the HTTP long-polling guard (middleware/enforce_device_token)
+          // so the socket and its fallback transport enforce the SAME rule.
+          const ok = await is_device_token_current(uid, device_id, token_version);
           if (!ok) {
             // Terminal: single-device supersede. Send the labeled frame before the
             // close so a client reading it gets the reason; close(4003) remains the

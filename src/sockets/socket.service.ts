@@ -23,6 +23,7 @@ import { add_members, is_member } from "@/cache-management/conv.cache";
 import {
   set_last_message,
   batch_increment_unread,
+  batch_increment_unread_by,
   reset_unread,
 } from "@/cache-management/chat-meta.cache";
 import db from "@/config/db";
@@ -697,20 +698,33 @@ const handle_message_new = async (
         // sender_name: payload.sender_name ?? "",
       });
 
-      // 2. Increment unread for all chat members except the sender, and except
-      //    users currently active in this conversation (their UI is already
-      //    showing the message; bumping their unread would inflate the badge
-      //    until they re-join). active_conv_id is set in handle_conv_join.
+      // 2. Increment unread for every chat member except the sender.
+      //
+      //    This used to also skip users whose socket carried
+      //    `active_conv_id === conv_id`, on the theory that their UI was
+      //    already showing the message. That pin is set in handle_conv_join
+      //    (:152) and NOTHING in the backend ever cleared it — there is no
+      //    conversation:leave event, handle_connection_status only touches
+      //    is_background, and the client emits nothing on leave. So after a
+      //    user opened a chat once, every later message in it silently skipped
+      //    their increment for the whole life of that socket. Redis stayed at
+      //    the "0" written by reset_unread, get_all_unread's `count > 0` filter
+      //    dropped the field, and the chat list truthfully reported 0 — which
+      //    the client then wrote over its locally-counted badge. That was the
+      //    "open a chat, go back, refresh, receive messages, refresh => badge
+      //    gone" bug, and it explained why a fresh app open was unaffected
+      //    (new socket, no pin yet).
+      //
+      //    Always incrementing is safe: the genuinely-open case is covered
+      //    twice over — the client writes 0 for its active conversation
+      //    (chat.provider _handleNewMessage) and the read-status ack drives
+      //    reset_unread in handle_message_status_ack below, within the
+      //    client's 800ms ack debounce.
       const unread_user_ids = [
         ...sent_result.offline,
         ...sent_result.online,
         ...sent_result.polling,
-      ].filter((id) => {
-        if (id === payload.sender_id) return false;
-        const conn = socket_connections.get(id);
-        if (conn && conn.active_conv_id === payload.conv_id) return false;
-        return true;
-      });
+      ].filter((id) => id !== payload.sender_id);
       if (unread_user_ids.length > 0) {
         batch_increment_unread(unread_user_ids, payload.conv_id);
       }
@@ -957,6 +971,14 @@ const handle_message_forward = async (
         // Get all members of this conversation for batch message status creation
         // const conv_members = await get_conversation_members(conv_id);
 
+        // Presence buckets for this conversation, captured from the FIRST
+        // broadcast only. broadcast_message evicts polling connections as a
+        // side effect (socket.handlers `polling_connections.delete` runs
+        // outside the 10s-freshness branch), so only the first call in a burst
+        // buckets polling recipients correctly — every later one reports them
+        // as offline, which would send them FCM pushes they must not get.
+        let presence: Awaited<ReturnType<typeof broadcast_message>> | null = null;
+
         // loop on all forward message in that target conversation
         for (const msg of all_msgs_for_conv) {
           const new_chat_msg_payload: ChatMessagePayload = {
@@ -972,7 +994,12 @@ const handle_message_forward = async (
           };
 
           // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-          await broadcast_message({
+          // NOTE: exclude_user_ids stays off deliberately. The forwarder's
+          // client performs no optimistic local insert for a forward (it only
+          // sends the frame), and in broadcast_message an excluded user returns
+          // before store_targets.push — excluding the forwarder would make the
+          // forward vanish from their own copy of the chat.
+          const sent_result = await broadcast_message({
             to: "conversation",
             conv_id: conv_id,
             message: {
@@ -982,6 +1009,7 @@ const handle_message_forward = async (
             },
             // exclude_user_ids: [payload.forwarder_id],
           });
+          if (presence === null) presence = sent_result;
 
           // Prepare message status records for all members except sender
           // for (const member_id of conv_members) {
@@ -1026,6 +1054,57 @@ const handle_message_forward = async (
           attachments: last_msg.attachments ?? null,
           // sender_name: payload.sender_name ?? "",
         });
+
+        // ── The two things this path used to skip entirely ────────────────
+        // handle_message_forward only ever inserted rows and broadcast them.
+        // It never touched Redis unread and never queued FCM, so forwarded
+        // messages arrived silently and their badge died on the next chat-list
+        // refresh (the Redis field was never created, so get_all_unread
+        // reported nothing and the list shipped 0).
+        if (presence) {
+          // Bump by N in ONE pipeline — a forward is N messages, not 1. This is
+          // what made the badge rise by only 1 no matter how many were sent.
+          const forwarded_count = all_msgs_for_conv.length;
+          const unread_user_ids = [
+            ...presence.offline,
+            ...presence.online,
+            ...presence.polling,
+          ].filter((id) => id !== payload.forwarder_id);
+          if (unread_user_ids.length > 0) {
+            // fire-and-forget, matching handle_message_new
+            batch_increment_unread_by(unread_user_ids, conv_id, forwarded_count);
+          }
+
+          // FCM for offline + backgrounded recipients. Resolve mutes ONCE per
+          // conversation — get_muted_user_ids hits Redis and may hydrate from
+          // the DB, so it must never sit inside the per-message loop.
+          // The forwarder filter is mandatory here: unlike handle_message_new,
+          // this path does not pass exclude_user_ids, so the forwarder is in
+          // these buckets and would otherwise push a notification to itself.
+          const muted = await get_muted_user_ids(conv_id);
+          for (const msg of all_msgs_for_conv) {
+            const fcm_payload: ChatMessagePayload = {
+              id: msg.id,
+              sender_id: msg.sender_id ?? payload.forwarder_id,
+              conv_id: conv_id,
+              msg_type: msg.type,
+              body: msg.body || undefined,
+              attachments: msg.attachments,
+              sent_at: msg.sent_at ? msg.sent_at : new Date(),
+            };
+            const fcm_ws_message: WSMessage = {
+              type: "message:new",
+              payload: fcm_payload,
+              ws_timestamp: new Date(),
+            };
+            for (const uid of [...presence.offline, ...presence.background]) {
+              if (uid === payload.forwarder_id) continue;
+              queue_message_fcm(uid, fcm_ws_message, {
+                silent: muted.has(uid),
+              });
+            }
+          }
+        }
       }
 
       // Batch insert all message statuses in ONE database call

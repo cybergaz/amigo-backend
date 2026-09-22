@@ -312,6 +312,43 @@ const login_device = async (
   return { token, token_version };
 };
 
+// Is this device token still the CURRENT one for the user? Redis fast-path with a
+// DB fallback that write-throughs the cache (there is no TTL on the key; login_device
+// purges the keys of the devices it evicts). Returns false when the row is gone —
+// an evicted device must fail, not pass.
+//
+// Single source for every transport that has to answer "was this device superseded?":
+// the WS `open` handler and the HTTP long-polling guard both call it, so the two can
+// never drift apart (they did: polling had no check at all, which is what kept a
+// superseded device alive on the fallback transport).
+const is_device_token_current = async (
+  user_id: string,
+  device_id: string,
+  token_version: number,
+): Promise<boolean> => {
+  // A cache blip must degrade to the DB (the authority), never decide the answer:
+  // answering "current" would let a superseded device through, answering "stale"
+  // would log out every device on the platform. Both reads are allowed to throw —
+  // the caller then fails the request (500 / socket error), which is a retry, not
+  // a logout.
+  let cached: string | null = null;
+  try {
+    cached = await redis.get(`authver:${user_id}:${device_id}`);
+  } catch (error) {
+    console.error(`[AUTH] authver cache read failed for ${user_id}:`, error);
+  }
+  if (cached != null) return Number(cached) === token_version;
+
+  const row = await get_auth_device(user_id, device_id);
+  if (!row) return false;
+  try {
+    await redis.set(`authver:${user_id}:${device_id}`, String(row.token_version));
+  } catch (error) {
+    console.error(`[AUTH] authver cache write failed for ${user_id}:`, error);
+  }
+  return row.token_version === token_version;
+};
+
 // Current token_version for a device (WS open falls back to this on a Redis miss).
 const get_auth_device = async (user_id: string, device_id: string) => {
   const [row] = await db
@@ -334,4 +371,5 @@ export {
   validate_session,
   login_device,
   get_auth_device,
+  is_device_token_current,
 };

@@ -261,6 +261,30 @@ const batch_increment_unread = async (user_ids: string[], chat_id: string): Prom
 };
 
 /**
+ * Batch increment unread by an arbitrary amount, in a single pipeline.
+ *
+ * A forward drops N messages into a chat in one shot. Calling
+ * batch_increment_unread N times would issue N pipelines for what is one
+ * logical bump, so the forward path uses this instead.
+ */
+const batch_increment_unread_by = async (
+  user_ids: string[],
+  chat_id: string,
+  by: number,
+): Promise<void> => {
+  if (user_ids.length === 0 || by <= 0) return;
+  try {
+    const pipeline = redis.pipeline();
+    for (const uid of user_ids) {
+      pipeline.hincrby(unread_key(uid), chat_id, by);
+    }
+    await pipeline.exec();
+  } catch (err) {
+    console.error(`[CACHE] batch_increment_unread_by failed for chat ${chat_id}:`, err);
+  }
+};
+
+/**
  * Reset unread count for a user in a specific chat (user opened the chat).
  * Called from handle_join_conversation.
  */
@@ -316,6 +340,7 @@ export {
   set_disappearing_after_sec,
   increment_unread,
   batch_increment_unread,
+  batch_increment_unread_by,
   reset_unread,
   get_unread,
   get_all_unread,

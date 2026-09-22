@@ -1,5 +1,5 @@
 import Elysia, { t } from "elysia";
-import { app_middleware } from "@/middleware";
+import { app_middleware, enforce_device_token } from "@/middleware";
 import { fetch_pending_messages } from "@/cache-management/polling.cache";
 import { socket_message_handler } from "@/sockets/socket.handlers";
 import { ChatMessagePayload, MessageSentAckPayload, WSMessage } from "@/types/socket.types";
@@ -9,11 +9,22 @@ import { polling_connections } from "@/sockets/socket.server";
 export const chat_poll_routes = new Elysia({ prefix: "/chat/poll" })
   .state({ id: "", role: "" })
   .guard({
-    beforeHandle({ cookie, set, store, headers }) {
+    async beforeHandle({ cookie, set, store, headers }) {
       const state_result = app_middleware({ cookie, headers });
 
       set.status = state_result.code;
       if (!state_result.data) return state_result;
+
+      // Single-device enforcement on the POLLING path. Long polling is the
+      // WebSocket's stand-in, so it has to answer the same question the socket's
+      // `open` handler does — otherwise a device superseded by a newer login keeps
+      // polling and sending forever, which is exactly what kept an old device
+      // "logged in" whenever it fell back to (or started on) polling.
+      const superseded = await enforce_device_token(state_result.data);
+      if (superseded) {
+        set.status = superseded.code;
+        return superseded;
+      }
 
       store.id = state_result.data.id;
       store.role = state_result.data.role;
