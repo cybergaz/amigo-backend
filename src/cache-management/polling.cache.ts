@@ -6,6 +6,7 @@ import { missed_ws_messages_model } from "@/models/message.model";
 import { VITAL_WS_EVENTS_CONST, VitalWSMessage, VitalWSMessageEventsType, WSMessage, WSMessageEventsType } from "@/types/socket.types";
 import { eq, and, lt, asc, gt, inArray } from "drizzle-orm";
 import Snowflake from "@/utils/snowflake.utils";
+import { sort_pending_for_replay } from "@/utils/pending-order.utils";
 import { randomUUIDv7 } from "bun";
 
 // ============================================================================
@@ -293,8 +294,11 @@ async function fetch_pending_messages(
   // 500-entry backlog used to cost ~1000 sequential ops per poll).
   await remove_pending_messages_batch(user_id, Array.from(messages.keys()));
 
-  // Filter by after_message_id if provided (cursor-based pagination)
-  let result = Array.from(messages.values()).sort((a, b) => a.created_at - b.created_at);
+  // Replay order: created_at, with conversation:new first on a same-ms tie
+  // (see pending-order.utils — e.g. a new DM's conversation:new and its first
+  // message:new). Then filter by after_message_id if provided (cursor-based
+  // pagination).
+  let result = sort_pending_for_replay(Array.from(messages.values()));
   if (after_message_id) {
     const idx = result.findIndex(m => m.message_id === after_message_id);
     if (idx !== -1) {

@@ -358,6 +358,9 @@ const socket_message_handler = async (
         const result = await handle_message_new(
           message.payload as ChatMessagePayload,
           user_name,
+          // Authenticated id of this connection — the broadcast-list branch
+          // refuses a payload.sender_id that doesn't match it.
+          user_id,
         );
         // console.log("result -> ", result);
         if (!result.success) {

@@ -45,6 +45,13 @@ const MessageSentAckPayloadSchema = t.Object({
   is_sent: t.Boolean(),
   error_code: t.Optional(t.Number()),
   new_id: t.Optional(t.String()),
+  // Outbound-only (broadcast-list sends); listed so the schema documents the
+  // full ack shape. Optional, so it can never reject an inbound frame.
+  broadcast_copies: t.Optional(t.Array(t.Object({
+    recipient_id: t.String(),
+    conv_id: t.String(),
+    msg_id: t.String(),
+  }))),
 });
 
 // MessageStatusAckPayload schema

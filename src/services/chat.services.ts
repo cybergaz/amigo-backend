@@ -23,6 +23,10 @@ import { get_message_statuses_bulk } from "@/cache-management/message.cache";
 import { generate_unique_id } from "@/utils/general.utils";
 import { randomUUIDv7 } from "bun";
 import { compute_group_caps, load_group_actor_context } from "./group-caps";
+import { broadcast_recipient_model } from "@/models/broadcast.model";
+import { get_chat_type } from "@/cache-management/chat-type.cache";
+import { soft_delete_broadcast_copies } from "./chat-broadcast.service";
+import { for_each_with_concurrency, BROADCAST_FANOUT_CONCURRENCY } from "@/utils/broadcast.utils";
 
 const build_conversation_action_message = (
   action: ConversationActionPayload["action"],
@@ -407,13 +411,19 @@ const get_chat_list = async (user_id: string, type: string) => {
             ? isNotNull(chat_member_model.removed_at)
             : isNull(chat_member_model.removed_at),
           isNull(chat_model.deleted_at),
-          type !== "all"
-            ? type === "group"
-              ? eq(chat_model.type, "group")
-              : type === "community_group"
-                ? eq(chat_model.type, "community_group")
-                : eq(chat_model.type, "dm")
-            : undefined,
+          // Broadcast lists only ever come back for an explicit
+          // type='broadcast' request. 'all' must exclude them: older app
+          // builds (and plenty of code) treat every non-dm row as a group.
+          // Every other value already maps to one concrete type.
+          type === "all"
+            ? ne(chat_model.type, "broadcast")
+            : type === "broadcast"
+              ? eq(chat_model.type, "broadcast")
+              : type === "group"
+                ? eq(chat_model.type, "group")
+                : type === "community_group"
+                  ? eq(chat_model.type, "community_group")
+                  : eq(chat_model.type, "dm"),
         )
       )
       // NOTE: deliberately no LIMIT. This response is the client's full
@@ -437,10 +447,26 @@ const get_chat_list = async (user_id: string, type: string) => {
         chats.map(c => c.pinnedMsgId).filter((id): id is string => !!id)
       ),
     ];
-    const [chat_metas, unread_counts, pinned_messages] = await Promise.all([
+    // Broadcast rows also carry recipientCount (one grouped count, only paid
+    // for the broadcast list request — no other type can return such rows).
+    const broadcast_ids = chats
+      .filter(c => c.type === "broadcast")
+      .map(c => c.conversationId);
+    const [chat_metas, unread_counts, pinned_messages, recipient_counts] = await Promise.all([
       get_chat_metas(chat_ids),
       get_all_unread(user_id),
       get_pinned_message_map(pinned_ids),
+      broadcast_ids.length > 0
+        ? db
+          .select({
+            list_id: broadcast_recipient_model.list_id,
+            count: sql<number>`count(*)::int`,
+          })
+          .from(broadcast_recipient_model)
+          .where(inArray(broadcast_recipient_model.list_id, broadcast_ids))
+          .groupBy(broadcast_recipient_model.list_id)
+          .then(rows => new Map(rows.map(r => [r.list_id, Number(r.count)])))
+        : Promise.resolve(new Map<string, number>()),
     ]);
 
     // ── Read-through fallback: resolve missing previews from Postgres ─────
@@ -600,6 +626,10 @@ const get_chat_list = async (user_id: string, type: string) => {
           ? pinned_messages.get(chat.pinnedMsgId) ?? null
           : null,
         unreadCount: is_active_member && !last_msg_cleared ? unread : 0,
+        // Broadcast lists only: how many recipients the list has.
+        ...(chat.type === "broadcast"
+          ? { recipientCount: recipient_counts.get(chat.conversationId) ?? 0 }
+          : {}),
       };
     });
 
@@ -677,6 +707,16 @@ const soft_delete_chat = async (conversation_id: string, user_id: string) => {
         success: false,
         code: 400,
         message: "Use /chat/dm/soft-delete-dm for DM deletion",
+      };
+    }
+
+    // A broadcast list is not a group: this path would fan a "group deleted"
+    // chat_delete out and flip the owner to 'left'. Lists have their own delete.
+    if (chat_row.type === "broadcast") {
+      return {
+        success: false,
+        code: 400,
+        message: "Use DELETE /chat/broadcast/:id for broadcast lists",
       };
     }
 
@@ -959,10 +999,17 @@ const revive_chat = async (conversation_id: string) => {
 //     excludes the sender (their UI already updated optimistically).
 //   - disappearing sweeper (server-initiated): passes actor_id = null so
 //     every chat member receives the event.
+//
+// opts.skip_actor_fcm: don't queue the FCM copy for the actor. Used for the
+// broadcast-list cascade — deleting one broadcast message deletes up to 250
+// DM copies, and the actor is a member of every one of those DMs, so the
+// default (FCM every member, actor included) would push the sender's own
+// device ~60 batched notifications for a single delete.
 const broadcast_deletion = async (
   chat_id: string,
   message_ids: string[],
   actor_id: string | null,
+  opts?: { skip_actor_fcm?: boolean },
 ): Promise<void> => {
   if (message_ids.length === 0) return;
 
@@ -995,6 +1042,7 @@ const broadcast_deletion = async (
     get_muted_user_ids(chat_id),
   ]);
   for (const member_id of members) {
+    if (opts?.skip_actor_fcm && actor_id && member_id === actor_id) continue;
     await queue_message_fcm(member_id, ws_msg, { silent: muted.has(member_id) });
   }
 
@@ -1087,20 +1135,46 @@ const broadcast_deletion = async (
 
 const soft_delete_message = async (message_ids: string[], user_id: string, is_admin_or_staff?: boolean) => {
   try {
-    // First, get the messages to retrieve chat_id and check if they exist
-    const messagesToDelete = await db
+    // First, get the messages to retrieve chat_id and check if they exist.
+    // Already-deleted rows are read too (same single query, same ownership
+    // rule) — only so the broadcast cascade below can be HEALED: see there.
+    const requested = await db
       .select({
         id: message_model.id,
         chat_id: message_model.chat_id,
+        sender_id: message_model.sender_id,
+        deleted_at: message_model.deleted_at,
       })
       .from(message_model)
       .where(and(
         inArray(message_model.id, message_ids),
-        isNull(message_model.deleted_at),
         !is_admin_or_staff ? eq(message_model.sender_id, user_id) : undefined,
       ));
+    const messagesToDelete = requested.filter(m => m.deleted_at === null);
 
-    if (messagesToDelete.length === 0) {
+    // Delete-for-everyone of a broadcast-list message also deletes every copy
+    // it made in the recipients' DMs. Which chats are broadcast lists comes
+    // from the process-local type cache (no DB round-trip once warm).
+    const broadcast_chat_ids = new Set<string>();
+    for (const conversationId of new Set(requested.map(m => m.chat_id))) {
+      if ((await get_chat_type(conversationId)) === "broadcast") {
+        broadcast_chat_ids.add(conversationId);
+      }
+    }
+    // The cascade runs AFTER the broadcast message itself is deleted, so if it
+    // failed, a replay of the same delete (the client's vital-event outbox)
+    // would find nothing live and 404 out, stranding the copies forever. So
+    // broadcast messages that are ALREADY deleted and the actor's own are
+    // re-cascaded on every request — idempotent, the cascade only touches
+    // copies still live.
+    const heal_broadcast_ids = requested
+      .filter(m =>
+        m.deleted_at !== null &&
+        m.sender_id?.toLowerCase() === user_id.toLowerCase() &&
+        broadcast_chat_ids.has(m.chat_id))
+      .map(m => m.id);
+
+    if (messagesToDelete.length === 0 && heal_broadcast_ids.length === 0) {
       return {
         success: false,
         code: 404,
@@ -1109,11 +1183,8 @@ const soft_delete_message = async (message_ids: string[], user_id: string, is_ad
       };
     }
 
-    // Get unique chat IDs
-    const conversationIds = [...new Set(messagesToDelete.map(m => m.chat_id))];
-
     // Soft delete the messages
-    const deletedMessages = await db
+    const deletedMessages = messagesToDelete.length === 0 ? [] : await db
       .update(message_model)
       .set({ deleted_at: new Date() })
       .where(and(
@@ -1123,7 +1194,7 @@ const soft_delete_message = async (message_ids: string[], user_id: string, is_ad
       ))
       .returning();
 
-    if (!deletedMessages || deletedMessages.length === 0) {
+    if (deletedMessages.length === 0 && heal_broadcast_ids.length === 0) {
       return {
         success: false,
         code: 404,
@@ -1134,12 +1205,43 @@ const soft_delete_message = async (message_ids: string[], user_id: string, is_ad
 
     // Fan out per conversation. broadcast_deletion handles WS + FCM +
     // last_msg/pinned repoint identically for user-initiated and sweeper-
-    // initiated deletes — see its docs.
+    // initiated deletes — see its docs. Only rows THIS call deleted: a row a
+    // concurrent delete got first was already fanned out by that call.
+    const conversationIds = [...new Set(deletedMessages.map(m => m.chat_id))];
     for (const conversationId of conversationIds) {
-      const ids_in_conv = messagesToDelete
+      const ids_in_conv = deletedMessages
         .filter(m => m.chat_id === conversationId)
         .map(m => m.id);
       await broadcast_deletion(conversationId, ids_in_conv, user_id);
+    }
+
+    // The copy cascade, with the normal per-DM deletion fan-out (recipients
+    // get message:delete in their DM; the actor is excluded from the WS frame
+    // as usual and from the per-DM FCM — their app removes its local copies
+    // itself). Covers the just-deleted broadcast messages plus the heal set.
+    const broadcast_msg_ids = [
+      ...deletedMessages.filter(m => broadcast_chat_ids.has(m.chat_id)).map(m => m.id),
+      ...heal_broadcast_ids,
+    ];
+    if (broadcast_msg_ids.length > 0) {
+      try {
+        const copies = await soft_delete_broadcast_copies(broadcast_msg_ids, user_id, is_admin_or_staff);
+        const by_dm = new Map<string, string[]>();
+        for (const c of copies) {
+          const list = by_dm.get(c.chat_id) ?? [];
+          list.push(c.id);
+          by_dm.set(c.chat_id, list);
+        }
+        await for_each_with_concurrency(
+          Array.from(by_dm.entries()),
+          BROADCAST_FANOUT_CONCURRENCY,
+          ([dm_id, ids]) => broadcast_deletion(dm_id, ids, user_id, { skip_actor_fcm: true }),
+        );
+      } catch (err) {
+        // The broadcast message itself is already deleted; a failure here is
+        // healed by a replay of the same delete (heal_broadcast_ids above).
+        console.error("[delete] broadcast copy cascade failed:", err);
+      }
     }
 
     return {

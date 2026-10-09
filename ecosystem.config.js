@@ -51,7 +51,7 @@ module.exports = {
     merge_logs: true,
 
     // Memory management
-    max_memory_restart: '4G', // Restart if memory exceeds 1GB
+    max_memory_restart: '4G', // Restart if memory exceeds XG
 
     // Kill settings
     kill_timeout: 5000,

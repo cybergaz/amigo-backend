@@ -15,11 +15,23 @@ import { get_user_details } from "./user.services";
 import { broadcast_conversation_action } from "./chat.services";
 import { add_member, add_members, remove_member as cache_remove_member } from "@/cache-management/conv.cache";
 import { compute_group_caps, load_group_actor_context } from "./group-caps";
+import { is_broadcast_chat } from "@/cache-management/chat-type.cache";
 import {
   upload_image_to_s3,
   delete_image_from_s3,
   generate_profile_image_key,
 } from "@/services/s3.service";
+
+// Broadcast lists are chats (type 'broadcast') whose ONLY member is the owner,
+// with role 'admin' — so every owner/admin-gated group path below would happily
+// operate on one. Any of them that adds a member, accepts a join request or
+// re-titles the "group" would turn a private recipient list into a de-facto
+// group. Group-only entry points refuse the type outright with this result.
+const NOT_A_GROUP = {
+  success: false,
+  code: 400,
+  message: "Not a group conversation",
+} as const;
 
 // Returns true if the user is an active admin of the chat. Used to gate
 // admin-only mutations (title / pfp updates).
@@ -307,6 +319,10 @@ const add_new_member = async (
   actor_id?: string,
 ) => {
   try {
+    // The single choke point every "add a member" flow goes through (group
+    // route, admin panel, bulk add, join-request approval, force-declare).
+    if (await is_broadcast_chat(conversation_id)) return { ...NOT_A_GROUP };
+
     // 1. Filter valid users
     const validUsers = await db
       .select({ id: user_model.id })
@@ -559,6 +575,7 @@ const remove_member = async (
       .from(chat_model)
       .where(eq(chat_model.id, conversation_id))
       .limit(1);
+    if (conversation?.type === "broadcast") return { ...NOT_A_GROUP };
 
     const member_info = await db
       .select({
@@ -661,6 +678,7 @@ const promote_to_admin = async (
       .from(chat_model)
       .where(eq(chat_model.id, conversation_id))
       .limit(1);
+    if (conversation?.type === "broadcast") return { ...NOT_A_GROUP };
 
     const actor_details = actor_id ? await get_user_details(actor_id) : null;
     const target_user_details = await get_user_details(user_id);
@@ -732,6 +750,7 @@ const demote_to_member = async (
       .from(chat_model)
       .where(eq(chat_model.id, conversation_id))
       .limit(1);
+    if (conversation?.type === "broadcast") return { ...NOT_A_GROUP };
 
     const actor_details = actor_id ? await get_user_details(actor_id) : null;
     const target_user_details = await get_user_details(user_id);
@@ -798,6 +817,10 @@ const update_group_title = async (
   actor_id: string,
 ) => {
   try {
+    // The list owner is its 'admin' member; lists are renamed via
+    // PATCH /chat/broadcast/:id, never through the group path.
+    if (await is_broadcast_chat(conversation_id)) return { ...NOT_A_GROUP };
+
     if (!(await is_chat_admin(conversation_id, actor_id))) {
       return {
         success: false,
@@ -854,6 +877,8 @@ const update_group_profile_pic = async (
   file: File,
 ) => {
   try {
+    if (await is_broadcast_chat(conversation_id)) return { ...NOT_A_GROUP };
+
     if (!(await is_chat_admin(conversation_id, actor_id))) {
       return {
         success: false,
@@ -1056,6 +1081,21 @@ const bulk_remove_members_from_groups = async (
   }
 
   try {
+    // Broadcast lists are not groups — "removing" their only member (the
+    // owner) would orphan the list. Drop them from the target set up front.
+    const broadcast_ids = new Set(
+      (
+        await db
+          .select({ id: chat_model.id })
+          .from(chat_model)
+          .where(and(inArray(chat_model.id, conversation_ids), eq(chat_model.type, "broadcast")))
+      ).map((r) => r.id),
+    );
+    const group_ids = conversation_ids.filter((id) => !broadcast_ids.has(id));
+    if (group_ids.length === 0) {
+      return { ...NOT_A_GROUP, data: null };
+    }
+
     // 1. One batched UPDATE returning every (chat_id, user_id, role, joined_at)
     //    that was actually active and got soft-deleted. Anything not in the
     //    group silently fails to match — desired behaviour per spec.
@@ -1066,7 +1106,7 @@ const bulk_remove_members_from_groups = async (
       .set({ status: "left" })
       .where(
         and(
-          inArray(chat_member_model.chat_id, conversation_ids),
+          inArray(chat_member_model.chat_id, group_ids),
           inArray(chat_member_model.user_id, user_ids),
           isNull(chat_member_model.removed_at),
           eq(chat_member_model.status, "active"),
@@ -1218,7 +1258,7 @@ const leave_group = async (
     if (!ctx.exists || ctx.deletedAt) {
       return { success: false, code: 404, message: "Group not found" };
     }
-    if (ctx.type === "dm") {
+    if (ctx.type === "dm" || ctx.type === "broadcast") {
       return { success: false, code: 400, message: "Not a group conversation" };
     }
 
@@ -1347,7 +1387,7 @@ const transfer_ownership = async (
     if (!ctx.exists || ctx.deletedAt) {
       return { success: false, code: 404, message: "Group not found" };
     }
-    if (ctx.type === "dm") {
+    if (ctx.type === "dm" || ctx.type === "broadcast") {
       return { success: false, code: 400, message: "Not a group conversation" };
     }
 
@@ -1422,7 +1462,7 @@ const request_join = async (conversation_id: string, user_id: string) => {
     if (!ctx.exists || ctx.deletedAt) {
       return { success: false, code: 404, message: "Group not found" };
     }
-    if (ctx.type === "dm") {
+    if (ctx.type === "dm" || ctx.type === "broadcast") {
       return { success: false, code: 400, message: "Not a group conversation" };
     }
     if (ctx.status === "active") {
@@ -1490,6 +1530,7 @@ const list_join_requests = async (conversation_id: string, actor_id: string) => 
     if (!ctx.exists || ctx.deletedAt) {
       return { success: false, code: 404, message: "Group not found" };
     }
+    if (ctx.type === "broadcast") return { ...NOT_A_GROUP };
     const caps = compute_group_caps({
       ownerId: ctx.ownerId,
       myUserId: actor_id,
@@ -1541,6 +1582,7 @@ const respond_join_request = async (
     if (!ctx.exists || ctx.deletedAt) {
       return { success: false, code: 404, message: "Group not found" };
     }
+    if (ctx.type === "broadcast") return { ...NOT_A_GROUP };
     const caps = compute_group_caps({
       ownerId: ctx.ownerId,
       myUserId: actor_id,

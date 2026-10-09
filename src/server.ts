@@ -15,6 +15,7 @@ import app_version_routes from "./routes/app-version.routes";
 import web_socket_server from "./sockets/socket.server";
 import { chat_dm_routes } from "./routes/chat-dm.routes";
 import { chat_group_routes } from "./routes/chat-group.routes";
+import { chat_broadcast_routes } from "./routes/chat-broadcast.routes";
 import { chat_poll_routes } from "./routes/chat-poll.routes";
 import { message_routes } from "./routes/message.routes";
 import { start_receipts_flush } from "./cache-management/receipt-flush";
@@ -72,6 +73,7 @@ const app = new Elysia({ prefix: "/api" })
   .use(chat_routes)
   .use(chat_dm_routes)
   .use(chat_group_routes)
+  .use(chat_broadcast_routes)
   .use(chat_poll_routes)
   .use(message_routes)
   .use(community_routes)

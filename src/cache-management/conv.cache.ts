@@ -249,6 +249,44 @@ const add_members = async (user_ids: string[], chat_id: string): Promise<void> =
   }
 };
 
+/**
+ * add_members for MANY chats in one go — the broadcast-list fan-out creates or
+ * revives up to 250 DMs per send, and add_members per DM would be ~250 Redis
+ * pipelines plus ~750 sequential publishes. Same effect, two round-trips: one
+ * pipeline with every SADD/EXPIRE, one pipeline with every invalidation
+ * publish (other PM2 workers drop their LRU copies on receipt).
+ */
+const add_members_bulk = async (
+  entries: { chat_id: string; user_ids: string[] }[],
+): Promise<void> => {
+  const work = entries.filter((e) => e.user_ids.length > 0);
+  if (work.length === 0) return;
+  try {
+    const touched_users = new Set<string>();
+    const pipe = redis.pipeline();
+    for (const { chat_id, user_ids } of work) {
+      pipe.sadd(conv_members_key(chat_id), ...user_ids);
+      pipe.expire(conv_members_key(chat_id), REDIS_TTL_SEC);
+      for (const uid of user_ids) {
+        pipe.sadd(user_conv_key(uid), chat_id);
+        pipe.expire(user_conv_key(uid), REDIS_TTL_SEC);
+        touched_users.add(uid);
+      }
+    }
+    await pipe.exec();
+
+    for (const { chat_id } of work) conv_user_cache.delete(chat_id);
+    for (const uid of touched_users) user_conv_cache.delete(uid);
+
+    const pub = redis.pipeline();
+    for (const { chat_id } of work) pub.publish(INVALIDATE_CHANNEL, `conv:${chat_id}`);
+    for (const uid of touched_users) pub.publish(INVALIDATE_CHANNEL, `user:${uid}`);
+    await pub.exec();
+  } catch (err) {
+    console.error(`[CACHE] add_members_bulk failed (${work.length} chats):`, err);
+  }
+};
+
 const remove_member = async (user_id: string, chat_id: string): Promise<void> => {
   try {
     const pipe = redis.pipeline();
@@ -293,6 +331,7 @@ export {
   is_member,
   add_member,
   add_members,
+  add_members_bulk,
   remove_member,
   invalidate_conversation,
   invalidate_user_conversations,

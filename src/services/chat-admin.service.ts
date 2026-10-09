@@ -6,7 +6,7 @@ import {
   ChatRoleType,
   ChatType,
 } from "@/types/chat.types";
-import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, ne, sql } from "drizzle-orm";
 import { add_new_member, promote_to_admin } from "./chat-group.service";
 import { add_member, invalidate_conversation } from "@/cache-management/conv.cache";
 import { broadcast_conversation_action } from "./chat.services";
@@ -19,6 +19,11 @@ const get_all_conversations_admin = async (type?: string) => {
 
     if (type && type !== "all") {
       whereCondition = eq(chat_model.type, type as ChatType);
+    } else {
+      // Broadcast lists are a user's private recipient list, not a
+      // conversation — and the admin panel labels every non-dm row a group.
+      // Only an explicit type='broadcast' request lists them.
+      whereCondition = ne(chat_model.type, "broadcast");
     }
 
     const conversations = await db

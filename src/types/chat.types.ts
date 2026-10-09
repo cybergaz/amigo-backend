@@ -1,4 +1,12 @@
-const CHAT_TYPE_CONSTS = ["dm", "group", "community_group"] as const;
+// "broadcast" = a WhatsApp-style broadcast list. It IS a chat row (type
+// 'broadcast', owner = sender) whose ONLY chat_members row is the owner;
+// recipients live in broadcast_recipients, never in chat_members, so nothing
+// chat-scoped (fan-out, chat list, history, presence) can ever reach them.
+// Every message sent into it is copied server-side into the owner's 1:1 DM
+// with each recipient (see chat-broadcast.service.ts). Group-only endpoints
+// must refuse it — code that treats "not dm" as "group" would otherwise turn a
+// list into a de-facto group.
+const CHAT_TYPE_CONSTS = ["dm", "group", "community_group", "broadcast"] as const;
 type ChatType = typeof CHAT_TYPE_CONSTS[number];
 
 const MESSAGE_TYPE_CONSTS = ["text", "image", "video", "audio", "document", "media", "reply", "forwarded", "system", "attachment", "reaction", "contact"] as const;

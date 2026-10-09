@@ -118,6 +118,20 @@ type MessageSentAckPayload = {
   // The sender applies it to its local row so its display matches what
   // recipients see when the device clock was skewed.
   sent_at?: Date;
+  // Present ONLY for messages sent into a broadcast-list chat (also on the
+  // idempotent duplicate re-ack): one entry per recipient naming the 1:1 DM
+  // the server copied the message into and the copy's id. A send into a list
+  // with no recipients is refused (is_sent:false, error_code:422) rather than
+  // acked with an empty array. See BROADCAST_LISTS.md.
+  broadcast_copies?: BroadcastCopyRef[];
+};
+
+// One server-made copy of a broadcast message: the recipient, the DM it was
+// delivered in, and the copy's message id inside that DM.
+type BroadcastCopyRef = {
+  recipient_id: string;
+  conv_id: string;
+  msg_id: string;
 };
 
 type MessageStatusAckPayload = {
@@ -368,6 +382,7 @@ export type {
   ConvJoinPayload,
   ChatMessagePayload,
   MessageSentAckPayload,
+  BroadcastCopyRef,
   MessageStatusAckPayload,
   TypingPayload,
   DeleteMessagePayload,

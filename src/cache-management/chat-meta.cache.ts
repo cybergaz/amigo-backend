@@ -1,7 +1,7 @@
 import { redis } from "@/config/redis";
 import db from "@/config/db";
 import { chat_model } from "@/models/chat.model";
-import { and, eq, isNull, lte, or } from "drizzle-orm";
+import { and, eq, isNull, lte, or, sql } from "drizzle-orm";
 import { MessageType } from "@/types/chat.types";
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -148,6 +148,73 @@ const set_last_message = async (
         console.error(`[LASTMSG] postgres pointer write failed for chat ${chat_id}:`, err),
       ),
   ]);
+};
+
+/**
+ * Bulk form of set_last_message for one event that moves MANY chats' last
+ * message at once — a broadcast-list send updates every recipient's DM plus
+ * the list itself. Same two halves, same rules, but O(1) round-trips instead
+ * of O(N): ONE Redis pipeline for the chat_meta hashes and ONE Postgres
+ * `UPDATE … FROM (VALUES …)` for the pointers.
+ *
+ * The Postgres half keeps set_last_message's MONOTONIC rule per row
+ * (last_msg_at IS NULL OR last_msg_at <= sent_at), so an out-of-order write
+ * can never rewind any of the chats. There is no allow_rewind variant on
+ * purpose — rewinds only happen on delete, which repoints one chat at a time.
+ *
+ * Never rejects; each half logs and swallows its own failure (one failing must
+ * not skip the other), exactly like set_last_message.
+ */
+const batch_set_last_message = async (
+  entries: { chat_id: string; msg: ChatMetaFields }[],
+): Promise<void> => {
+  if (entries.length === 0) return;
+
+  const normalized = entries.map(({ chat_id, msg }) => {
+    const parsed = new Date(msg.sent_at);
+    const sent_at = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+    return { chat_id, msg: { ...msg, sent_at: sent_at.toISOString() } };
+  });
+
+  const redis_half = (async () => {
+    try {
+      const pipe = redis.pipeline();
+      for (const { chat_id, msg } of normalized) {
+        pipe.hset(chat_meta_key(chat_id), {
+          id: msg.id,
+          body: msg.body ?? "",
+          type: msg.type,
+          sender_id: msg.sender_id,
+          sent_at: msg.sent_at,
+          attachments: msg.attachments != null ? JSON.stringify(msg.attachments) : "",
+        });
+      }
+      await pipe.exec();
+    } catch (err) {
+      console.error(`[CACHE] batch_set_last_message redis half failed (${normalized.length} chats):`, err);
+    }
+  })();
+
+  const postgres_half = (async () => {
+    try {
+      const rows = normalized.map(
+        ({ chat_id, msg }) =>
+          sql`(${chat_id}::uuid, ${msg.id}::uuid, ${msg.sent_at}::timestamptz)`,
+      );
+      await db.execute(sql`
+        UPDATE ${chat_model} AS c
+        SET last_msg_id = v.msg_id,
+            last_msg_at = v.sent_at
+        FROM (VALUES ${sql.join(rows, sql`, `)}) AS v(chat_id, msg_id, sent_at)
+        WHERE c.id = v.chat_id
+          AND (c.last_msg_at IS NULL OR c.last_msg_at <= v.sent_at)
+      `);
+    } catch (err) {
+      console.error(`[LASTMSG] batch postgres pointer write failed (${normalized.length} chats):`, err);
+    }
+  })();
+
+  await Promise.all([redis_half, postgres_half]);
 };
 
 /**
@@ -333,6 +400,7 @@ const get_all_unread = async (user_id: string): Promise<Map<string, number>> => 
 export {
   update_chat_meta,
   set_last_message,
+  batch_set_last_message,
   clear_chat_meta_message,
   get_chat_meta,
   get_chat_metas,

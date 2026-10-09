@@ -6,57 +6,98 @@ import { and, eq, exists, isNotNull, isNull, ne, sql } from "drizzle-orm";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { NewConversationPayload } from "@/types/socket.types";
 import { add_members, remove_member } from "@/cache-management/conv.cache";
+import { is_broadcast_chat } from "@/cache-management/chat-type.cache";
+import { dm_pair_lock_key, dm_pair_locks_sql, tx_timeouts_sql } from "@/utils/broadcast.utils";
 
 const create_dm = async (sender_id: string, receiver_id: string) => {
   try {
-    // Find ANY existing DM between these two users — ignoring removed_at on
-    // either side. The DM model in the new "delete-for-me" world is: if a
-    // chat row exists with both parties as members (even if one party has
-    // removed_at set), the chat continues to exist and the deleting party
-    // is "revived" on next interaction. Creating a new chat_id every time
-    // someone re-DMs a person they previously deleted would orphan the
-    // shared message history.
-    const existingChat = await db
-      .select({ id: chat_model.id })
-      .from(chat_model)
-      .where(
-        and(
-          eq(chat_model.type, "dm"),
-          isNull(chat_model.deleted_at),
-          exists(
-            db.select().from(chat_member_model).where(
-              and(
-                eq(chat_member_model.chat_id, chat_model.id),
-                eq(chat_member_model.user_id, sender_id),
+    // Lookup + insert run in ONE transaction under the DM-pair advisory lock —
+    // the SAME lock (namespace + key derivation, from broadcast.utils) the
+    // broadcast-list send takes before it creates DMs. Without it a create_dm
+    // racing a broadcast for the same pair (or another create_dm) could each
+    // see "no DM yet" and insert two chats for one pair. Side effects (cache,
+    // conversation:new) run only after COMMIT, below.
+    const outcome = await db.transaction(async (tx) => {
+      // Bounded waits: a stalled pair-lock holder fails this request (500)
+      // instead of pinning a pooled connection indefinitely.
+      await tx.execute(tx_timeouts_sql());
+      await tx.execute(dm_pair_locks_sql([dm_pair_lock_key(sender_id, receiver_id)]));
+
+      // Find ANY existing DM between these two users — ignoring removed_at on
+      // either side. The DM model in the new "delete-for-me" world is: if a
+      // chat row exists with both parties as members (even if one party has
+      // removed_at set), the chat continues to exist and the deleting party
+      // is "revived" on next interaction. Creating a new chat_id every time
+      // someone re-DMs a person they previously deleted would orphan the
+      // shared message history.
+      const existingChat = await tx
+        .select({ id: chat_model.id })
+        .from(chat_model)
+        .where(
+          and(
+            eq(chat_model.type, "dm"),
+            isNull(chat_model.deleted_at),
+            exists(
+              tx.select().from(chat_member_model).where(
+                and(
+                  eq(chat_member_model.chat_id, chat_model.id),
+                  eq(chat_member_model.user_id, sender_id),
+                )
               )
-            )
-          ),
-          exists(
-            db.select().from(chat_member_model).where(
-              and(
-                eq(chat_member_model.chat_id, chat_model.id),
-                eq(chat_member_model.user_id, receiver_id),
+            ),
+            exists(
+              tx.select().from(chat_member_model).where(
+                and(
+                  eq(chat_member_model.chat_id, chat_model.id),
+                  eq(chat_member_model.user_id, receiver_id),
+                )
               )
             )
           )
         )
-      )
-      .limit(1);
+        .limit(1);
 
-    if (existingChat.length > 0) {
-      const conv_id = existingChat[0].id;
-      // If either side had hidden the chat (removed_at set), revive their
-      // membership so message:new broadcasts include them again. dm_delete_status
-      // is the single-side revive; here we cover both for completeness.
-      await db
-        .update(chat_member_model)
-        .set({ removed_at: null })
-        .where(
-          and(
-            eq(chat_member_model.chat_id, conv_id),
-            isNotNull(chat_member_model.removed_at),
-          )
-        );
+      if (existingChat.length > 0) {
+        const conv_id = existingChat[0].id;
+        // If either side had hidden the chat (removed_at set), revive their
+        // membership so message:new broadcasts include them again. dm_delete_status
+        // is the single-side revive; here we cover both for completeness.
+        await tx
+          .update(chat_member_model)
+          .set({ removed_at: null })
+          .where(
+            and(
+              eq(chat_member_model.chat_id, conv_id),
+              isNotNull(chat_member_model.removed_at),
+            )
+          );
+        return { existing: true as const, conv_id };
+      }
+
+      const [chat] = await tx
+        .insert(chat_model)
+        .values({
+          creater_id: sender_id,
+          type: "dm",
+        })
+        .returning();
+
+      // Insert both members
+      await tx.insert(chat_member_model).values([
+        {
+          chat_id: chat.id,
+          user_id: sender_id,
+        },
+        {
+          chat_id: chat.id,
+          user_id: receiver_id,
+        },
+      ]);
+      return { existing: false as const, chat };
+    });
+
+    if (outcome.existing) {
+      const { conv_id } = outcome;
       // Re-hydrate the conversation member cache to include both parties so
       // the very next message:new broadcast fans out to both. add_members
       // is idempotent and also invalidates the LRU + publishes pub/sub.
@@ -71,25 +112,7 @@ const create_dm = async (sender_id: string, receiver_id: string) => {
       };
     }
 
-    const [chat] = await db
-      .insert(chat_model)
-      .values({
-        creater_id: sender_id,
-        type: "dm",
-      })
-      .returning();
-
-    // Insert both members
-    await db.insert(chat_member_model).values([
-      {
-        chat_id: chat.id,
-        user_id: sender_id,
-      },
-      {
-        chat_id: chat.id,
-        user_id: receiver_id,
-      },
-    ]);
+    const { chat } = outcome;
 
     // Send notification to receiver about new DM
     try {
@@ -152,6 +175,18 @@ const create_dm = async (sender_id: string, receiver_id: string) => {
 
 const dm_delete_status = async (conversation_id: string, user_id: string, status: boolean) => {
   try {
+    // A broadcast list is deleted through DELETE /chat/broadcast/:id. Hiding
+    // it here would set the owner's removed_at, drop them from the member
+    // cache and tombstone every list message — a half-deleted list.
+    if (await is_broadcast_chat(conversation_id)) {
+      return {
+        success: false,
+        code: 400,
+        message: "Use DELETE /chat/broadcast/:id for broadcast lists",
+        data: { conversation_id, deleted: false },
+      };
+    }
+
     const [conversation] = await db
       .update(chat_member_model)
       .set({ removed_at: status ? new Date() : null })

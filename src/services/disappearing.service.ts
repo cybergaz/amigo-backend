@@ -8,6 +8,7 @@ import { broadcast_message } from "@/sockets/socket.handlers";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
 import { get_conversation_members } from "@/cache-management/conv.cache";
 import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
+import { is_broadcast_chat } from "@/cache-management/chat-type.cache";
 import {
   set_disappearing_after_sec,
   set_last_message,
@@ -54,6 +55,12 @@ const set_chat_disappearing = async (
 ): Promise<{ success: boolean; code: number; message: string; }> => {
   if (!is_valid_duration(duration_sec)) {
     return { success: false, code: 400, message: "Invalid duration" };
+  }
+
+  // Broadcast lists: each copy follows the setting of the DM it lands in, so a
+  // list-level setting would only expire the sender's own copy. Not offered.
+  if (await is_broadcast_chat(chat_id)) {
+    return { success: false, code: 400, message: "Not supported in a broadcast list" };
   }
 
   // Membership check — must be an active member of the chat to change settings.

@@ -27,6 +27,18 @@ import {
   set_disappearing_after_sec,
   set_last_message,
 } from "@/cache-management/chat-meta.cache";
+import { resolve_stored_sent_at } from "@/utils/message-time.utils";
+import { get_chat_type, is_broadcast_chat } from "@/cache-management/chat-type.cache";
+
+// Product rule for broadcast lists: no pins, replies or reactions INSIDE the
+// list chat (the app hides them; this is the server-side backstop). The list
+// chat's only member is its owner, so none of these would leak — they would
+// just create state no client renders.
+const BROADCAST_UNSUPPORTED = {
+  success: false,
+  code: 400,
+  message: "Not supported in a broadcast list",
+} as const;
 
 // Resolve the disappearing-messages duration for a chat with read-through
 // caching on chat_meta. Returns null = disappearing off. Never throws — a
@@ -80,18 +92,6 @@ const get_user_info = async (user_id: string) => {
   return user;
 };
 
-// Message types whose payload is a file the client uploads BEFORE emitting
-// message:new (the app's MediaUploadManager). store_message orders these by
-// server arrival — see the sent_at comment there.
-const UPLOADED_MEDIA_TYPES: ReadonlySet<string> = new Set<MessageType>([
-  "image",
-  "video",
-  "audio",
-  "document",
-  "media",
-  "attachment",
-]);
-
 // Result of storing a message. `duplicate` = a row with this exact client id
 // already existed (an idempotent re-send), so the caller must NOT fan it out again.
 interface StoreMessageResultType extends ResultType<DBInsertMessageType> {
@@ -105,29 +105,12 @@ const store_message = async (payload: ChatMessagePayload): Promise<StoreMessageR
     // to keep expiry deterministic per-message even if the setting changes
     // mid-conversation. duration null = no expiry stamped.
     //
-    // Client clocks can be skewed (users with a fast device clock were
-    // producing sent_at minutes in the future, shown verbatim to recipients).
-    // Server time is the authority for the upper bound: never store a future
-    // or unparseable sent_at. Past values are kept — offline-queued messages
-    // legitimately carry an older client stamp.
-    //
-    // Uploaded media is the exception: it is stamped with the time the SERVER
-    // received it, not the client's tap-send time. The client stamps sent_at
-    // before the upload, so a slow upload landed at its old tap time — above
-    // every message sent while it uploaded — and recipients never saw it
-    // arrive. Every reader orders by sent_at (history, pagination, read
-    // cursors, last-message pointer), so stamping it here makes all of them
-    // order media by arrival with no query changes. The ack and the fan-out
-    // both carry this stored value, so the sender's bubble moves to the same
-    // place recipients see it.
-    const now = new Date();
-    const client_sent_at = new Date(payload.sent_at);
-    const sent_at_date =
-      UPLOADED_MEDIA_TYPES.has(payload.msg_type) ||
-      Number.isNaN(client_sent_at.getTime()) ||
-      client_sent_at > now
-        ? now
-        : client_sent_at;
+    // sent_at itself is clamped to server time (and uploaded media is stamped
+    // with server arrival) — see resolve_stored_sent_at, shared with the
+    // broadcast-list send path so both store the exact same value. The ack and
+    // the fan-out both carry this stored value, so the sender's bubble moves to
+    // the same place recipients see it.
+    const sent_at_date = resolve_stored_sent_at(payload.msg_type, payload.sent_at);
     const duration_sec = await resolve_disappearing_after_sec(payload.conv_id);
     const expires_at: Date | null = duration_sec != null
       ? new Date(sent_at_date.getTime() + duration_sec * 1000)
@@ -227,6 +210,8 @@ const store_message_with_retry = async (payload: ChatMessagePayload, _retry_coun
 // (only one pinned message per conversation; calling again overwrites the previous pin)
 const pin_message = async (payload: PinMessageRequest) => {
   try {
+    if (await is_broadcast_chat(payload.conv_id)) return { ...BROADCAST_UNSUPPORTED };
+
     // Verify user is a member of the conversation
     const membership = await verify_user_membership(payload.conv_id, payload.user_id);
     if (!membership) {
@@ -319,6 +304,8 @@ const pin_message = async (payload: PinMessageRequest) => {
 // currently pinned message matches the requested message_id (idempotent guard).
 const unpin_message = async (payload: PinMessageRequest) => {
   try {
+    if (await is_broadcast_chat(payload.conv_id)) return { ...BROADCAST_UNSUPPORTED };
+
     // Verify user is a member of the conversation
     const membership = await verify_user_membership(payload.conv_id, payload.user_id);
     if (!membership) {
@@ -407,6 +394,8 @@ const unpin_message = async (payload: PinMessageRequest) => {
 // Reply to message
 const reply_to_message = async (request: ReplyMessageRequest, user_id: string) => {
   try {
+    if (await is_broadcast_chat(request.conversation_id)) return { ...BROADCAST_UNSUPPORTED };
+
     // Verify user membership
     // const membership = await verify_user_membership(request.conversation_id, user_id);
     // if (!membership) {
@@ -515,6 +504,14 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: string)
     const forwardedMessages: Map<string, (DBMessageType & { conv_type: string; })[]> = new Map();
 
     for (const target_conv_id of request.target_conversation_ids) {
+      // Forwarding INTO a broadcast list isn't supported (v1): this path only
+      // inserts + fans out to the target chat's members, so the message would
+      // land in the owner's list chat and never be copied to a recipient.
+      // Skip it rather than store a message nobody receives.
+      if ((await get_chat_type(target_conv_id)) === "broadcast") {
+        console.warn(`[forward] skipping broadcast-list target ${target_conv_id}`);
+        continue;
+      }
 
       const all_msgs: (DBMessageType & { conv_type: string; })[] = [];
 
@@ -673,6 +670,8 @@ const get_starred_messages = async (user_id: string, conversation_id?: string) =
 // React/unreact to a message - stores per-user reaction in message_status table
 const react_to_message = async (request: ReactMessageRequest, user_id: string, user_name?: string) => {
   try {
+    if (await is_broadcast_chat(request.conversation_id)) return { ...BROADCAST_UNSUPPORTED };
+
     // Only active members may react — a left/kicked member must not be able to
     // post reactions into a group they no longer belong to (verify_user_membership
     // requires removed_at IS NULL AND status='active', same as pin/unpin/send).

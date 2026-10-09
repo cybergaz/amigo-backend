@@ -29,6 +29,7 @@ import {
 import db from "@/config/db";
 import { chat_model, chat_member_model } from "@/models/chat.model";
 import { message_model } from "@/models/message.model";
+import { broadcast_message_copy_model } from "@/models/broadcast.model";
 import { user_model } from "@/models/user.model";
 import { livekit_call_model } from "@/models/call.model";
 import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
@@ -55,6 +56,9 @@ import {
   LivekitService,
   register_call_timeout_notifier,
 } from "@/services/livekit.service";
+import { get_chat_type } from "@/cache-management/chat-type.cache";
+import { handle_broadcast_message_new } from "@/services/chat-broadcast.service";
+import type { ChatType } from "@/types/chat.types";
 
 const handle_connection_status = async (
   payload: ConnectionStatusPayload,
@@ -338,19 +342,28 @@ const handle_conv_mark_read = async (
 // Group chats don't have a per-user hide concept — they're either deleted
 // for everyone (chat_delete) or you're an active member. This whole path
 // is a no-op for non-DM messages.
+//
+// `known_type` is the chat type handle_message_new already resolved (from the
+// process-local chat-type cache); when present the type SELECT is skipped.
+// Omitted / null / undefined falls back to the lookup exactly as before.
 const revive_hidden_dm_members = async (
   conv_id: string,
   sender_id: string,
+  known_type?: ChatType | null,
 ): Promise<void> => {
   try {
-    // Look up chat type + sender info in parallel — both are needed only
-    // when revival is required, but the type check is cheap and short-circuits.
-    const [chat_row] = await db
-      .select({ id: chat_model.id, type: chat_model.type })
-      .from(chat_model)
-      .where(eq(chat_model.id, conv_id))
-      .limit(1);
-    if (!chat_row || chat_row.type !== "dm") return;
+    if (known_type) {
+      if (known_type !== "dm") return;
+    } else {
+      // Look up chat type + sender info in parallel — both are needed only
+      // when revival is required, but the type check is cheap and short-circuits.
+      const [chat_row] = await db
+        .select({ id: chat_model.id, type: chat_model.type })
+        .from(chat_model)
+        .where(eq(chat_model.id, conv_id))
+        .limit(1);
+      if (!chat_row || chat_row.type !== "dm") return;
+    }
 
     // Find members with removed_at set. For DMs this is at most one row
     // (only the receiver could have hidden the chat — the sender obviously
@@ -436,6 +449,10 @@ const revive_hidden_dm_members = async (
 const handle_message_new = async (
   payload: ChatMessagePayload,
   user_name: string,
+  // The authenticated user id of the connection/request that sent the frame.
+  // Only the broadcast-list branch uses it (it must not trust
+  // payload.sender_id); the DM/group path is unchanged.
+  auth_user_id?: string,
 ): Promise<ResultType> => {
   try {
     // Send guard: only active members may post (so a left/kicked user can't keep
@@ -486,6 +503,41 @@ const handle_message_new = async (
         code: 403,
         message: "Not an active member of this conversation",
       };
+    }
+
+    // Chat type, from a process-local cache (a chat's type never changes, so
+    // after the first lookup this costs nothing). Broadcast-list chats branch
+    // off here: the message is stored as the sender's copy and copied into a
+    // 1:1 DM per recipient — none of the conversation fan-out below applies.
+    const chat_type = await get_chat_type(payload.conv_id);
+    if (chat_type === undefined) {
+      // Type lookup failed (DB error). Proceeding could push a broadcast-list
+      // message down the plain path, where it would be stored but never
+      // copied to a single recipient. Fail transiently instead: the client
+      // keeps it pending and the GC retry re-sends it.
+      const failed_ack: MessageSentAckPayload = {
+        msg_id: payload.id,
+        conv_id: payload.conv_id,
+        is_sent: false,
+        error_code: 500,
+      };
+      await broadcast_message({
+        to: "users",
+        user_ids: [payload.sender_id],
+        message: {
+          type: "message:sent:ack",
+          payload: failed_ack,
+          ws_timestamp: new Date(),
+        },
+      });
+      return {
+        success: false,
+        code: 500,
+        message: "Failed to resolve conversation type",
+      };
+    }
+    if (chat_type === "broadcast") {
+      return await handle_broadcast_message_new(payload, auth_user_id);
     }
 
     // store the new message in DB
@@ -645,7 +697,7 @@ const handle_message_new = async (
     // before message:new is processed. Awaited so the conversation:new
     // arrives on the WS wire ahead of message:new — order matters on the
     // recipient side. Group chats short-circuit inside the helper.
-    await revive_hidden_dm_members(payload.conv_id, payload.sender_id);
+    await revive_hidden_dm_members(payload.conv_id, payload.sender_id, chat_type);
 
     // broadcast to the chat recipients about the new message
     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
@@ -865,14 +917,28 @@ const handle_message_status_ack = async (
     }
 
     if (all_msg_ids.length > 0) {
+      // Same single lookup, plus — via idx_bmc_message_id — the broadcast
+      // message an acked id is a COPY of (NULL for every ordinary message).
+      // Recipients only ever ack copy ids, but the sender's pending sent-ack
+      // was stored under the BROADCAST id, so without this it never drained.
       const rows = await db
-        .select({ id: message_model.id, sender_id: message_model.sender_id })
+        .select({
+          id: message_model.id,
+          sender_id: message_model.sender_id,
+          broadcast_msg_id: broadcast_message_copy_model.broadcast_msg_id,
+        })
         .from(message_model)
+        .leftJoin(
+          broadcast_message_copy_model,
+          eq(broadcast_message_copy_model.message_id, message_model.id),
+        )
         .where(inArray(message_model.id, all_msg_ids));
 
       const sender_map = new Map<string, string>();
+      const broadcast_of = new Map<string, string>(); // copy id → broadcast id
       for (const r of rows) {
         if (r.sender_id) sender_map.set(r.id, r.sender_id);
+        if (r.broadcast_msg_id) broadcast_of.set(r.id, r.broadcast_msg_id);
       }
 
       // group acks by sender so each sender gets only their messages
@@ -918,13 +984,20 @@ const handle_message_status_ack = async (
         // A delivery receipt for message X also proves the sender's own
         // sent-ack lifecycle for X completed — drain the sender's pending
         // `ack:{X}` copy too (same deterministic-key mechanics as above).
+        // For a broadcast copy X the sender's ack lives under the broadcast
+        // id instead, so drain that one as well (a Set: many copies of one
+        // broadcast in a batch → one key).
+        const acked_ids = new Set<string>();
+        for (const id of acks.flatMap((g) => g.msg_ids)) {
+          acked_ids.add(id);
+          const bid = broadcast_of.get(id);
+          if (bid) acked_ids.add(bid);
+        }
         remove_pending_messages_batch(
           sender_id,
-          acks
-            .flatMap((g) => g.msg_ids)
-            .map((id) =>
-              Snowflake.correlationId(sender_id, "message:sent:ack", id),
-            ),
+          Array.from(acked_ids, (id) =>
+            Snowflake.correlationId(sender_id, "message:sent:ack", id),
+          ),
         ).catch((err) =>
           console.error("[STATUS-ACK] sender ack drain failed:", err),
         );

@@ -4,10 +4,12 @@ import { add_new_member, create_group, demote_to_member, get_group_info, leave_g
 import { compute_group_caps, GroupCaps, load_group_actor_context } from "@/services/group-caps";
 
 // Loads the actor's capabilities for a group so a route can gate before
-// touching the service. Returns null when the group doesn't exist.
+// touching the service. Returns null when the group doesn't exist — or when
+// the chat is a broadcast list: its owner is its 'admin' member, so real caps
+// would let them add members / assign roles and turn the list into a group.
 const actor_caps = async (conversation_id: string, actor_id: string): Promise<GroupCaps | null> => {
   const ctx = await load_group_actor_context(conversation_id, actor_id);
-  if (!ctx.exists) return null;
+  if (!ctx.exists || ctx.type === "broadcast") return null;
   return compute_group_caps({
     ownerId: ctx.ownerId,
     myUserId: actor_id,
