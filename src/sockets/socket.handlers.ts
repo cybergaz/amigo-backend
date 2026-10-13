@@ -163,15 +163,29 @@ const broadcast_message = async (data: BroadcastData) => {
         // store every message as missed_ws_message and remove upon recieving delivery reciept from client
         // return;
       } else if (poll_connection) {
-        if (poll_connection.last_poll_at) {
-          const timeSinceLastPoll =
-            Date.now() - poll_connection.last_poll_at.getTime();
-          // Consider users with a poll in the last 10 seconds as online for polling transport
-          if (timeSinceLastPoll < 10000) {
-            polling_users_id.add(user_id);
+        // Non-destructive lease (SYNC_V2 R0). The entry used to be deleted on
+        // EVERY broadcast, fresh or not — so only the first broadcast after a
+        // poll saw the user as polling; every later one (until the next poll)
+        // found no entry, bucketed them offline and FCM'd a foreground poller.
+        // A stale lease, meanwhile, landed in NO bucket (no FCM at all).
+        // Now: a fresh poller stays in the polling bucket across broadcasts;
+        // only a STALE lease is evicted, and that user is offline.
+        const timeSinceLastPoll = poll_connection.last_poll_at
+          ? Date.now() - poll_connection.last_poll_at.getTime()
+          : Infinity;
+        // Consider users with a poll in the last 10 seconds as online for polling transport
+        if (timeSinceLastPoll < 10000) {
+          polling_users_id.add(user_id);
+          // A backgrounded app keeps polling until the OS freezes it, but
+          // notifications are painted only from FCM — push it too (client
+          // dedupes poll/FCM by id). Disjoint from offline, so no double-queue.
+          if (poll_connection.connection_status === "background") {
+            background_users_id.add(user_id);
           }
-          // remove the stale polling connections
+        } else {
+          // remove the stale polling connection — the user is offline
           polling_connections.delete(user_id);
+          offline_users_id.add(user_id);
         }
 
         // don't return as we yet to store message for polling users
@@ -256,9 +270,12 @@ const socket_message_handler = async (
       // ----------------------------------------------------
       case "connection:status": {
         // --------------------------------------------------
-        const result = await handle_connection_status(
-          message.payload as ConnectionStatusPayload,
-        );
+        // sender_id pinned to the authenticated id — the payload's must not be
+        // able to flip someone else's background flag / presence.
+        const result = await handle_connection_status({
+          ...(message.payload as ConnectionStatusPayload),
+          sender_id: user_id,
+        });
         if (!result.success) {
           // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
           await broadcast_message({
@@ -281,8 +298,9 @@ const socket_message_handler = async (
       // ----------------------------------------------------
       case "conversation:join": {
         // -------------------------------------------------- // case 'conversation:leave':
+        // Identity comes from the authenticated connection, never the payload.
         const result = await handle_conv_join(
-          message.payload as ConvJoinPayload,
+          { ...(message.payload as ConvJoinPayload), user_id },
           message.ws_timestamp,
         );
         if (!result.success) {
@@ -308,8 +326,9 @@ const socket_message_handler = async (
       // ----------------------------------------------------
       case "conversation:mark_read": {
         // --------------------------------------------------
+        // Identity comes from the authenticated connection, never the payload.
         const result = await handle_conv_mark_read(
-          message.payload as ConvJoinPayload,
+          { ...(message.payload as ConvJoinPayload), user_id },
           message.ws_timestamp,
         );
         if (!result.success) {
@@ -418,18 +437,18 @@ const socket_message_handler = async (
         // `default:` and was DROPPED as unhandled; only the HTTP route
         // actually deleted, so an offline delete died at the API gate and
         // was never replayed. soft_delete_message enforces sender
-        // ownership (unless elevated — the same client-supplied flag the
-        // HTTP route already trusts) and fans out via broadcast_deletion
+        // ownership + active membership (elevation is derived server-side
+        // from the authenticated user's role — the payload's
+        // is_admin_or_staff is ignored) and fans out via broadcast_deletion
         // (WS + FCM + last-msg/pin repoint), excluding the actor. Outbox
         // replays are idempotent: already-deleted rows match nothing, so
         // there is no double fan-out.
         const payload = message.payload as DeleteMessagePayload;
-        const elevated = (message.payload as any)?.is_admin_or_staff === true;
         const ids = Array.isArray(payload?.message_ids)
           ? payload.message_ids
           : [];
         if (ids.length > 0) {
-          await soft_delete_message(ids, user_id, elevated);
+          await soft_delete_message(ids, user_id);
         }
         break;
       }
@@ -439,26 +458,38 @@ const socket_message_handler = async (
         // --------------------------------------------------
         const payload = message.payload as MessagePinPayload;
 
-        // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        await broadcast_message({
-          to: "conversation",
-          conv_id: payload.conv_id,
-          message: {
-            type: "message:pin",
-            payload: payload,
-            ws_timestamp: new Date(),
-          },
-          exclude_user_ids: [payload.sender_id],
-        });
-
+        // validate → commit → broadcast ONCE (SYNC_V2 R0). The raw payload
+        // used to be re-broadcast here BEFORE validation/commit, so receivers
+        // applied pins that were then rejected (phantom pins / unpins). Now
+        // pin_message / unpin_message are the only broadcasters, and only of
+        // committed state. The actor is the AUTHENTICATED id of this
+        // connection, never payload.sender_id.
         const pin_data = {
           conv_id: payload.conv_id,
           message_id: payload.message_id,
-          user_id: payload.sender_id,
+          user_id: user_id,
         };
-        // update in DB
-        if (payload.pin) await pin_message(pin_data);
-        else await unpin_message(pin_data);
+        // update in DB (+ committed broadcast inside)
+        const result = payload.pin
+          ? await pin_message(pin_data)
+          : await unpin_message(pin_data);
+
+        if (!result.success) {
+          // Rejected (403/404/409/...) — nothing was broadcast; tell the actor only.
+          // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+          await broadcast_message({
+            to: "users",
+            user_ids: [user_id],
+            message: {
+              type: "socket:error",
+              payload: {
+                code: result.code || 500,
+                message: result.message || "Error handling message pin",
+              },
+              ws_timestamp: new Date(),
+            },
+          });
+        }
 
         break;
       }

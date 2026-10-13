@@ -364,6 +364,19 @@ const reset_unread = async (user_id: string, chat_id: string): Promise<void> => 
 };
 
 /**
+ * Set the unread count for a user in a specific chat to an absolute value.
+ * Used by the read handlers when the read watermark is NOT the chat's newest
+ * message, so a stale or replayed read can't zero messages that arrived after it.
+ */
+const set_unread = async (user_id: string, chat_id: string, count: number): Promise<void> => {
+  try {
+    await redis.hset(unread_key(user_id), chat_id, String(Math.max(0, count)));
+  } catch (err) {
+    console.error(`[CACHE] set_unread failed for user ${user_id}, chat ${chat_id}:`, err);
+  }
+};
+
+/**
  * Get unread count for a user in a specific chat.
  * Returns 0 if no entry exists (treated as "no unread").
  */
@@ -410,6 +423,7 @@ export {
   batch_increment_unread,
   batch_increment_unread_by,
   reset_unread,
+  set_unread,
   get_unread,
   get_all_unread,
 };

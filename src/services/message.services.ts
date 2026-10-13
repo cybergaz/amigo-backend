@@ -20,7 +20,7 @@ import {
 } from "@/types/chat.types";
 import { ResultType } from "@/types/core.types";
 import { ChatMessagePayload, MessagePinPayload, MessageReactPayload, } from "@/types/socket.types";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { randomUUIDv7 } from "bun";
 import {
   get_disappearing_after_sec,
@@ -208,6 +208,13 @@ const store_message_with_retry = async (payload: ChatMessagePayload, _retry_coun
 
 // Pin a message in a conversation — stores message_id in chat_model.pinned_msg_id
 // (only one pinned message per conversation; calling again overwrites the previous pin)
+//
+// validate → commit → broadcast ONCE the committed state (SYNC_V2 R0). The
+// write is a single conditional UPDATE: it only changes the row when the pin
+// actually moves (IS DISTINCT FROM — re-pinning the current pin is a no-op
+// with NO broadcast) and only to a stored, undeleted message of this chat.
+// `payload.user_id` must be the AUTHENTICATED id (ws.data / store), never a
+// client payload field — it is what receivers see as the actor.
 const pin_message = async (payload: PinMessageRequest) => {
   try {
     if (await is_broadcast_chat(payload.conv_id)) return { ...BROADCAST_UNSUPPORTED };
@@ -215,6 +222,7 @@ const pin_message = async (payload: PinMessageRequest) => {
     // Verify user is a member of the conversation
     const membership = await verify_user_membership(payload.conv_id, payload.user_id);
     if (!membership) {
+      console.warn(`[PIN] 403 pin conv=${payload.conv_id} msg=${payload.message_id} user=${payload.user_id}`);
       return {
         success: false,
         code: 403,
@@ -222,23 +230,40 @@ const pin_message = async (payload: PinMessageRequest) => {
       };
     }
 
-    // Verify message exists in this conversation and isn't deleted
-    const [message] = await db
-      .select({
-        id: message_model.id,
-        type: message_model.type,
-      })
-      .from(message_model)
+    // Atomic validate-and-commit: the target must be a stored, undeleted
+    // message of THIS chat, and the pin must actually change.
+    const [updated] = await db
+      .update(chat_model)
+      .set({ pinned_msg_id: payload.message_id })
       .where(
         and(
-          eq(message_model.id, payload.message_id),
-          eq(message_model.chat_id, payload.conv_id),
-          isNull(message_model.deleted_at)
+          eq(chat_model.id, payload.conv_id),
+          sql`${chat_model.pinned_msg_id} IS DISTINCT FROM ${payload.message_id}`,
+          sql`EXISTS (SELECT 1 FROM ${message_model} WHERE ${message_model.id} = ${payload.message_id} AND ${message_model.chat_id} = ${payload.conv_id} AND ${message_model.deleted_at} IS NULL)`
         )
       )
-      .limit(1);
+      .returning({ id: chat_model.id });
 
-    if (!message) {
+    if (!updated) {
+      // Nothing changed — classify: already pinned (no-op, success, nothing
+      // broadcast) vs. target not stored in this chat (404).
+      const [conv] = await db
+        .select({ pinned_msg_id: chat_model.pinned_msg_id })
+        .from(chat_model)
+        .where(eq(chat_model.id, payload.conv_id))
+        .limit(1);
+
+      if (conv && conv.pinned_msg_id === payload.message_id) {
+        console.log(`[PIN] noop pin conv=${payload.conv_id} msg=${payload.message_id}`);
+        return {
+          success: true,
+          code: 200,
+          message: "Message already pinned",
+          data: { conv_id: payload.conv_id, message_id: payload.message_id },
+        };
+      }
+
+      console.warn(`[PIN] 404 pin conv=${payload.conv_id} msg=${payload.message_id}`);
       return {
         success: false,
         code: 404,
@@ -246,29 +271,20 @@ const pin_message = async (payload: PinMessageRequest) => {
       };
     }
 
-    // Store the pinned message ID on the chat
-    const [updated] = await db
-      .update(chat_model)
-      .set({ pinned_msg_id: payload.message_id })
-      .where(eq(chat_model.id, payload.conv_id))
-      .returning({ id: chat_model.id });
+    // Message type for the broadcast payload (the row was just proven to exist).
+    const [message] = await db
+      .select({ type: message_model.type })
+      .from(message_model)
+      .where(eq(message_model.id, payload.message_id))
+      .limit(1);
 
-    if (!updated) {
-      return {
-        success: false,
-        code: 404,
-        message: "Coudn't pin the message",
-      };
-    }
+    console.log(`[PIN] applied pin conv=${payload.conv_id} msg=${payload.message_id}`);
 
-    // Fetch sender name for the broadcast payload
-    // const user = await get_user_info(payload.user_id);
-
-    // Broadcast pin event to all members of the conversation
+    // Broadcast the COMMITTED pin to all members of the conversation
     const pinPayload: MessagePinPayload = {
       conv_id: payload.conv_id,
       message_id: payload.message_id,
-      message_type: message.type as MessageType,
+      message_type: (message?.type ?? "text") as MessageType,
       sender_id: payload.user_id,
       // sender_name: user?.name ?? undefined,
       pin: true,
@@ -301,7 +317,9 @@ const pin_message = async (payload: PinMessageRequest) => {
 };
 
 // Unpin a message — clears chat_model.pinned_msg_id, but only if the
-// currently pinned message matches the requested message_id (idempotent guard).
+// currently pinned message matches the requested message_id. Atomic
+// compare-and-clear (UPDATE … WHERE pinned_msg_id = target) — the old
+// read-then-write let a stale unpin clear a pin set in between.
 const unpin_message = async (payload: PinMessageRequest) => {
   try {
     if (await is_broadcast_chat(payload.conv_id)) return { ...BROADCAST_UNSUPPORTED };
@@ -309,6 +327,7 @@ const unpin_message = async (payload: PinMessageRequest) => {
     // Verify user is a member of the conversation
     const membership = await verify_user_membership(payload.conv_id, payload.user_id);
     if (!membership) {
+      console.warn(`[PIN] 403 unpin conv=${payload.conv_id} msg=${payload.message_id} user=${payload.user_id}`);
       return {
         success: false,
         code: 403,
@@ -316,22 +335,21 @@ const unpin_message = async (payload: PinMessageRequest) => {
       };
     }
 
-    // Get current pinned_msg_id to verify it matches
-    const [conv] = await db
-      .select({ pinned_msg_id: chat_model.pinned_msg_id })
-      .from(chat_model)
-      .where(eq(chat_model.id, payload.conv_id))
-      .limit(1);
+    const [cleared] = await db
+      .update(chat_model)
+      .set({ pinned_msg_id: null })
+      .where(
+        and(
+          eq(chat_model.id, payload.conv_id),
+          eq(chat_model.pinned_msg_id, payload.message_id)
+        )
+      )
+      .returning({ id: chat_model.id });
 
-    if (!conv) {
-      return {
-        success: false,
-        code: 404,
-        message: "Conversation not found",
-      };
-    }
-
-    if (conv.pinned_msg_id !== payload.message_id) {
+    if (!cleared) {
+      // Not the current pin (already unpinned, or another message is pinned
+      // now) — nothing changes, nothing is broadcast. Same 409 as before.
+      console.warn(`[PIN] 409 unpin conv=${payload.conv_id} msg=${payload.message_id}`);
       return {
         success: false,
         code: 409,
@@ -346,16 +364,9 @@ const unpin_message = async (payload: PinMessageRequest) => {
       .where(eq(message_model.id, payload.message_id))
       .limit(1);
 
-    // Clear the pinned message
-    await db
-      .update(chat_model)
-      .set({ pinned_msg_id: null })
-      .where(eq(chat_model.id, payload.conv_id));
+    console.log(`[PIN] applied unpin conv=${payload.conv_id} msg=${payload.message_id}`);
 
-    // Fetch sender name for the broadcast payload
-    // const user = await get_user_info(payload.user_id);
-
-    // Broadcast unpin event to all members of the conversation
+    // Broadcast the COMMITTED unpin to all members of the conversation
     const unpinPayload: MessagePinPayload = {
       conv_id: payload.conv_id,
       message_id: payload.message_id,
@@ -432,8 +443,11 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: string) =
       };
     }
 
-    // Create new reply message — replied_to column stores the reference
-    const [replyMessage] = await db
+    // Create new reply message — replied_to column stores the reference.
+    // Idempotent on the client id, exactly like store_message (SYNC_V2 R0):
+    // a retried request used to hit the PK and come back 500. A duplicate
+    // returns the stored row and does NOT re-point the last message.
+    const [insertedReply] = await db
       .insert(message_model)
       .values({
         id: request.message_id,
@@ -444,7 +458,50 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: string) =
         attachments: request.attachments,
         replied_to: originalMessage.id,
       })
+      .onConflictDoNothing({ target: message_model.id })
       .returning();
+
+    if (!insertedReply) {
+      const [existing] = await db
+        .select()
+        .from(message_model)
+        .where(eq(message_model.id, request.message_id))
+        .limit(1);
+
+      if (!existing) {
+        return {
+          success: false,
+          code: 500,
+          message: "ERROR: reply_to_message",
+        };
+      }
+
+      // Only echo the row back when it's genuinely THIS sender's retry in
+      // this chat — otherwise a known id would leak someone else's message
+      // (incl. a deleted-for-everyone body) through the duplicate path.
+      if (
+        existing.sender_id !== user_id ||
+        existing.chat_id !== request.conversation_id ||
+        existing.deleted_at
+      ) {
+        console.warn(
+          `[reply-dup] id collision rejected id=${request.message_id} user=${user_id}`
+        );
+        return {
+          success: false,
+          code: 409,
+          message: "message id already exists",
+        };
+      }
+
+      return {
+        success: true,
+        code: 200,
+        message: "Reply already stored (duplicate send)",
+        data: existing,
+      };
+    }
+    const replyMessage = insertedReply;
 
     // Update the conversation's last-message pointer. Was Postgres-only, which
     // left the Redis preview showing the message this reply superseded; the

@@ -228,35 +228,42 @@ async function store_pending_message_for_users(
 }
 
 // ============================================================================
-// READ PATH — fetch pending messages for a user (3-tier fallthrough)
-//   1. LRU cache (fastest)
-//   2. Redis (if LRU miss)
-//   3. DB (if Redis miss)
+// READ PATH — fetch pending messages for a user (3-tier UNION)
+//   LRU ∪ Redis ∪ DB, deduped by correlation key.
 // After reading, messages are cleared from all tiers.
+//
+// SYNC_V2 R0: this used to be a fallthrough — Redis was read only when this
+// process's LRU was empty, and the DB only when Redis was empty too. The LRU
+// is PER PROCESS and the DB tier holds entries Redis no longer has (trimmed /
+// expired), so a non-empty upper tier SHADOWED entries that existed only below
+// it: they stayed undelivered until the upper tier happened to be empty.
+// Every tier is now read on every poll and merged.
 // ============================================================================
+
+// [POLL] cursor_would_drop counter (per process, since start).
+let cursor_would_drop_total = 0;
+
 async function fetch_pending_messages(
   user_id: string,
   after_message_id?: string,
 ): Promise<CachedPollMessage[]> {
 
-  // Map<message_id, CachedPollMessage> for dedup across tiers
-  let messages = new Map<string, CachedPollMessage>();
+  // Map<message_id, CachedPollMessage> for dedup across tiers. Merge order is
+  // DB → LRU → Redis, each overwriting the previous for the same correlation
+  // key: Redis is written synchronously by EVERY worker's fan-out, so for a
+  // self-compacting key (pin / react / user:update ...) it holds the latest
+  // version; this process's LRU can hold an older one written here before
+  // another worker overwrote it; the DB copy is a deferred snapshot.
+  const messages = new Map<string, CachedPollMessage>();
 
-  // --- Tier 1: LRU ---
-  const lru_map = polling_lru.get(user_id);
-  if (lru_map && lru_map.size > 0) {
-    lru_map.forEach((msg, id) => messages.set(id, msg));
-  } else {
-    // --- Tier 2: Redis ---
+  const redis_read = (async () => {
+    const out: [string, CachedPollMessage][] = [];
     try {
-      const key = redis_poll_key(user_id);
-      const raw_hash = await redis.hgetall(key);
-
-      if (raw_hash && Object.keys(raw_hash).length > 0) {
+      const raw_hash = await redis.hgetall(redis_poll_key(user_id));
+      if (raw_hash) {
         for (const [msg_id, str] of Object.entries(raw_hash)) {
           try {
-            const parsed = JSON.parse(str) as CachedPollMessage;
-            messages.set(msg_id, parsed);
+            out.push([msg_id, JSON.parse(str) as CachedPollMessage]);
           } catch (err) {
             console.error(`[POLL-CACHE] Error parsing Redis message for user ${user_id}:`, err);
           }
@@ -265,44 +272,82 @@ async function fetch_pending_messages(
     } catch (err) {
       console.error(`[POLL-CACHE] Redis read error for user ${user_id}:`, err);
     }
+    return out;
+  })();
 
-    // --- Tier 3: DB (only if Redis was also empty) ---
-    if (messages.size === 0) {
-      try {
-        const db_messages = await db
-          .select()
-          .from(missed_ws_messages_model)
-          .where(eq(missed_ws_messages_model.user_id, user_id))
-          .orderBy(asc(missed_ws_messages_model.created_at))
-          .limit(MAX_MESSAGES_PER_USER);
+  const db_read = (async () => {
+    const out: [string, CachedPollMessage][] = [];
+    try {
+      const db_messages = await db
+        .select()
+        .from(missed_ws_messages_model)
+        .where(eq(missed_ws_messages_model.user_id, user_id))
+        .orderBy(asc(missed_ws_messages_model.created_at))
+        .limit(MAX_MESSAGES_PER_USER);
 
-        for (const row of db_messages) {
-          messages.set(row.id, {
-            message_id: row.id,
-            ws_message: row.ws_message as VitalWSMessage,
-            created_at: new Date(row.created_at).getTime(),
-          });
-        }
-      } catch (err) {
-        console.error(`[POLL-CACHE] DB read error for user ${user_id}:`, err);
+      for (const row of db_messages) {
+        out.push([row.id, {
+          message_id: row.id,
+          ws_message: row.ws_message as VitalWSMessage,
+          created_at: new Date(row.created_at).getTime(),
+        }]);
       }
+    } catch (err) {
+      console.error(`[POLL-CACHE] DB read error for user ${user_id}:`, err);
     }
-  }
+    return out;
+  })();
 
-  // Remove from all 3 tiers upon fetching success — batched: one variadic
-  // HDEL + one IN-list DB delete instead of 2 round trips per entry (a
-  // 500-entry backlog used to cost ~1000 sequential ops per poll).
-  await remove_pending_messages_batch(user_id, Array.from(messages.keys()));
+  const [redis_entries, db_entries] = await Promise.all([redis_read, db_read]);
+
+  // --- Tier 3: DB ---
+  for (const [id, msg] of db_entries) messages.set(id, msg);
+  // --- Tier 1: LRU ---
+  const lru_map = polling_lru.get(user_id);
+  if (lru_map && lru_map.size > 0) {
+    lru_map.forEach((msg, id) => messages.set(id, msg));
+  }
+  // --- Tier 2: Redis ---
+  for (const [id, msg] of redis_entries) messages.set(id, msg);
 
   // Replay order: created_at, with conversation:new first on a same-ms tie
   // (see pending-order.utils — e.g. a new DM's conversation:new and its first
-  // message:new). Then filter by after_message_id if provided (cursor-based
-  // pagination).
-  let result = sort_pending_for_replay(Array.from(messages.values()));
+  // message:new).
+  const sorted = sort_pending_for_replay(Array.from(messages.values()));
+
+  // Cap one response at MAX_MESSAGES_PER_USER, oldest first: the tier union
+  // can reach ~1000 entries, and poll v1 deletes on read, so a bigger
+  // response lost mid-transfer on flaky wifi is lost for good. The rest stays
+  // queued for the next poll (same size as the old one-tier-per-poll read).
+  const result = sorted.length > MAX_MESSAGES_PER_USER
+    ? sorted.slice(0, MAX_MESSAGES_PER_USER)
+    : sorted;
+  if (result.length < sorted.length) {
+    console.log(
+      `[POLL] capped user=${user_id} returned=${result.length} remaining=${sorted.length - result.length}`,
+    );
+  }
+
+  // Remove the RETURNED entries from all 3 tiers — batched: one variadic
+  // HDEL + one IN-list DB delete instead of 2 round trips per entry (a
+  // 500-entry backlog used to cost ~1000 sequential ops per poll).
+  await remove_pending_messages_batch(user_id, result.map(m => m.message_id));
+
+  // Cursor (after_message_id): NO slicing (SYNC_V2 R0). Everything above was
+  // just DELETED from every tier, so slicing "after the cursor" dropped the
+  // entries at/before it for good. The cursor entry can only still be in the
+  // queue because it was RE-STORED after the client saw it (a self-compacting
+  // key such as message:pin / message:react / user:update overwritten with a
+  // newer state, or a sibling worker's deferred DB write) — so it and the
+  // entries sorted before it are new to the client. Return them all; client
+  // handlers are idempotent per id. Counted so the old loss is visible.
   if (after_message_id) {
     const idx = result.findIndex(m => m.message_id === after_message_id);
     if (idx !== -1) {
-      result = result.slice(idx + 1);
+      cursor_would_drop_total += idx + 1;
+      console.warn(
+        `[POLL] cursor_would_drop user=${user_id} n=${idx + 1} of=${result.length} total=${cursor_would_drop_total}`,
+      );
     }
   }
 

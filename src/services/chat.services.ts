@@ -316,6 +316,10 @@ const get_pinned_message_map = async (pinned_ids: string[]) => {
   return result;
 };
 
+// [META] counter: chat-list rows whose Redis chat_meta disagreed with the PG
+// last_msg_id pointer (per process, since start).
+let chat_meta_mismatch_total = 0;
+
 const get_chat_list = async (user_id: string, type: string) => {
   try {
     // ── Single query: my memberships → chats, with DM peer via self-join ──
@@ -492,12 +496,30 @@ const get_chat_list = async (user_id: string, type: string) => {
     // last_msg_id, and it keeps the post-cache-wipe cost flat no matter how
     // much history a chat holds. Only pointer-less chats (rows predating the
     // pointer writeback) fall back to scanning for their newest message.
+    //
+    // PG pointer is the truth (SYNC_V2 R0, §3.5): the Redis hash is
+    // last-writer-wins while chats.last_msg_id only moves forward, so a cached
+    // row is used ONLY when its id equals the PG pointer. On disagreement the
+    // cached row is dropped and the chat goes through the pointer lookup like
+    // a miss — so lastMessage.id == lastMsgId always holds (old clients too).
     const pointer_ids: string[] = [];
     const scan_chat_ids: string[] = [];
+    let meta_mismatch = 0;
     for (const chat of chats) {
-      if (chat_metas.get(chat.conversationId)) continue; // cache hit
+      const cached = chat_metas.get(chat.conversationId);
+      if (cached) {
+        if (!chat.lastMsgId || cached.id === chat.lastMsgId) continue; // cache hit
+        meta_mismatch++;
+        chat_metas.delete(chat.conversationId);
+      }
       if (chat.lastMsgId) pointer_ids.push(chat.lastMsgId);
       else scan_chat_ids.push(chat.conversationId);
+    }
+    if (meta_mismatch > 0) {
+      chat_meta_mismatch_total += meta_mismatch;
+      console.warn(
+        `[META] meta_vs_pg_mismatch user=${user_id} chats=${meta_mismatch} total=${chat_meta_mismatch_total}`,
+      );
     }
 
     if (pointer_ids.length > 0 || scan_chat_ids.length > 0) {
@@ -1133,12 +1155,72 @@ const broadcast_deletion = async (
   }
 };
 
-const soft_delete_message = async (message_ids: string[], user_id: string, is_admin_or_staff?: boolean) => {
+// Delete-for-everyone authority, derived SERVER-SIDE from the authenticated
+// user (SYNC_V2 R0, §3.3.6). The client-sent `is_admin_or_staff` flag used to be
+// trusted outright — any client could set it and delete anyone's message in
+// any chat. Now, per chat:
+//   - master (global 'admin' | 'sub_admin'): may delete any message, member
+//     or not (mirrors group-caps' master rule);
+//   - otherwise the actor must be an ACTIVE member of the chat, and may delete
+//     their own messages — plus anyone's when they are the chat's owner, a
+//     group admin (chat_members.role 'admin'), or global 'staff' (the same
+//     people the app already offers "delete for everyone" on others' messages).
+const resolve_delete_authority = async (user_id: string, chat_ids: string[]) => {
+  const [actor] = await db
+    .select({ role: user_model.role })
+    .from(user_model)
+    .where(eq(user_model.id, user_id))
+    .limit(1);
+  const global_role = actor?.role ?? null;
+  const is_master = global_role === "admin" || global_role === "sub_admin";
+  const is_staff = global_role === "staff";
+
+  // chat_id → may this actor delete OTHER people's messages there?
+  const member_chats = new Map<string, boolean>();
+  if (!is_master && chat_ids.length > 0) {
+    const rows = await db
+      .select({
+        chat_id: chat_member_model.chat_id,
+        role: chat_member_model.role,
+        owner_id: chat_model.owner_id,
+      })
+      .from(chat_member_model)
+      .innerJoin(chat_model, eq(chat_model.id, chat_member_model.chat_id))
+      .where(
+        and(
+          eq(chat_member_model.user_id, user_id),
+          inArray(chat_member_model.chat_id, chat_ids),
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active"),
+        )
+      );
+    for (const r of rows) {
+      if (!r.chat_id) continue;
+      member_chats.set(
+        r.chat_id,
+        is_staff || r.role === "admin" || r.owner_id?.toLowerCase() === user_id.toLowerCase(),
+      );
+    }
+  }
+
+  const can_delete = (m: { chat_id: string; sender_id: string | null; }) => {
+    if (is_master) return true;
+    const can_delete_others = member_chats.get(m.chat_id);
+    if (can_delete_others === undefined) return false; // not an active member
+    return can_delete_others || m.sender_id?.toLowerCase() === user_id.toLowerCase();
+  };
+
+  return { is_master, can_delete };
+};
+
+// `message_ids` may span chats; authority is checked per message's chat (see
+// resolve_delete_authority). No client-supplied elevation is accepted.
+const soft_delete_message = async (message_ids: string[], user_id: string) => {
   try {
     // First, get the messages to retrieve chat_id and check if they exist.
-    // Already-deleted rows are read too (same single query, same ownership
+    // Already-deleted rows are read too (same single query, same authority
     // rule) — only so the broadcast cascade below can be HEALED: see there.
-    const requested = await db
+    const fetched = await db
       .select({
         id: message_model.id,
         chat_id: message_model.chat_id,
@@ -1146,10 +1228,17 @@ const soft_delete_message = async (message_ids: string[], user_id: string, is_ad
         deleted_at: message_model.deleted_at,
       })
       .from(message_model)
-      .where(and(
-        inArray(message_model.id, message_ids),
-        !is_admin_or_staff ? eq(message_model.sender_id, user_id) : undefined,
-      ));
+      .where(inArray(message_model.id, message_ids));
+    const authority = await resolve_delete_authority(
+      user_id,
+      [...new Set(fetched.map(m => m.chat_id))],
+    );
+    const requested = fetched.filter(m => authority.can_delete(m));
+    if (requested.length < fetched.length) {
+      console.warn(
+        `[DELETE] refused ${fetched.length - requested.length}/${fetched.length} message(s) for user ${user_id} (not sender / not member / not elevated)`,
+      );
+    }
     const messagesToDelete = requested.filter(m => m.deleted_at === null);
 
     // Delete-for-everyone of a broadcast-list message also deletes every copy
@@ -1188,9 +1277,9 @@ const soft_delete_message = async (message_ids: string[], user_id: string, is_ad
       .update(message_model)
       .set({ deleted_at: new Date() })
       .where(and(
-        inArray(message_model.id, message_ids),
+        // Only the rows the authority check above admitted.
+        inArray(message_model.id, messagesToDelete.map(m => m.id)),
         isNull(message_model.deleted_at),
-        !is_admin_or_staff ? eq(message_model.sender_id, user_id) : undefined,
       ))
       .returning();
 
@@ -1225,7 +1314,7 @@ const soft_delete_message = async (message_ids: string[], user_id: string, is_ad
     ];
     if (broadcast_msg_ids.length > 0) {
       try {
-        const copies = await soft_delete_broadcast_copies(broadcast_msg_ids, user_id, is_admin_or_staff);
+        const copies = await soft_delete_broadcast_copies(broadcast_msg_ids, user_id, authority.is_master);
         const by_dm = new Map<string, string[]>();
         for (const c of copies) {
           const list = by_dm.get(c.chat_id) ?? [];
@@ -1482,7 +1571,10 @@ const get_conversation_history = async (
         sender_profile_pic: user_model.profile_pic,
       })
       .from(message_model)
-      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+      // LEFT JOIN (SYNC_V2 R0): an INNER join silently dropped every sender-less
+      // row — system messages (sender_id NULL) and messages whose sender's
+      // account was deleted (FK ON DELETE SET NULL) — from history.
+      .leftJoin(user_model, eq(user_model.id, message_model.sender_id))
       .leftJoin(delete_for_me, eq(delete_for_me.message_id, message_model.id))
       .where(
         and(
@@ -1874,6 +1966,8 @@ const get_messages_around = async (
       ? not(inArray(message_model.id, deletedMessageIds))
       : undefined;
 
+    // Steps 4-6 LEFT JOIN the sender (SYNC_V2 R0) so system / sender-less
+    // rows are not dropped from the window (an INNER join removed them).
     // 4. Fetch `before` messages with created_at < target
     const olderMessages = await db
       .select({
@@ -1891,7 +1985,7 @@ const get_messages_around = async (
         sender_profile_pic: user_model.profile_pic,
       })
       .from(message_model)
-      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+      .leftJoin(user_model, eq(user_model.id, message_model.sender_id))
       .where(
         and(
           eq(message_model.chat_id, conversation_id),
@@ -1921,7 +2015,7 @@ const get_messages_around = async (
         sender_profile_pic: user_model.profile_pic,
       })
       .from(message_model)
-      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+      .leftJoin(user_model, eq(user_model.id, message_model.sender_id))
       .where(
         and(
           eq(message_model.chat_id, conversation_id),
@@ -1951,7 +2045,7 @@ const get_messages_around = async (
         sender_profile_pic: user_model.profile_pic,
       })
       .from(message_model)
-      .innerJoin(user_model, eq(user_model.id, message_model.sender_id))
+      .leftJoin(user_model, eq(user_model.id, message_model.sender_id))
       .where(eq(message_model.id, message_id))
       .limit(1);
 
@@ -1968,6 +2062,11 @@ const get_messages_around = async (
         members,
         hasOlder: olderMessages.length === before,
         hasNewer: newerMessages.length === after,
+        // snake_case twins (SYNC_V2 R0) — the app's MessagesAroundResponse
+        // reads `has_older` / `has_newer`; the camelCase keys stay for any
+        // client already reading them.
+        has_older: olderMessages.length === before,
+        has_newer: newerMessages.length === after,
       },
     };
   } catch (error) {

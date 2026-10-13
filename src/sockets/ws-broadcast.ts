@@ -55,7 +55,11 @@ sub.on("message", (channel, raw) => {
         setTimeout(() => {
           if (conn.ws.readyState === 1) {
             conn.ws.close(4003, "Logged out due to new login on another device");
-            socket_connections.delete(user_id);
+            // Compare-and-delete (SYNC_V2 R0): the new device's socket can
+            // register inside this 100ms window — never evict it.
+            if (socket_connections.get(user_id)?.ws.raw === conn.ws.raw) {
+              socket_connections.delete(user_id);
+            }
           }
         }, 100);
       }

@@ -3,7 +3,7 @@ import LRUCache from '@/utils/cache.utils';
 import { get_new_redis_client, redis } from '@/config/redis';
 import db from '@/config/db';
 import { chat_member_model } from '@/models/chat.model';
-import { and, eq, isNull } from 'drizzle-orm';
+import { and, count, eq, isNotNull, isNull } from 'drizzle-orm';
 
 if (!process.env.REDIS_URL) {
   throw new Error("REDIS_URL is not defined in environment variables can't proceed");
@@ -28,6 +28,21 @@ const USER_CONV_LRU_TTL_MS = 5 * 60 * 1000;     // 5 min
 
 const conv_members_key = (chat_id: string) => `conv:${chat_id}:members`;
 const user_conv_key = (user_id: string) => `user_conv:${user_id}`;
+
+// SADD only into a set that already EXISTS (SYNC_V2 R0, INV-FANOUT-1).
+// get_conversation_members / get_user_conversations trust ANY non-empty cached
+// set with no DB fallback, so SADDing into an expired/missing key created a
+// PARTIAL set (just the users being added) that silently dropped every other
+// member from fan-out, the pending queue and FCM for up to 24h. On a miss we
+// do nothing: the next read rebuilds the full set from PG. EXISTS + SADD +
+// EXPIRE run as one script so the key can't expire between check and write.
+// KEYS[1] = set key; ARGV[1] = ttl seconds; ARGV[2..] = members.
+const SADD_IF_EXISTS_LUA = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+for i = 2, #ARGV do redis.call('SADD', KEYS[1], ARGV[i]) end
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return 1
+`;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Pub/sub invalidation
@@ -87,6 +102,38 @@ const publish_user_conv_invalidation = async (user_id: string): Promise<void> =>
 // Reads (3-tier)
 // ────────────────────────────────────────────────────────────────────────────
 
+// [MEMBERS] scard_vs_pg_mismatch — a cached Redis member set whose size differs
+// from the active PG membership (partial set from an old SADD-into-missing-key,
+// a lost SREM, ...). Sampled on Redis hits so the hot path pays nothing; one
+// indexed COUNT per sample. Log only — the next expiry/invalidation heals it.
+const MEMBERS_DRIFT_SAMPLE_RATE = 0.01;
+let members_drift_count = 0;
+
+const check_members_drift = async (conv_id: string, cached_size: number): Promise<void> => {
+  try {
+    const [row] = await db
+      .select({ n: count() })
+      .from(chat_member_model)
+      .where(
+        and(
+          eq(chat_member_model.chat_id, conv_id),
+          isNull(chat_member_model.removed_at),
+          eq(chat_member_model.status, "active"),
+          isNotNull(chat_member_model.user_id)
+        )
+      );
+    const pg_size = Number(row?.n ?? 0);
+    if (pg_size !== cached_size) {
+      members_drift_count++;
+      console.warn(
+        `[MEMBERS] scard_vs_pg_mismatch conv=${conv_id} redis=${cached_size} pg=${pg_size} total=${members_drift_count}`,
+      );
+    }
+  } catch (err) {
+    console.error(`[MEMBERS] drift check failed (${conv_id}):`, err);
+  }
+};
+
 const get_conversation_members = async (conv_id: string): Promise<Set<string>> => {
   const cached = conv_user_cache.get(conv_id);
   if (cached !== null) return cached;
@@ -98,6 +145,10 @@ const get_conversation_members = async (conv_id: string): Promise<Set<string>> =
     let members: Set<string>;
     if (member_strings.length > 0) {
       members = new Set<string>(member_strings);
+      // Sampled drift check (SYNC_V2 R0 counter) — off the hot path.
+      if (Math.random() < MEMBERS_DRIFT_SAMPLE_RATE) {
+        void check_members_drift(conv_id, members.size);
+      }
     } else {
       const db_members = await db
         .select({ user_id: chat_member_model.user_id })
@@ -213,10 +264,8 @@ const is_member = async (user_id: string, chat_id: string): Promise<boolean> => 
 const add_member = async (user_id: string, chat_id: string): Promise<void> => {
   try {
     const pipe = redis.pipeline();
-    pipe.sadd(conv_members_key(chat_id), user_id);
-    pipe.expire(conv_members_key(chat_id), REDIS_TTL_SEC);
-    pipe.sadd(user_conv_key(user_id), chat_id);
-    pipe.expire(user_conv_key(user_id), REDIS_TTL_SEC);
+    pipe.eval(SADD_IF_EXISTS_LUA, 1, conv_members_key(chat_id), REDIS_TTL_SEC, user_id);
+    pipe.eval(SADD_IF_EXISTS_LUA, 1, user_conv_key(user_id), REDIS_TTL_SEC, chat_id);
     await pipe.exec();
 
     conv_user_cache.delete(chat_id);
@@ -232,11 +281,9 @@ const add_members = async (user_ids: string[], chat_id: string): Promise<void> =
   if (user_ids.length === 0) return;
   try {
     const pipe = redis.pipeline();
-    pipe.sadd(conv_members_key(chat_id), ...user_ids);
-    pipe.expire(conv_members_key(chat_id), REDIS_TTL_SEC);
+    pipe.eval(SADD_IF_EXISTS_LUA, 1, conv_members_key(chat_id), REDIS_TTL_SEC, ...user_ids);
     for (const uid of user_ids) {
-      pipe.sadd(user_conv_key(uid), chat_id);
-      pipe.expire(user_conv_key(uid), REDIS_TTL_SEC);
+      pipe.eval(SADD_IF_EXISTS_LUA, 1, user_conv_key(uid), REDIS_TTL_SEC, chat_id);
     }
     await pipe.exec();
 
@@ -265,11 +312,9 @@ const add_members_bulk = async (
     const touched_users = new Set<string>();
     const pipe = redis.pipeline();
     for (const { chat_id, user_ids } of work) {
-      pipe.sadd(conv_members_key(chat_id), ...user_ids);
-      pipe.expire(conv_members_key(chat_id), REDIS_TTL_SEC);
+      pipe.eval(SADD_IF_EXISTS_LUA, 1, conv_members_key(chat_id), REDIS_TTL_SEC, ...user_ids);
       for (const uid of user_ids) {
-        pipe.sadd(user_conv_key(uid), chat_id);
-        pipe.expire(user_conv_key(uid), REDIS_TTL_SEC);
+        pipe.eval(SADD_IF_EXISTS_LUA, 1, user_conv_key(uid), REDIS_TTL_SEC, chat_id);
         touched_users.add(uid);
       }
     }

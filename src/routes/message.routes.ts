@@ -162,10 +162,12 @@ export const message_routes = new Elysia({ prefix: "/message" })
 
 
   .delete("/soft-delete", async ({ set, store, body }) => {
+    // `is_admin_or_staff` is still accepted (old clients send it) but IGNORED:
+    // delete authority is derived server-side from the authenticated user's
+    // role + chat membership (soft_delete_message → resolve_delete_authority).
     const delete_result = await soft_delete_message(
       body.message_ids,
       store.id,
-      body.is_admin_or_staff ?? false
     );
     set.status = delete_result.code;
     return delete_result;

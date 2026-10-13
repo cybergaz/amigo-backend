@@ -5,6 +5,7 @@ import {
   DBUpdateMessageStatusType,
   DBInsertMessageStatusType,
 } from "@/models/message.model";
+import { chat_member_model } from "@/models/chat.model";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import { remove_pending_messages_batch } from "@/cache-management/polling.cache";
 import Snowflake from "@/utils/snowflake.utils";
@@ -130,6 +131,38 @@ const update_message_status = async (msg_status: DBUpdateMessageStatusType) => {
       message: "ERROR: update_message_status",
     };
   }
+};
+
+// Delivered receipt as an UPSERT (SYNC_V2 R0). The FCM delivered path
+// (/message/delivered, /delivered/batch) used update_message_status, which is
+// UPDATE-only: when no message_info row existed yet for (message, recipient) —
+// the usual case for a push-delivered message — the receipt matched nothing
+// and was silently lost (Read-by / ticks never showed "delivered"). Now the
+// row is inserted when missing. delivered_at is fill-a-blank (COALESCE): a
+// replayed or late receipt never moves an existing delivery time. Only an
+// active member of the chat (unremoved AND status='active' — left/pending
+// keep removed_at NULL) gets a row created.
+const upsert_message_delivered = async (
+  message_id: string,
+  chat_id: string,
+  user_id: string,
+  at: Date,
+): Promise<number> => {
+  const at_iso = at.toISOString();
+  const result = await db.execute(sql`
+    INSERT INTO ${message_info_model} (message_id, user_id, chat_id, delivered_at)
+    SELECT ${message_id}::uuid, ${user_id}::uuid, ${chat_id}::uuid, ${at_iso}::timestamptz
+    WHERE EXISTS (
+      SELECT 1 FROM ${chat_member_model} cm
+      WHERE cm.chat_id = ${chat_id}::uuid
+        AND cm.user_id = ${user_id}::uuid
+        AND cm.removed_at IS NULL
+        AND cm.status = 'active'
+    )
+    ON CONFLICT (message_id, user_id) DO UPDATE
+      SET delivered_at = COALESCE(${message_info_model.delivered_at}, EXCLUDED.delivered_at)
+  `);
+  return (result as any)?.count ?? (result as any)?.rowCount ?? 0;
 };
 
 const batch_insert_message_status = async (
@@ -264,12 +297,14 @@ const mark_message_delivered = async (
     const sender_id = message.sender_id;
     const now = new Date();
 
-    const res = await update_message_status({
-      message_id: message_id,
-      user_id: recipient_id,
-      delivered_at: now,
-      // ...(is_active_in_conv && { read_at: now }),
-    });
+    // Upsert, not UPDATE-only — see upsert_message_delivered. A recipient
+    // never gets a receipt row for their own message.
+    if (sender_id !== recipient_id) {
+      const rows = await upsert_message_delivered(message_id, conversation_id, recipient_id, now);
+      if (rows === 0) {
+        console.warn(`[STATUS] delivered upsert skipped (not a member) msg=${message_id} chat=${conversation_id} user=${recipient_id}`);
+      }
+    }
 
     // const ack_payload: MessageStatusAckPayload = {
     //   id: message_id,

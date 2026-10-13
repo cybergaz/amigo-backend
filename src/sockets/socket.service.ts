@@ -13,7 +13,7 @@ import {
 } from "@/types/socket.types";
 import { broadcast_message, is_user_online } from "./socket.handlers";
 // import { update_user_connection_status } from "@/services/user.services";
-import { socket_connections } from "./socket.server";
+import { socket_connections, polling_connections } from "./socket.server";
 import {
   forward_messages,
   store_message_with_retry,
@@ -25,6 +25,7 @@ import {
   batch_increment_unread,
   batch_increment_unread_by,
   reset_unread,
+  set_unread,
 } from "@/cache-management/chat-meta.cache";
 import db from "@/config/db";
 import { chat_model, chat_member_model } from "@/models/chat.model";
@@ -75,6 +76,13 @@ const handle_connection_status = async (
     if (connection) {
       connection.is_background = payload.status === "background";
     }
+    // Same flag on the polling lease (SYNC_V2 R0): the lease is no longer
+    // evicted per broadcast, so a backgrounded poller would otherwise sit in
+    // the polling bucket and never get an FCM push. 'online' clears it.
+    const poll_connection = polling_connections.get(payload.sender_id);
+    if (poll_connection) {
+      poll_connection.connection_status = payload.status;
+    }
 
     const connected_users = await get_user_peers(payload.sender_id);
     const message_payload: ConnectionStatusPayload = {
@@ -113,6 +121,45 @@ const handle_connection_status = async (
   }
 };
 
+// Cap for the recount below: the badge only needs "how many", and a reader
+// this far behind is shown 99+ anyway.
+const UNREAD_RECOUNT_CAP = 1000;
+
+// Reset this user's unread for a chat up to the given read watermark.
+// The old behaviour was an unconditional reset to 0, so a delayed or replayed
+// join/mark_read (outbox replay after reconnect) zeroed the badge for messages
+// that arrived AFTER the watermark. Now: recount the messages from others that
+// are newer than the watermark and store that. Unknown watermark (e.g. the
+// reader's own not-yet-stored message) keeps the old reset-to-0 behaviour.
+const reset_unread_upto = async (
+  user_id: string,
+  conv_id: string,
+  last_read_msg_id: string,
+): Promise<void> => {
+  try {
+    const rows = await db.execute<{ found: boolean; n: number }>(sql`
+      SELECT EXISTS (SELECT 1 FROM ${message_model} WHERE ${message_model.id} = ${last_read_msg_id}) AS found,
+             (SELECT count(*)::int FROM (
+                SELECT 1 FROM ${message_model}
+                 WHERE ${message_model.chat_id} = ${conv_id}
+                   AND ${message_model.deleted_at} IS NULL
+                   AND ${message_model.sender_id} IS DISTINCT FROM ${user_id}::uuid
+                   AND ${message_model.sent_at} > (SELECT ${message_model.sent_at} FROM ${message_model} WHERE ${message_model.id} = ${last_read_msg_id} LIMIT 1)
+                 LIMIT ${UNREAD_RECOUNT_CAP}
+             ) newer) AS n`);
+    const row = rows[0];
+    if (!row?.found || !row.n) {
+      await reset_unread(user_id, conv_id);
+      return;
+    }
+    console.log(`[UNREAD] stale read watermark user=${user_id} chat=${conv_id} kept=${row.n}`);
+    await set_unread(user_id, conv_id, row.n);
+  } catch (err) {
+    console.error(`[UNREAD] reset_unread_upto failed (${user_id}, ${conv_id}):`, err);
+    await reset_unread(user_id, conv_id);
+  }
+};
+
 const handle_conv_join = async (
   payload: ConvJoinPayload,
   timestamp?: Date | string,
@@ -146,8 +193,8 @@ const handle_conv_join = async (
       effective_ts,
     );
 
-    // reset the unread count for this user - conversation
-    reset_unread(payload.user_id, payload.conv_id);
+    // reset the unread count for this user - conversation, up to the watermark
+    reset_unread_upto(payload.user_id, payload.conv_id, payload.last_read_msg_id);
 
     // Pin the user's currently-active conversation on their socket connection so
     // handle_message_new can skip incrementing unread for them while they're here.
@@ -260,7 +307,7 @@ const handle_conv_mark_read = async (
       effective_ts,
     );
 
-    reset_unread(payload.user_id, payload.conv_id);
+    reset_unread_upto(payload.user_id, payload.conv_id, payload.last_read_msg_id);
 
     mark_read_upto(
       payload.user_id,
@@ -1045,11 +1092,11 @@ const handle_message_forward = async (
         // const conv_members = await get_conversation_members(conv_id);
 
         // Presence buckets for this conversation, captured from the FIRST
-        // broadcast only. broadcast_message evicts polling connections as a
-        // side effect (socket.handlers `polling_connections.delete` runs
-        // outside the 10s-freshness branch), so only the first call in a burst
-        // buckets polling recipients correctly — every later one reports them
-        // as offline, which would send them FCM pushes they must not get.
+        // broadcast only. broadcast_message used to evict polling connections
+        // as a side effect on every call, so only the first call in a burst
+        // bucketed polling recipients correctly. Since SYNC_V2 R0 the lease is
+        // non-destructive (only a stale lease is evicted), but one bucketing
+        // per burst stays: it keeps one FCM decision for the whole burst.
         let presence: Awaited<ReturnType<typeof broadcast_message>> | null = null;
 
         // loop on all forward message in that target conversation

@@ -329,6 +329,19 @@ const web_socket_server = new Elysia({
     close: async (ws) => {
       const user_id = get_ws_data(ws, "user_id") as string;
       if (user_id) {
+        // Compare-and-delete (SYNC_V2 R0): only evict the entry if it is THIS
+        // socket. On a reconnect the new socket's `open` overwrites the entry
+        // before the old socket's close lands; an unconditional delete evicted
+        // the live socket (its frames then went nowhere) and the debounce below
+        // broadcast "offline" for a user who was online. Elysia wraps the Bun
+        // socket in a fresh ElysiaWS per callback, so compare the raw socket.
+        const current = socket_connections.get(user_id);
+        if (current && current.ws.raw !== ws.raw) {
+          console.log(
+            `[WS] close of a superseded socket for user ${user_id} — live socket kept, no offline broadcast`,
+          );
+          return;
+        }
         socket_connections.delete(user_id);
 
         // CALLS — INSTANT, no debounce. If this user was in a CONNECTED call,
@@ -416,6 +429,14 @@ function startHeartbeat() {
 
         try {
           const connected_users = await get_user_peers(user_id);
+          // Reconnected during the await (SYNC_V2 R0) — same check as the
+          // close-handler debounce; don't announce a live user offline.
+          if (socket_connections.has(user_id)) {
+            console.log(
+              `[WS-HEARTBEAT] User ${user_id} reconnected, skipping offline broadcast`,
+            );
+            return;
+          }
           const message_payload: ConnectionStatusPayload = {
             sender_id: user_id,
             status: "offline",
