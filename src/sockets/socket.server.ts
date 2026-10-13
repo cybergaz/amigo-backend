@@ -41,7 +41,7 @@ const polling_connections = new Map<string, PollingConnection>(); // user_id -> 
 // Heartbeat: client pings every 12s, server checks every 15s, 2 missed = ~24-27s detection
 const HEARTBEAT_INTERVAL_MS = 15000;
 const MAX_MISSED_PINGS = 2;
-const STATS_LOGGING_INTERVAL_MS = 60000;
+const STATS_LOGGING_INTERVAL_MS = 600000;
 const OFFLINE_STATUS_BROADCAST_DELAY_MS = 8000;
 const SOCKET_PORT = parseInt(process.env.SOCKET_PORT || "5002");
 
