@@ -34,6 +34,7 @@ import {
   MessageSentAckPayload,
   NewConversationPayload,
 } from "@/types/socket.types";
+import { track } from "@/cluster/lifecycle";
 
 // ============================================================================
 // Broadcast lists (WhatsApp-style) — see BROADCAST_LISTS.md for the contract.
@@ -856,6 +857,9 @@ const enqueue_sender_fanout = (sender_id: string, job: () => Promise<void>): Pro
     .then(job)
     .catch((err) => console.error(`[BROADCAST] fan-out failed (sender ${sender_id}):`, err));
   sender_fanout_tail.set(sender_id, next);
+  // The sender already has its ack; a restart must not drop the copies
+  // mid-fan-out, so the drain awaits this (SYNC_V2 B6).
+  track(next);
   void next.then(() => {
     if (sender_fanout_tail.get(sender_id) === next) sender_fanout_tail.delete(sender_id);
   });

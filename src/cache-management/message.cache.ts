@@ -312,7 +312,7 @@ const DEFAULT_MESSAGE_BATCH_SIZE = 500;
 const start_message_flush_worker = (
   flush: MessageFlushFn,
   opts: { interval_ms?: number; batch_size?: number } = {},
-): (() => void) => {
+): (() => Promise<void>) => {
   const interval_ms = opts.interval_ms ?? DEFAULT_MESSAGE_FLUSH_INTERVAL_MS;
   const batch_size = opts.batch_size ?? DEFAULT_MESSAGE_BATCH_SIZE;
   let running = false;
@@ -349,9 +349,13 @@ const start_message_flush_worker = (
   };
 
   schedule();
-  return () => {
+  // Resolves once a batch already in flight has finished (SYNC_V2 §13.9.3
+  // "stop timers, await running loops"): a drain must not close the PG pool
+  // under a half-written flush. Existing callers ignore the promise.
+  return async () => {
     stopped = true;
     if (timer) clearTimeout(timer);
+    while (running) await Bun.sleep(25);
   };
 };
 

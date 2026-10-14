@@ -2,10 +2,12 @@ import db from "@/config/db";
 import { chat_member_model } from "@/models/chat.model";
 import { start_receipt_flush_worker, type DirtyReceipt } from "./chat-member.cache";
 import { sql } from "drizzle-orm";
+import { run_pg_singleton, type Tx } from "@/cluster/jobs";
 
 // Bulk upsert last_delivered_msg_id / last_read_msg_id into chat_members.
 // One flush = one DB round-trip via UPDATE ... FROM (VALUES ...).
-const flush_receipts_to_db = async (items: DirtyReceipt[]): Promise<void> => {
+// `exec` is the batch's fenced transaction when called from the worker.
+const flush_receipts_to_db = async (items: DirtyReceipt[], exec?: Tx): Promise<void> => {
   if (items.length === 0) return;
 
   const rows = items
@@ -19,7 +21,7 @@ const flush_receipts_to_db = async (items: DirtyReceipt[]): Promise<void> => {
 
   const values = sql.join(rows, sql`, `);
 
-  await db.execute(sql`
+  await (exec ?? db).execute(sql`
     UPDATE ${chat_member_model} AS cm
     SET last_delivered_msg_id = COALESCE(v.delivered_id, cm.last_delivered_msg_id),
         last_read_msg_id      = COALESCE(v.read_id,      cm.last_read_msg_id)
@@ -30,7 +32,13 @@ const flush_receipts_to_db = async (items: DirtyReceipt[]): Promise<void> => {
   `);
 };
 
-const start_receipts_flush = (): (() => void) =>
-  start_receipt_flush_worker(flush_receipts_to_db);
+// SYNC_V2 §13.7 F7: each batch (SPOP 500 → read receipts → UPDATE → commit)
+// runs under the 'receipt_flush' advisory lock, so at most one worker is
+// ever between the SPOP and the UPDATE — today during every A/B swap, later
+// at N>1. What is written is unchanged. R4 deletes this flush entirely.
+const start_receipts_flush = (): (() => Promise<void>) =>
+  start_receipt_flush_worker<Tx>(flush_receipts_to_db, {
+    exclusive: (batch) => run_pg_singleton("receipt_flush", (tx) => batch(tx)),
+  });
 
 export { flush_receipts_to_db, start_receipts_flush };

@@ -1,0 +1,14 @@
+# /etc/systemd/system/amigo-watchdog@.timer — runs the watchdog every 10 s.
+# deploy.sh enables/disables it together with its slot.
+[Unit]
+Description=Amigo watchdog timer for slot %i
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=10
+# The default AccuracySec is 1 min, which would let systemd coalesce these
+# runs to roughly once a minute.
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

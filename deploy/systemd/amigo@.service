@@ -1,0 +1,61 @@
+# /etc/systemd/system/amigo@.service — one Amigo backend slot (SYNC_V2 §13.10.3)
+#
+# %i is the slot number: 1 or 2. Slot N listens on HTTP 510N and WS 520N.
+# At N=1 deploys alternate slots (deploy.sh); exactly ONE slot is enabled at
+# a time, and the in-process boot guard refuses a stray second one unless
+# deploy.sh just authorised a swap (/run/amigo/swap).
+#
+# Install (see deploy/CUTOVER.md):
+#   sudo install -m 0644 deploy/systemd/amigo@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+# Nothing here is enabled or started by the repository itself.
+
+[Unit]
+Description=Amigo backend slot %i
+After=network-online.target
+Wants=network-online.target
+PartOf=amigo.target
+# Never give up restarting (a crash loop is still visible in the journal).
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=ubuntu
+WorkingDirectory=/opt/amigo/current
+EnvironmentFile=/etc/amigo/prod.env
+Environment=INSTANCE_ID=%i
+Environment=SERVER_PORT=510%i
+Environment=SOCKET_PORT=520%i
+Environment=PG_POOL_MAX=10
+Environment=REDIS_NS=p
+Environment=CLUSTER_MAX=1
+# NODE_ENV: add ONLY if the running tmux process already has it
+# (check /proc/<pid>/environ). auth.routes.ts switches the cookie domain on
+# NODE_ENV=production, so adding it here would change auth behaviour.
+#Environment=NODE_ENV=production
+ExecStart=/home/ubuntu/.bun/bin/bun run src/server.ts
+# "started" means /api/readyz answers 200 (deps up, boot guard passed, both
+# listeners bound). systemctl start blocks until then.
+ExecStartPost=/opt/amigo/bin/wait-ready.sh %i
+TimeoutStartSec=60
+Restart=always
+RestartSec=2
+# SIGTERM = slow drain (sockets get socket:restart + 1012, ~50 s with a live
+# sibling, ~5 s without). A second signal switches to fast drain; the
+# process hard-exits at 80 s on its own, and systemd SIGKILLs at 90 s.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=90
+# Sized for 100% of connections on one slot (a rolling restart and
+# least_conn pile everyone onto one slot). Refine after measuring (V2:
+# prod RSS was ~150 MB on 2026-10-13).
+MemoryHigh=2500M
+MemoryMax=3500M
+LimitNOFILE=65536
+CPUWeight=100
+SyslogIdentifier=amigo-%i
+LogRateLimitIntervalSec=0
+Slice=amigo.slice
+
+[Install]
+WantedBy=amigo.target

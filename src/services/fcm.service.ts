@@ -6,6 +6,7 @@ import { ResultType } from '@/types/core.types';
 import { store_fcm_token, fetch_fcm_tokens, remove_fcm_token } from '@/cache-management/fcm-token.cache';
 import db from '@/config/db';
 import { user_model } from '@/models/user.model';
+import { count } from '@/utils/counters';
 
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
@@ -64,6 +65,19 @@ export class FCMService {
 
           if (!fcm_token) return false;
 
+          // SYNC_V2 §14.13: android priority 'normal' ONLY for pushes that
+          // will not post a notification — the muted-chat path (silent:'1',
+          // data-only). High priority is a Doze-exempt wake-up budget that
+          // Android shrinks for apps whose high-priority pushes don't show a
+          // notification; spending it on muted chats makes the pushes that DO
+          // notify arrive late. Everything that notifies stays 'high', calls
+          // included (their 30 s TTL is unchanged).
+          const normal_priority =
+            payload.silent === true &&
+            payload.fcm_mode === 'data-only' &&
+            payload.type !== 'call';
+          if (normal_priority) count('FCM', 'priority_normal');
+
           try {
             const message: admin.messaging.Message = {
               token: fcm_token,
@@ -97,7 +111,7 @@ export class FCMService {
                 ...(payload.silent ? { silent: '1' } : {}),
               },
               android: {
-                priority: 'high',
+                priority: normal_priority ? 'normal' : 'high',
                 ttl: payload.type === 'call' ? 30000 : 2419200000,
                 // Only include android.notification when fcm_mode is 'notification'
                 // This prevents Firebase from auto-displaying notifications for data-only messages

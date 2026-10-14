@@ -3,6 +3,7 @@ import { broadcast_to_all } from "./socket.handlers";
 import { socket_connections } from "./socket.server";
 import { AuthError } from "@/constants/auth-codes";
 import type { WSMessage } from "@/types/socket.types";
+import { register_ready_check } from "@/cluster/lifecycle";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Cross-instance global WS broadcast.
@@ -32,6 +33,11 @@ sub.subscribe(WS_BROADCAST_CHANNEL, WS_FORCE_LOGOUT_CHANNEL, (err, count) => {
     );
   }
 });
+
+// readyz (SYNC_V2 §13.9.1 "bus subscriber ready"): without this subscriber
+// force-logout and global broadcasts never reach this worker's sockets.
+// This module is imported explicitly by server.ts so it is always loaded.
+register_ready_check("bus", () => sub.status === "ready");
 
 sub.on("message", (channel, raw) => {
   try {

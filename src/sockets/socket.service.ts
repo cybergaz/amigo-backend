@@ -55,6 +55,7 @@ import { remove_pending_messages_batch } from "@/cache-management/polling.cache"
 import Snowflake from "@/utils/snowflake.utils";
 import {
   LivekitService,
+  register_call_party_locality,
   register_call_timeout_notifier,
 } from "@/services/livekit.service";
 import { get_chat_type } from "@/cache-management/chat-type.cache";
@@ -2070,6 +2071,12 @@ register_call_timeout_notifier(async (call) => {
     fan_out_to_user(call.callee_id, "call:missed", payload),
   ]);
 });
+
+// Same test fan_out_to_user uses for WS-vs-FCM, so the ring tick prefers the
+// worker whose timeout notification would actually go out over WS. Wrapped:
+// socket.handlers imports this module, so its binding may not be initialised
+// yet while this top-level code runs.
+register_call_party_locality((user_id) => is_user_online(user_id));
 
 /**
  * The app reports that a Stream call reached the CONNECTED state (first media

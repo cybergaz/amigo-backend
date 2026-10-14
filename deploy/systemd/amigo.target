@@ -1,0 +1,11 @@
+# /etc/systemd/system/amigo.target — groups the Amigo slots.
+# `systemctl enable amigo@N` hangs the slot off this target; enabling the
+# target itself (once) makes it start at boot.
+#   sudo systemctl enable amigo.target
+[Unit]
+Description=Amigo backend (all enabled slots)
+Wants=network-online.target
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

@@ -85,7 +85,11 @@ const flush_message_statuses_to_db = async (items: DirtyMessage[]): Promise<void
     });
 };
 
-const start_message_status_flush = (): (() => void) =>
+// Deliberately NOT a run_pg_singleton job (SYNC_V2 §13.7 F8): two workers
+// SPOP disjoint message ids, and the upsert is monotone (GREATEST), so
+// running this on every worker at once cannot write an older value over a
+// newer one. The drain awaits a batch in flight via the returned stop().
+const start_message_status_flush = (): (() => Promise<void>) =>
   start_message_flush_worker(flush_message_statuses_to_db);
 
 export { flush_message_statuses_to_db, start_message_status_flush };

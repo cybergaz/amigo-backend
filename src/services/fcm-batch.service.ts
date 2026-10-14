@@ -169,3 +169,19 @@ export async function queue_message_fcm(
     await flush(user_id);
   }
 }
+
+/**
+ * Drain (SYNC_V2 §13.9.3, D1): send every open batch now instead of losing it
+ * when the process exits. A batch waits up to WINDOW_MS (4 s) for more
+ * messages; on a restart those pushes are the only copy an offline (often
+ * FCM-only, Wi-Fi-flaky) recipient would get before the pending queue is
+ * replayed on their next connect. Returns how many batches were flushed.
+ */
+export async function flush_all(): Promise<number> {
+  const user_ids = [...batches.keys()];
+  const results = await Promise.allSettled(user_ids.map((id) => flush(id)));
+  for (const r of results) {
+    if (r.status === 'rejected') console.error('[FCM-BATCH] flush_all send failed:', r.reason);
+  }
+  return user_ids.length;
+}

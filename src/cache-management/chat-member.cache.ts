@@ -312,17 +312,31 @@ const readd_dirty_receipts = async (items: DirtyReceipt[]): Promise<void> => {
 
 // Periodic flush worker. Call with your DB upsert function. Drains the dirty
 // set in batches on each tick; re-enqueues on error. Returns a stop() fn.
-type ReceiptFlushFn = (items: DirtyReceipt[]) => Promise<void>;
+//
+// `exclusive` (SYNC_V2 §13.7 F7) wraps ONE batch — pop → read → write →
+// commit — so that only one worker at a time is between SPOP and the UPDATE.
+// Without it two workers can interleave: A pops a member and reads the
+// receipt, an ack bumps it and re-dirties it, B pops and writes the newer
+// value, then A's older read lands last (the UPDATE's COALESCE takes any
+// non-null value, it is not monotone). It returns the batch size, 0 when
+// the set is empty, or undefined when another worker holds the batch lock;
+// either of the last two ends this tick. Default: no fence (single process).
+// `E` is whatever the fence hands the batch to write through (a transaction).
+type ReceiptFlushFn<E = undefined> = (items: DirtyReceipt[], exec?: E) => Promise<void>;
+type ReceiptBatchFence<E> = (
+  batch: (exec?: E) => Promise<number>,
+) => Promise<number | undefined>;
 
 const DEFAULT_RECEIPT_FLUSH_INTERVAL_MS = 5 * 60 * 1000;
 const DEFAULT_RECEIPT_BATCH_SIZE = 500;
 
-const start_receipt_flush_worker = (
-  flush: ReceiptFlushFn,
-  opts: { interval_ms?: number; batch_size?: number } = {},
-): (() => void) => {
+const start_receipt_flush_worker = <E = undefined>(
+  flush: ReceiptFlushFn<E>,
+  opts: { interval_ms?: number; batch_size?: number; exclusive?: ReceiptBatchFence<E> } = {},
+): (() => Promise<void>) => {
   const interval_ms = opts.interval_ms ?? DEFAULT_RECEIPT_FLUSH_INTERVAL_MS;
   const batch_size = opts.batch_size ?? DEFAULT_RECEIPT_BATCH_SIZE;
+  const exclusive: ReceiptBatchFence<E> = opts.exclusive ?? ((batch) => batch());
   let running = false;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -335,15 +349,24 @@ const start_receipt_flush_worker = (
     running = true;
     try {
       while (!stopped) {
-        const batch = await pop_dirty_receipts(batch_size);
-        if (batch.length === 0) break;
+        // Kept outside the fence so a failed batch (including a failed
+        // COMMIT) can be put back: the rollback undoes the UPDATE, not the
+        // SPOP.
+        let popped: DirtyReceipt[] = [];
+        let n: number | undefined;
         try {
-          await flush(batch);
+          n = await exclusive(async (exec) => {
+            popped = await pop_dirty_receipts(batch_size);
+            if (popped.length === 0) return 0;
+            await flush(popped, exec);
+            return popped.length;
+          });
         } catch (err) {
           console.error("[CACHE] receipt flush failed, re-enqueueing:", err);
-          await readd_dirty_receipts(batch);
+          await readd_dirty_receipts(popped);
           break;
         }
+        if (!n) break;
       }
     } finally {
       running = false;
@@ -357,9 +380,13 @@ const start_receipt_flush_worker = (
   };
 
   schedule();
-  return () => {
+  // Resolves once a batch already in flight has finished (SYNC_V2 §13.9.3
+  // "stop timers, await running loops"): a drain must not close the PG pool
+  // under a half-written flush. Existing callers ignore the promise.
+  return async () => {
     stopped = true;
     if (timer) clearTimeout(timer);
+    while (running) await Bun.sleep(25);
   };
 };
 
@@ -376,4 +403,4 @@ export {
   dirty_receipts_count,
   start_receipt_flush_worker,
 };
-export type { Receipt, DirtyReceipt, ReceiptUpdate, ReceiptFlushFn };
+export type { Receipt, DirtyReceipt, ReceiptUpdate, ReceiptFlushFn, ReceiptBatchFence };

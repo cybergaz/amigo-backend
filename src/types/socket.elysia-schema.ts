@@ -11,6 +11,11 @@ const FlexDate = () => t.Union([t.Date(), t.String(), t.Number()]);
 const ConnectionStatusPayloadSchema = t.Object({
   sender_id: t.String(),
   status: t.Enum(Object.fromEntries(CONNECTION_STATUS_CONST.map(x => [x, x]))),
+  // Keepalive announcement (SYNC_V2 §14.5), optional so old clients validate.
+  // mode is a free string (validated in code): an unknown future mode must not
+  // fail the whole frame.
+  mode: t.Optional(t.String()),
+  ka_s: t.Optional(t.Number()),
 });
 
 // ConvJoinPayload schema
@@ -243,6 +248,9 @@ const WSMessageSchema = t.Object({
   type: t.Enum(Object.fromEntries(WS_MESSAGE_EVENTS_CONST.map(x => [x, x]))),
   payload: t.Optional(WSPayloadSchema),
   ws_timestamp: t.Optional(t.String()),
+  // socket:ping client clock (SYNC_V2 §14.5), echoed in the direct pong.
+  // Declared so schema normalisation can never strip it.
+  t: t.Optional(t.Number()),
 });
 
 const VitalWSPayloadSchema = t.Union([

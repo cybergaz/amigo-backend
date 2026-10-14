@@ -8,6 +8,8 @@ import { eq, and, lt, asc, gt, inArray } from "drizzle-orm";
 import Snowflake from "@/utils/snowflake.utils";
 import { sort_pending_for_replay } from "@/utils/pending-order.utils";
 import { randomUUIDv7 } from "bun";
+import { run_batched_singleton, run_daily } from "@/cluster/jobs";
+import { is_draining, track } from "@/cluster/lifecycle";
 
 // ============================================================================
 // Three-tier Polling Cache for Missed WS Messages
@@ -443,47 +445,76 @@ async function remove_pending_message(user_id: string, message_id: string): Prom
 
 // ============================================================================
 // CLEANUP — purge expired DB rows (> 1 month old)
-// Call this from a cron job or scheduled task.
 // ============================================================================
-async function cleanup_expired_messages(): Promise<number> {
-  try {
-    const cutoff = new Date(Date.now() - DB_RETENTION_DAYS * 24 * 60 * 60 * 1000);
-    const result = await db
-      .delete(missed_ws_messages_model)
-      .where(lt(missed_ws_messages_model.created_at, cutoff))
-      .returning({ id: missed_ws_messages_model.id });
+// SYNC_V2 §13.7 C4. This used to run on every process once a day AND 10 s
+// after every boot — so every deploy (and, at N>1, every worker) issued one
+// unbounded DELETE over the whole table. Now:
+//   - run_daily(): at most one run per ~day across all workers, no boot run
+//     (the marker lives in Redis, so a restart does not reset it);
+//   - 5k-row batches, each its own transaction under the job's advisory
+//     lock, so a second worker can never run a batch concurrently, a drain
+//     stops between batches, and no single statement holds locks for long.
+// What is deleted is unchanged: rows older than DB_RETENTION_DAYS.
+const CLEANUP_BATCH_ROWS = 5_000;
+// How often each worker asks "is the daily cleanup due?" (cheap: one Redis
+// SET NX). The first ask is one interval after boot — never at boot.
+const CLEANUP_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 
-    const count = result.length;
-    if (count > 0) {
-      console.log(`[POLL-CACHE] Cleaned up ${count} expired missed messages (older than ${DB_RETENTION_DAYS} days)`);
-    }
-    return count;
-  } catch (err) {
-    console.error("[POLL-CACHE] Error cleaning up expired messages:", err);
-    return 0;
+async function cleanup_expired_messages(): Promise<number> {
+  const cutoff = new Date(Date.now() - DB_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+  const count = await run_batched_singleton("missed_cleanup", async (tx) => {
+    const expired_ids = tx
+      .select({ id: missed_ws_messages_model.id })
+      .from(missed_ws_messages_model)
+      .where(lt(missed_ws_messages_model.created_at, cutoff))
+      .limit(CLEANUP_BATCH_ROWS);
+    const deleted = await tx
+      .delete(missed_ws_messages_model)
+      .where(inArray(missed_ws_messages_model.id, expired_ids))
+      .returning({ id: missed_ws_messages_model.id });
+    return deleted.length;
+  });
+  if (count > 0) {
+    console.log(`[POLL-CACHE] Cleaned up ${count} expired missed messages (older than ${DB_RETENTION_DAYS} days)`);
   }
+  return count;
 }
 
 // ============================================================================
-// CRON — start a periodic cleanup interval (runs once per day)
+// CRON — ask every CLEANUP_CHECK_INTERVAL_MS whether the daily run is due
 // ============================================================================
 let cleanup_interval: ReturnType<typeof setInterval> | null = null;
+let cleanup_running: Promise<unknown> | null = null;
 
 function start_cleanup_cron() {
   if (cleanup_interval) clearInterval(cleanup_interval);
 
-  const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-  cleanup_interval = setInterval(async () => {
-    console.log("[POLL-CACHE] Running scheduled cleanup of expired missed messages...");
-    await cleanup_expired_messages();
-  }, CLEANUP_INTERVAL_MS);
-
-  // Also run once on startup (after a short delay to let DB settle)
-  setTimeout(() => cleanup_expired_messages(), 10_000);
+  cleanup_interval = setInterval(() => {
+    if (cleanup_running || is_draining()) return;
+    // track(): the drain waits for a batch in flight before closing the pool.
+    cleanup_running = track(run_daily("missed_cleanup", cleanup_expired_messages))
+      .finally(() => {
+        cleanup_running = null;
+      });
+  }, CLEANUP_CHECK_INTERVAL_MS);
 
   console.log("[POLL-CACHE] Started daily cleanup cron for missed messages");
 }
 
+// Drain (SYNC_V2 §13.9.3): cancel the deferred DB inserts that have not fired.
+// This is what an exit always did implicitly; it is now explicit and counted.
+// The entries stay in Redis (7-day TTL), so the poll / reconnect replay still
+// finds them — only the 30-day DB backstop copy is skipped. Running them
+// early instead would race the recipient's ack-drain (RC-3 C3 handles that).
+function drop_pending_db_timers(): number {
+  const n = pending_db_timers.size;
+  for (const timer of pending_db_timers.values()) clearTimeout(timer);
+  pending_db_timers.clear();
+  return n;
+}
+
+// Stops asking; a run already in flight is awaited by the drain via track()
+// and itself stops between batches once draining.
 function stop_cleanup_cron() {
   if (cleanup_interval) {
     clearInterval(cleanup_interval);
@@ -522,6 +553,7 @@ export {
   cleanup_expired_messages,
   start_cleanup_cron,
   stop_cleanup_cron,
+  drop_pending_db_timers,
   is_allowed_event,
   log_current_cache_state,
   type CachedPollMessage,

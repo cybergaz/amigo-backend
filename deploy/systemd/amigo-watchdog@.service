@@ -1,0 +1,11 @@
+# /etc/systemd/system/amigo-watchdog@.service — restarts slot %i when it is
+# alive but wedged (process running, /api/healthz failing 3 times in a row).
+# healthz checks no dependencies on purpose: an RDS or Redis outage must not
+# make the watchdog restart a healthy process into the same outage.
+[Unit]
+Description=Amigo watchdog for slot %i
+After=amigo@%i.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/amigo/bin/watchdog.sh %i

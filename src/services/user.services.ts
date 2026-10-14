@@ -17,6 +17,7 @@ import { create_session, login_device } from "./session.service";
 import { upload_image_to_s3, delete_image_from_s3, generate_profile_image_key } from "@/services/s3.service";
 import { eq, and, inArray, isNull, ne, sql, or, ilike } from "drizzle-orm";
 import { store_fcm_token } from "@/cache-management/fcm-token.cache";
+import { invalidate_user_names, set_cached_user_name } from "@/cache-management/user-name.cache";
 import { remove_member, get_conversation_members, get_user_conversations, invalidate_user_conversations } from "@/cache-management/conv.cache";
 import { polling_connections, socket_connections } from "@/sockets/socket.server";
 import { broadcast_message } from "@/sockets/socket.handlers";
@@ -283,6 +284,11 @@ const update_user_details = async (id: string, body: UpdateUserType) => {
       };
     }
 
+    // Keep the WS-open name cache in step with a rename (user-name.cache.ts).
+    if (body.name !== undefined) {
+      set_cached_user_name(id, user_details[0].name);
+    }
+
     // Broadcast a user:update only when something visible to peers changed
     // (name or profile pic). Other fields like fcm_token / location are
     // private and don't need a fanout.
@@ -393,6 +399,10 @@ const batch_update_users_details = async (ids: string[], body: UpdateUserType) =
       };
     }
 
+    if (body.name !== undefined) {
+      invalidate_user_names(ids);
+    }
+
     return {
       success: true,
       code: 200,
@@ -407,6 +417,20 @@ const batch_update_users_details = async (ids: string[], body: UpdateUserType) =
       data: null,
     };
   }
+};
+
+// Refresh last_seen for users that are connected right now (SYNC_V2 D-C4).
+// The WS `open` no longer writes last_seen inline (a reconnect herd turned that
+// into a burst of row-locking UPDATEs on RDS); socket.server.ts collects the
+// opened user ids and calls this every ~30 s, one statement per chunk. Plain
+// UPDATE: no RETURNING, no user:update fan-out (last_seen is not broadcast).
+// Throws on DB error — the caller logs and moves on.
+const touch_users_last_seen = async (ids: string[]): Promise<void> => {
+  if (ids.length === 0) return;
+  await db
+    .update(user_model)
+    .set({ last_seen: new Date() })
+    .where(inArray(user_model.id, ids));
 };
 
 const get_all_users = async () => {
@@ -1435,6 +1459,7 @@ export {
   find_user_by_phone,
   get_user_details,
   update_user_details,
+  touch_users_last_seen,
   batch_update_users_details,
   get_all_users,
   get_available_users,

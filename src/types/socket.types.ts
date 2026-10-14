@@ -6,17 +6,54 @@ interface WebSocketData {
   user_id?: string;
   user_name?: string;
   // user_pfp?: string;
+  // ---- connection lifecycle (SYNC_V2 §13.6.5 / §14.5) ----
+  // 12-hex per-connection nonce, for logs (and RC-2's 4009 close reason).
+  cid?: string;
+  // false from JWT verify until the socket is in socket_connections; inbound
+  // frames are buffered (not processed) while false.
+  registered?: boolean;
+  // Frames that arrived before `registered` (≤ EARLY_FRAME_LIMIT).
+  early_frames?: unknown[];
+  // Set by the close callback, so an `open` still awaiting auth/name lookups
+  // knows not to register a socket that is already gone.
+  closed?: boolean;
+  // Closed by the shutdown drain (1012 + socket:restart): the close callback
+  // skips the offline debounce and the last_seen write (SYNC_V2 §13.7 A6).
+  draining?: boolean;
 }
 
 // Transport types for fallback support
 type TransportType = 'ws' | 'polling';
 
 // Connection management
+// Keepalive mode a client announces in connection:status (§14.5).
+// 'reliable' is accepted for forward compatibility; until the server-learned
+// interval ships it behaves like 'bg'.
+type KeepaliveMode = 'fg' | 'bg' | 'reliable';
+
 interface UserConnection {
   ws: ElysiaWS;
   missed_pings: number;
   active_conv_id?: string;
   is_background?: boolean;
+  // ---- liveness / keepalive (SYNC_V2 §14.5) ----
+  // ms epoch of the last frame received on THIS socket (any type).
+  last_inbound_at?: number;
+  // ms epoch of the last server socket:ping sent on this socket.
+  last_ping_at?: number;
+  // ms epoch of the last keepalive accounting point (ping sent or skip
+  // counted) — only rate-limits the server_ping_skipped counter.
+  last_keepalive_at?: number;
+  // Per-connection keepalive interval; 20 s unless the client announced one.
+  keepalive_ms?: number;
+  keepalive_mode?: KeepaliveMode;
+  // ms epoch when ws.send first reported backpressure; cleared on drain.
+  congested_since?: number;
+  // ms epoch when ws.send first DROPPED a frame on this open socket (buffer
+  // past backpressureLimit). Never cleared: the frame is gone from this
+  // socket even if it drains later, and only a reconnect replays the
+  // pending queue, so the keepalive tick closes the socket (4008).
+  dropped_at?: number;
 }
 
 interface PollingConnection {
@@ -47,6 +84,9 @@ type WSMessage = {
   | MarqueeBannerPayload
   | ConversationDisappearingPayload;
   ws_timestamp?: Date;
+  // Client clock echo on socket:ping / socket:pong (§14.5): the server copies
+  // the ping's `t` into its pong so the app can measure RTT.
+  t?: number;
 };
 
 // Subset of WSMessage for critical events that must be processed by clients even if they miss some messages (e.g. due to reconnection)
@@ -73,6 +113,10 @@ type ConnectionStatusType = typeof CONNECTION_STATUS_CONST[number];
 type ConnectionStatusPayload = {
   sender_id: string;
   status: ConnectionStatusType;
+  // Optional keepalive announcement from new clients (§14.5). Old clients
+  // never send these → default 20 s keepalive.
+  mode?: string;
+  ka_s?: number;
 };
 
 type ConvJoinPayload = {
@@ -373,6 +417,7 @@ export {
 };
 export type {
   WebSocketData,
+  KeepaliveMode,
   UserConnection,
   PollingConnection,
   TransportType,

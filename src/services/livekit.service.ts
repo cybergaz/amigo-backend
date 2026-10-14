@@ -8,13 +8,14 @@ import Redis from "ioredis";
 import { redis } from "@/config/redis";
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
-import { eq, or } from "drizzle-orm";
+import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 import { call_model, livekit_call_model } from "@/models/call.model";
 import {
   setActiveCallsCache,
   setUserCallCache,
   getCallKey,
   getUserCallKey,
+  CALL_CACHE_TTL_SECONDS,
 } from "@/cache-management/calls.cache";
 import { CALL_TIMEOUT_MS } from "@/constants/calls.constants";
 // import { _missedCallNotifier } from "./call.service";
@@ -22,6 +23,12 @@ import { ResultType } from "@/types/core.types";
 import { livekit } from "@/config/livekit.config";
 import { AccessToken, VideoGrant } from "livekit-server-sdk";
 import { ConvJoinPayloadSchema } from "@/types/socket.elysia-schema";
+import { k } from "@/cluster/keys";
+import { deadline, rfast } from "@/cluster/redis-fast";
+import { run_pg_singleton } from "@/cluster/jobs";
+import { is_draining, track } from "@/cluster/lifecycle";
+import { has_live_sibling } from "@/cluster/beat";
+import { count } from "@/utils/counters";
 
 /**
  * Called when a call rings past {@link CALL_TIMEOUT_MS} without being
@@ -34,6 +41,20 @@ let _call_timeout_notifier: CallTimeoutNotifier | null = null;
 
 function register_call_timeout_notifier(fn: CallTimeoutNotifier) {
   _call_timeout_notifier = fn;
+}
+
+/**
+ * Does THIS worker hold a live WS for the user? Registered from
+ * `socket.service.ts` (same cycle reason as above). The ring tick uses it to
+ * leave a deadline to the sibling that can notify the caller over WS. Until
+ * registered, every user counts as local (fire at once, as before).
+ */
+type CallPartyLocal = (user_id: string) => boolean;
+
+let _call_party_is_local: CallPartyLocal = () => true;
+
+function register_call_party_locality(fn: CallPartyLocal) {
+  _call_party_is_local = fn;
 }
 
 interface ActiveCall {
@@ -49,16 +70,69 @@ interface ActiveCall {
   ended_at?: Date;
   status: CallStatusType;
   reason?: CallEndReasonsType;
+  /// Unused since RC-1 (ring deadlines live in Redis); kept so the cache
+  /// parser's shape does not change.
   timeout_timer?: NodeJS.Timeout;
 }
 
-/**
- * Ring-timeout handles, keyed by call id. Redis can't hold a live timer, so the
- * process that started the call owns cancelling it. A different process
- * terminating the call simply finds nothing to cancel — harmless, because
- * `timeout_call` re-reads the cache and no-ops once the call is gone.
- */
-const _pending_timeouts = new Map<string, NodeJS.Timeout>();
+// =============================================================================
+// Ring deadlines (SYNC_V2 §13.7 F10, §13.8)
+// =============================================================================
+// The ring cap used to be a setTimeout in the process that started the call.
+// A restart (every deploy) silently dropped every pending timer, so a call
+// ringing at that moment left the DB row 'initiated' and BOTH users pinned
+// "already in a call" until the 4 h cache TTL; and at N>1 only the starting
+// process could ever fire or cancel it. Now:
+//   - initiate_call ZADDs call_id → deadline into a Redis ZSET. If that fails
+//     the call fails (and is compensated): a call nobody can time out is
+//     worse than "call failed, try again";
+//   - accept / terminate / timeout ZREM it;
+//   - every worker ticks every 1 s, and the worker whose ZREM returns 1 runs
+//     timeout_call (which re-reads the call and no-ops if it was answered or
+//     already ended), so exactly one worker fires each deadline;
+//   - while a ready sibling exists (deploy overlap: the new slot is ready
+//     with few sockets while the old one still holds most), a worker that
+//     holds neither party's WS leaves a fresh deadline alone for up to
+//     RING_DEFER_MS, so the worker holding the caller's socket fires it and
+//     call:terminate goes out over WS instead of FCM (which this user base
+//     often never receives). Past that anyone fires it, so nothing strands;
+//     with no sibling (N=1) nothing is deferred at all;
+//   - a 30 s DB backstop (one worker, advisory lock) times out rows still
+//     'initiated' well past the cap — it catches a lost ZSET entry (Redis
+//     failover, a ZREM that won but whose worker died before timing out).
+// Same cap (CALL_TIMEOUT_MS) and the same timeout_call as before, so the
+// user-visible behaviour (missed call, call:terminate / call:missed) is
+// unchanged; only who fires it changed.
+const RING_TICK_MS = 1_000;
+const RING_TICK_BATCH = 20;
+const RING_REDIS_DEADLINE_MS = 500;
+const RING_BACKSTOP_MS = 30_000;
+// Slack past the cap before the backstop steps in, so it never races the
+// 1 s tick for a call that is merely due.
+const RING_BACKSTOP_GRACE_S = 10;
+const RING_BACKSTOP_BATCH = 50;
+// How long past its deadline a call may wait for the worker that holds one
+// of its parties' WS before any worker fires it.
+const RING_DEFER_MS = 5_000;
+// The sibling check reads the beat keys; one beat interval of staleness is
+// fine and keeps it off the 1 s tick.
+const RING_SIBLING_CACHE_MS = 5_000;
+
+// Main client on the request path: initiate already depends on it for the
+// busy checks and cache writes, so this adds no new failure mode.
+const schedule_ring_deadline = async (call_id: string): Promise<void> => {
+  await redis.zadd(k.ring_deadline(), Date.now() + CALL_TIMEOUT_MS, call_id);
+};
+
+// Best effort: a ZREM that fails leaves the entry for the tick, whose
+// timeout_call then sees an answered / ended call and does nothing.
+const clear_ring_deadline = async (call_id: string): Promise<void> => {
+  try {
+    await redis.zrem(k.ring_deadline(), call_id);
+  } catch (err: any) {
+    console.error(`[CALL] ring deadline ZREM failed for ${call_id}: ${err?.message ?? err}`);
+  }
+};
 
 export class LivekitService {
   // <-------------------Initiate Call------------------->
@@ -168,14 +242,24 @@ export class LivekitService {
       // Ring cap for an unanswered call. Without this a callee who never
       // answers (app killed, no network) leaves the DB row 'initiated' and
       // both users pinned "in a call" until the cache TTL expires hours later.
-      active_call.timeout_timer = setTimeout(() => {
-        this.timeout_call(new_call.id).catch((err) =>
-          console.error("[CALL] timeout sweep failed:", err),
+      try {
+        await schedule_ring_deadline(new_call.id);
+      } catch (err: any) {
+        // Nothing could ever time this call out, so fail it now and release
+        // both users (same compensation as a failed room creation). The
+        // caller gets call:error from handle_call_init; the callee was not
+        // rung yet.
+        count("CALL", "ring_zadd_failed");
+        console.error(
+          `[CALL] ring deadline ZADD failed for ${new_call.id}, failing the call: ${err?.message ?? err}`,
         );
-      }, CALL_TIMEOUT_MS);
-      // Never block process exit on a ringing call.
-      active_call.timeout_timer.unref?.();
-      _pending_timeouts.set(new_call.id, active_call.timeout_timer);
+        await this.abandon_unscheduled_call(new_call.id);
+        return {
+          success: false,
+          code: 500,
+          message: "Error initiating call",
+        };
+      }
 
       return {
         success: true,
@@ -195,6 +279,22 @@ export class LivekitService {
         message: "Error initiating call",
         error,
       };
+    }
+  }
+
+  // Compensation when the ring deadline could not be scheduled: release
+  // both users and close the row exactly like a failed room creation does
+  // (socket.service abandon_failed_call), so call history and "busy" stay
+  // consistent. Best effort — the 4 h cache TTL is the last resort.
+  static async abandon_unscheduled_call(call_id: string): Promise<void> {
+    try {
+      await this.clear_call_cache(call_id);
+      await db
+        .update(livekit_call_model)
+        .set({ status: "ended", reason: "network_error", ended_at: new Date() })
+        .where(eq(livekit_call_model.id, call_id));
+    } catch (err) {
+      console.error("[CALL] Failed to roll back unscheduled call", call_id, err);
     }
   }
 
@@ -305,6 +405,11 @@ export class LivekitService {
 
       // console.log("accepting call with id:", call_id, "for user:", user_id);
 
+      // The call is live now — the ring cap must not fire and mark it
+      // missed. Removed BEFORE the writes below, so a tick that lands in
+      // between finds nothing to fire.
+      await clear_ring_deadline(call_id);
+
       // Update call status to 'answered' in the database
       await db
         .update(livekit_call_model)
@@ -318,13 +423,6 @@ export class LivekitService {
       parsedActiveCall.status = "answered";
       parsedActiveCall.answered_at = new Date();
       await setActiveCallsCache(parsedActiveCall);
-
-      // The call is live now — the ring cap must not fire and mark it missed.
-      const ring_timer = _pending_timeouts.get(call_id);
-      if (ring_timer) {
-        clearTimeout(ring_timer);
-        _pending_timeouts.delete(call_id);
-      }
 
       return {
         success: true,
@@ -489,9 +587,12 @@ export class LivekitService {
   // <-------------------Clear all active calls cache------------------->
   static async clear_calls_cache(): Promise<ResultType> {
     try {
-      const keys = await redis.keys("calls:active_calls:*");
-      if (keys.length > 0) {
-        await redis.del(...keys);
+      // SCAN, not KEYS: KEYS walks the whole keyspace in one blocking
+      // command (and the Redis is shared with dev and every cache), stalling
+      // every other client for its duration.
+      const stream = redis.scanStream({ match: "calls:active_calls:*", count: 500 });
+      for await (const keys of stream as AsyncIterable<string[]>) {
+        if (keys.length > 0) await redis.del(...keys);
       }
 
       return {
@@ -522,12 +623,8 @@ export class LivekitService {
         raw as Record<string, string>,
       );
 
-      // Cancel the ring timer if this process is the one holding it.
-      const timer = _pending_timeouts.get(call_id);
-      if (timer) {
-        clearTimeout(timer);
-        _pending_timeouts.delete(call_id);
-      }
+      // Terminate and timeout both end here: the ring deadline goes too.
+      await clear_ring_deadline(call_id);
 
       // Always drop the call key. The per-user keys need the participant ids,
       // which only the cached row has; if it's already gone, fall back to the
@@ -661,30 +758,10 @@ export class LivekitService {
     }
   }
 
-  // <--------------------Get Acitve calls----------------------------->
-  static async get_all_active_calls(): Promise<ResultType> {
-    try {
-      const activeCalls = await redis.hgetall(`calls:active_calls:*`);
-
-      // console.log( `active calls fetched from cache : ${JSON.stringify(activeCalls)}`);
-
-      return {
-        success: true,
-        code: 200,
-        message: "Calls fetched successfully from cache",
-        data: activeCalls,
-      };
-
-    } catch (error) {
-      console.error("[CALL] Error fetching active calls:", error);
-      return {
-        success: false,
-        code: 500,
-        message: "Error fetching active calls",
-        error,
-      };
-    }
-  }
+  // get_all_active_calls() was removed in RC-1 (SYNC_V2 §13.7 F10): it ran
+  // HGETALL on the literal key "calls:active_calls:*" (always empty) and its
+  // only caller was a no-op "recovery" at boot. Ring recovery after a
+  // restart is now the ZSET tick + DB backstop below.
 
   // <-------------------Get a call info----------------------------->
   static async get_call_info(call_id: string): Promise<ResultType> {
@@ -857,5 +934,168 @@ export class LivekitService {
     }
   }
 }
-export { ActiveCall, register_call_timeout_notifier };
+// -----------------------------------------------------------------------------
+// Ring tick (every worker) + DB backstop (one worker)
+// -----------------------------------------------------------------------------
+const fire_ring_timeout = async (call_id: string, source: "tick" | "backstop") => {
+  const result = await LivekitService.timeout_call(call_id);
+  // 404 = the call is already gone (ended by both ends, or its cache
+  // expired): nothing to do, not an error.
+  count("CALL", result.success ? `ring_timeout_${source}` : `ring_timeout_${source}_${result.code === 404 ? "gone" : "failed"}`);
+  if (!result.success && result.code !== 404) {
+    console.error(`[CALL] ring timeout (${source}) failed for ${call_id}: ${result.message}`);
+  }
+};
+
+let ring_sibling_cache = { at: 0, live: false };
+
+// Errors → false (has_live_sibling already logs): with no proof of a sibling
+// we fire at once, exactly as at N=1.
+const ring_has_sibling = async (now: number): Promise<boolean> => {
+  if (now - ring_sibling_cache.at < RING_SIBLING_CACHE_MS) return ring_sibling_cache.live;
+  const live = await has_live_sibling();
+  ring_sibling_cache = { at: Date.now(), live };
+  return live;
+};
+
+// Fresh deadlines whose caller and callee both have no WS here, while a
+// sibling may hold them. Any failure defers nothing (fire as before).
+const ring_deferred = async (
+  fresh: string[],
+  now: number,
+): Promise<Set<string>> => {
+  const out = new Set<string>();
+  if (fresh.length === 0) return out;
+  try {
+    if (!(await ring_has_sibling(now))) return out;
+    const pipe = rfast.pipeline();
+    for (const call_id of fresh) pipe.hmget(getCallKey(call_id), "caller_id", "callee_id");
+    const rows = (await deadline(pipe.exec(), RING_REDIS_DEADLINE_MS, "ring parties")) as
+      | [Error | null, unknown][]
+      | null;
+    fresh.forEach((call_id, i) => {
+      const [err, val] = rows?.[i] ?? [null, null];
+      if (err || !Array.isArray(val)) return;
+      const [caller_id, callee_id] = val as (string | null)[];
+      // No cache → timeout_call would 404; let it fire and clean the entry.
+      if (!caller_id && !callee_id) return;
+      if (caller_id && _call_party_is_local(caller_id)) return;
+      if (callee_id && _call_party_is_local(callee_id)) return;
+      out.add(call_id);
+    });
+  } catch {
+    count("CALL", "ring_defer_check_failed");
+  }
+  return out;
+};
+
+const ring_tick = async (): Promise<void> => {
+  const key = k.ring_deadline();
+  const now = Date.now();
+  const raw = (await deadline(
+    rfast.zrangebyscore(key, "-inf", now, "WITHSCORES", "LIMIT", 0, RING_TICK_BATCH),
+    RING_REDIS_DEADLINE_MS,
+    "ring tick",
+  )) as string[];
+  if (raw.length === 0) return;
+  const due: string[] = [];
+  const fresh: string[] = [];
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    due.push(raw[i]);
+    if (now - Number(raw[i + 1]) < RING_DEFER_MS) fresh.push(raw[i]);
+  }
+  const deferred = await ring_deferred(fresh, now);
+  if (deferred.size > 0) count("CALL", "ring_deferred", deferred.size);
+  await Promise.all(
+    due.map(async (call_id) => {
+      if (deferred.has(call_id)) return;
+      // ZREM decides the owner: exactly one worker gets 1 back. A ZREM that
+      // times out on our side but succeeded in Redis leaves the call to the
+      // DB backstop.
+      const won = await deadline(rfast.zrem(key, call_id), RING_REDIS_DEADLINE_MS, "ring zrem");
+      if (won !== 1) return;
+      await fire_ring_timeout(call_id, "tick");
+    }),
+  );
+};
+
+// Rows still 'initiated' past the cap + grace. The DB clock decides (both
+// started_at and now() come from the same RDS-synced clocks on one box).
+// Bounded below by the call-cache TTL: past it there is no cached call left
+// for timeout_call to act on, and this keeps the scan off years of history.
+// Newest first, so old orphans (a row whose cache vanished) cannot starve a
+// fresh stuck call out of the batch.
+const ring_backstop = async (): Promise<void> => {
+  await run_pg_singleton("ring_backstop", async (tx) => {
+    const overdue = await tx
+      .select({ id: livekit_call_model.id })
+      .from(livekit_call_model)
+      .where(
+        and(
+          eq(livekit_call_model.status, "initiated"),
+          isNull(livekit_call_model.ended_at),
+          sql`${livekit_call_model.started_at} < now() - (${Math.ceil(CALL_TIMEOUT_MS / 1000) + RING_BACKSTOP_GRACE_S}::int * interval '1 second')`,
+          sql`${livekit_call_model.started_at} > now() - (${CALL_CACHE_TTL_SECONDS}::int * interval '1 second')`,
+        ),
+      )
+      .orderBy(desc(livekit_call_model.started_at))
+      .limit(RING_BACKSTOP_BATCH);
+    // Sequential, inside the lock: a second worker's backstop cannot fire
+    // the same call's timeout (and its notifications) concurrently.
+    for (const { id } of overdue) {
+      await fire_ring_timeout(id, "backstop");
+    }
+    return overdue.length;
+  });
+};
+
+/**
+ * Started by server.ts boot() after the boot guard; the returned stop()
+ * resolves once a tick / backstop already running has finished (the drain
+ * awaits it before closing the pools).
+ */
+const start_ring_deadlines = (): (() => Promise<void>) => {
+  let tick_running: Promise<void> | null = null;
+  let backstop_running: Promise<void> | null = null;
+  let last_tick_error_log_at = 0;
+
+  const tick_timer = setInterval(() => {
+    if (tick_running || is_draining()) return;
+    tick_running = track(ring_tick())
+      .catch((err: any) => {
+        count("CALL", "ring_tick_failed");
+        const now = Date.now();
+        if (now - last_tick_error_log_at >= 60_000) {
+          last_tick_error_log_at = now;
+          console.error(`[CALL] ring tick failed: ${err?.message ?? err}`);
+        }
+      })
+      .finally(() => {
+        tick_running = null;
+      });
+  }, RING_TICK_MS);
+
+  const backstop_timer = setInterval(() => {
+    if (backstop_running || is_draining()) return;
+    // run_pg_singleton already logs and counts failures.
+    backstop_running = track(ring_backstop())
+      .catch(() => { })
+      .finally(() => {
+        backstop_running = null;
+      });
+  }, RING_BACKSTOP_MS);
+
+  return async () => {
+    clearInterval(tick_timer);
+    clearInterval(backstop_timer);
+    await Promise.allSettled([tick_running, backstop_running]);
+  };
+};
+
+export {
+  ActiveCall,
+  register_call_timeout_notifier,
+  register_call_party_locality,
+  start_ring_deadlines,
+};
 export type { CallTimeoutNotifier };

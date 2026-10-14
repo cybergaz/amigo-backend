@@ -115,6 +115,11 @@ export const upload_file_to_s3 = async (
       Body: new Uint8Array(buffer),
       ContentType: file.type,
       ACL: "public-read" as const,
+      // SYNC_V2 §14.7 item 8: every key is unique (`{user}/{ms}_{name}`) and
+      // never overwritten, so the object at a URL never changes. Telling
+      // caches so lets the phone (and any CDN put in front later, D-N7) keep
+      // media without revalidating it over a slow link.
+      CacheControl: "public, max-age=31536000, immutable",
     };
 
     const command = new PutObjectCommand(uploadParams);

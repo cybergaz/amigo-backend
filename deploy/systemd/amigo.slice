@@ -1,0 +1,6 @@
+# /etc/systemd/system/amigo.slice — cgroup for the Amigo slots, so their
+# CPU/memory can be read (systemd-cgtop) and capped as one group later.
+[Unit]
+Description=Amigo backend slice
+
+[Slice]

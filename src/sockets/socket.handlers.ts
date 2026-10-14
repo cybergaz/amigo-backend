@@ -40,6 +40,7 @@ import {
 } from "./socket.service";
 import { pin_message, unpin_message } from "@/services/message.services";
 import { soft_delete_message } from "@/services/chat.services";
+import { ws_send } from "./ws-send";
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -78,11 +79,8 @@ const broadcast_to_all = (message: WSMessage) => {
   const serialized = JSON.stringify(message);
   for (const [user_id, connection] of socket_connections) {
     if (connection.ws.readyState !== 1) continue;
-    try {
-      connection.ws.send(serialized, true);
-    } catch (error) {
-      console.error(`[WS] broadcast_to_all error for user ${user_id}:`, error);
-    }
+    // ws_send never throws and records backpressure/drops (§14.5 item 4).
+    ws_send(connection.ws, serialized, connection, user_id);
   }
 };
 
@@ -153,12 +151,10 @@ const broadcast_message = async (data: BroadcastData) => {
         //   active_in_conv.add(user_id);
         // }
 
-        // Send message immediately via WebSocket
-        try {
-          ws_connection.ws.send(serialized_payload, true);
-        } catch (error) {
-          console.error(`[WS] Error sending to user ${user_id}:`, error);
-        }
+        // Send message immediately via WebSocket. ws_send never throws and
+        // marks the connection congested on backpressure (§14.5 item 4); a
+        // dropped vital frame is still covered by the pending store below.
+        ws_send(ws_connection.ws, serialized_payload, ws_connection, user_id);
 
         // store every message as missed_ws_message and remove upon recieving delivery reciept from client
         // return;
@@ -711,6 +707,10 @@ const socket_message_handler = async (
       // ----------------------------------------------------
       case "socket:ping": {
         // --------------------------------------------------
+        // WebSocket pings never get here: socket.server.ts answers them
+        // directly on the socket they arrived on (SYNC_V2 §14.5). This branch
+        // is only reachable from the HTTP long-polling path (chat-poll.routes)
+        // and is kept unchanged for it.
         // Client sent ping, respond with pong
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         await broadcast_message({

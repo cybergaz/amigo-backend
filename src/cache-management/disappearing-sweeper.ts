@@ -118,16 +118,19 @@ const tick = async () => {
   }
 };
 
-const start_disappearing_sweeper = (): (() => void) => {
+const start_disappearing_sweeper = (): (() => Promise<void>) => {
   if (stopped) stopped = false;
   schedule();
   console.log(`[SWEEPER] Disappearing-messages sweeper started (every ${SWEEP_INTERVAL_MS}ms, batch ${SWEEP_BATCH_SIZE})`);
-  return () => {
+  // Resolves once a sweep already in flight has finished, so the drain does
+  // not close the PG pool mid-sweep.
+  return async () => {
     stopped = true;
     if (timer) {
       clearTimeout(timer);
       timer = null;
     }
+    while (running) await Bun.sleep(25);
   };
 };
 
