@@ -13,9 +13,12 @@ import {
 } from "@/types/socket.types";
 import { broadcast_message, is_user_online } from "./socket.handlers";
 // import { update_user_connection_status } from "@/services/user.services";
-import { socket_connections, polling_connections } from "./socket.server";
+import { socket_connections, polling_connections, is_local_online } from "./connections";
+import { note_announced_status } from "./presence-flags";
+import { set_bg_soon, set_poll_bg_soon } from "@/cluster/presence";
 import {
   forward_messages,
+  resolve_reply_target,
   store_message_with_retry,
 } from "@/services/message.services";
 import { mark_read_upto } from "@/services/message-status.service";
@@ -36,6 +39,7 @@ import { livekit_call_model } from "@/models/call.model";
 import { and, eq, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import FCMService from "@/services/fcm.service";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
+import { start_fanout_log } from "@/utils/fanout-log";
 import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
 import type { CallEndReasonsType } from "@/types/call.types";
 // import {
@@ -60,7 +64,20 @@ import {
 } from "@/services/livekit.service";
 import { get_chat_type } from "@/cache-management/chat-type.cache";
 import { handle_broadcast_message_new } from "@/services/chat-broadcast.service";
+import {
+  apply_legacy_read,
+  apply_status_reads,
+  retry_unknown_legacy_read,
+  note_legacy_read,
+  note_status_ack,
+} from "@/services/sync/watermark.service";
+import { window_effects_active } from "@/services/sync/receipt-effects";
+import { sync_v2_flags } from "@/services/app-settings.service";
+import { v2_on } from "@/services/sync/flags-core";
+import { ack_seq_fields, msg_seq_fields } from "@/services/sync/frame-fields";
+import { run_fanout } from "./vital-chain";
 import type { ChatType } from "@/types/chat.types";
+import { sanitize_attachments } from "@/utils/attachment-thumbs";
 
 const handle_connection_status = async (
   payload: ConnectionStatusPayload,
@@ -76,6 +93,10 @@ const handle_connection_status = async (
     const connection = socket_connections.get(payload.sender_id);
     if (connection) {
       connection.is_background = payload.status === "background";
+      // A2 (RC-2): the same flag in the presence registry, so another
+      // worker's fan-out also pushes FCM to this backgrounded socket. Lost
+      // updates are repaired by the 15 s refresh (it rewrites bg).
+      set_bg_soon(payload.sender_id, connection.cid, connection.is_background);
     }
     // Same flag on the polling lease (SYNC_V2 R0): the lease is no longer
     // evicted per broadcast, so a backgrounded poller would otherwise sit in
@@ -84,6 +105,14 @@ const handle_connection_status = async (
     if (poll_connection) {
       poll_connection.connection_status = payload.status;
     }
+    // A4: the registry's poll key (existing lease only, TTL kept) and the
+    // announced-status hint — even with no lease on THIS worker: with
+    // several workers the user's lease may live on another one, and a lease
+    // created later anywhere must start from this announcement.
+    set_poll_bg_soon(payload.sender_id, payload.status === "background");
+    // Remembered past this lease (presence-flags.ts): a lease re-created
+    // during an old client's background wake starts from it.
+    note_announced_status(payload.sender_id, payload.status);
 
     const connected_users = await get_user_peers(payload.sender_id);
     const message_payload: ConnectionStatusPayload = {
@@ -161,6 +190,30 @@ const reset_unread_upto = async (
   }
 };
 
+// SYNC_V2 §3.7 (sync_v2 'on', derived state ready): an old app's read
+// frame is APPLIED to the PG watermarks, and its legacy effects (message_info
+// rows, conversation:join to the senders, reset_unread) are derived from
+// the committed window by apply_receipts (sync/receipt-effects.ts) — a
+// replayed or stale frame advances nothing and re-broadcasts nothing. The
+// Redis receipt cursor is still written for its legacy readers. Returns
+// false when the legacy path must run instead (chat not numbered, bad ids,
+// DB error).
+const v2_read_handled = async (payload: ConvJoinPayload, effective_ts: Date): Promise<boolean> => {
+  if (!window_effects_active()) return false;
+  // A client clock in the future must not date read receipts.
+  const at = effective_ts.getTime() > Date.now() || Number.isNaN(effective_ts.getTime()) ? new Date() : effective_ts;
+  const o = await apply_legacy_read(payload.user_id, payload.conv_id, payload.last_read_msg_id, payload.read_seq, at);
+  if (!o) return false;
+  // The id is not stored yet (the reader's own reply still being resent):
+  // nothing was applied. Legacy reset the badge here; retry the read until
+  // the reply lands instead (watermark.service retry_unknown_legacy_read).
+  if (o.status === "noop" && o.r === null && typeof payload.read_seq !== "number" && payload.last_read_msg_id) {
+    retry_unknown_legacy_read(payload.user_id, payload.conv_id, payload.last_read_msg_id, at);
+  }
+  set_last_read(payload.user_id, payload.conv_id, payload.last_read_msg_id, effective_ts);
+  return true;
+};
+
 const handle_conv_join = async (
   payload: ConvJoinPayload,
   timestamp?: Date | string,
@@ -182,6 +235,20 @@ const handle_conv_join = async (
           ? new Date(timestamp)
           : now;
 
+    if (await v2_read_handled(payload, effective_ts)) {
+      return {
+        success: true,
+        code: 200,
+        message:
+          "Conversation join/leave status updated and broadcasted successfully",
+      };
+    }
+
+    // SYNC_V2 §3.7 dual-write (sync_v2 shadow/on; a no-op when off):
+    // read_seq = seq(last_read_msg_id), by the authenticated id (the caller
+    // pins payload.user_id to it). Fire-and-forget: nothing below waits on it.
+    note_legacy_read(payload.user_id, payload.conv_id, payload.last_read_msg_id);
+
     // grab the previous cursor BEFORE overwriting it
     const prev_receipt = await get_receipt(payload.user_id, payload.conv_id);
     const prev_read_msg_id = prev_receipt.last_read_msg_id;
@@ -197,12 +264,9 @@ const handle_conv_join = async (
     // reset the unread count for this user - conversation, up to the watermark
     reset_unread_upto(payload.user_id, payload.conv_id, payload.last_read_msg_id);
 
-    // Pin the user's currently-active conversation on their socket connection so
-    // handle_message_new can skip incrementing unread for them while they're here.
-    // Polling-only clients have no socket_connections entry and fall through;
-    // their reset comes from the read-status ack path in handle_message_status_ack.
-    const ws_conn = socket_connections.get(payload.user_id);
-    if (ws_conn) ws_conn.active_conv_id = payload.conv_id;
+    // (The per-socket `active_conv_id` pin that used to be written here had
+    // no reader left — SYNC_V2 §13.7 A3 removed it; it could never work
+    // across workers anyway.)
 
     // mark messages as read upto last_read_msg_id in message_info table — only the unread window
     mark_read_upto(
@@ -295,6 +359,17 @@ const handle_conv_mark_read = async (
         : typeof timestamp === "string"
           ? new Date(timestamp)
           : now;
+
+    if (await v2_read_handled(payload, effective_ts)) {
+      return {
+        success: true,
+        code: 200,
+        message: "Conversation marked as read successfully",
+      };
+    }
+
+    // SYNC_V2 §3.7 dual-write, same mapping as conversation:join.
+    note_legacy_read(payload.user_id, payload.conv_id, payload.last_read_msg_id);
 
     // Snapshot previous cursor BEFORE overwriting so we only broadcast to
     // senders within the newly-acked window.
@@ -498,10 +573,19 @@ const handle_message_new = async (
   payload: ChatMessagePayload,
   user_name: string,
   // The authenticated user id of the connection/request that sent the frame.
-  // Only the broadcast-list branch uses it (it must not trust
-  // payload.sender_id); the DM/group path is unchanged.
+  // socket_message_handler already pinned payload.sender_id to it (the only
+  // caller); the broadcast-list branch re-checks it as defence in depth.
   auth_user_id?: string,
-): Promise<ResultType> => {
+): Promise<ResultType<{ sent_ack: MessageSentAckPayload }>> => {
+  // SYNC_V2 R1b: additive frame fields only in 'on' (frame-fields.ts).
+  const v2 = v2_on(sync_v2_flags());
+  // §14.7 item 5: bound the client-made attachments[i].thumb / thumb_url
+  // before anything stores or relays the payload (thumb only kept with
+  // sync_v2_inline_thumbs on). Identity (no copy, no change) for every
+  // message that has none — all old apps.
+  if (payload.attachments != null) {
+    payload.attachments = sanitize_attachments(payload.attachments, { inline_thumbs: sync_v2_flags().inline_thumbs });
+  }
   try {
     // Send guard: only active members may post (so a left/kicked user can't keep
     // sending into a group they no longer belong to). Active members ARE the
@@ -550,6 +634,7 @@ const handle_message_new = async (
         success: false,
         code: 403,
         message: "Not an active member of this conversation",
+        data: { sent_ack: rejected_ack },
       };
     }
 
@@ -582,8 +667,15 @@ const handle_message_new = async (
         success: false,
         code: 500,
         message: "Failed to resolve conversation type",
+        data: { sent_ack: failed_ack },
       };
     }
+    // replied_to is a client claim: keep it only when it names a live message
+    // of THIS chat, before either path stores it (resolve_reply_target).
+    if (payload.replied_to) {
+      payload.replied_to = await resolve_reply_target(payload.replied_to, payload.conv_id);
+    }
+
     if (chat_type === "broadcast") {
       return await handle_broadcast_message_new(payload, auth_user_id);
     }
@@ -615,6 +707,7 @@ const handle_message_new = async (
         success: false,
         code: store_msg_result.code || 500,
         message: "Failed to store message after multiple attempts",
+        data: { sent_ack: failed_to_send_ack },
       };
     }
 
@@ -634,6 +727,8 @@ const handle_message_new = async (
         conv_id: payload.conv_id,
         is_sent: true,
         sent_at: store_msg_result.data?.sent_at ?? undefined,
+        // §4.1: a duplicate returns the ORIGINAL seq ('on' only).
+        ...(v2 ? ack_seq_fields(store_msg_result.data) : {}),
       };
       await broadcast_message({
         to: "users",
@@ -648,6 +743,7 @@ const handle_message_new = async (
         success: true,
         code: 200,
         message: "Duplicate message ignored (idempotent)",
+        data: { sent_ack: dup_ack },
       };
     }
 
@@ -669,6 +765,8 @@ const handle_message_new = async (
       // Canonical stored sent_at — lets a sender with a skewed clock correct
       // its local copy to what the server persisted and recipients received.
       sent_at: store_msg_result.data?.sent_at ?? undefined,
+      // §4.1 additive ('on' only): seq + server arrival time.
+      ...(v2 ? ack_seq_fields(store_msg_result.data) : {}),
     };
     // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     await broadcast_message({
@@ -681,225 +779,263 @@ const handle_message_new = async (
       },
     });
 
-    // Pre-warm replied-to preview on the broadcast payload so recipients can
-    // render the reply container on first paint without a local DB lookup.
-    let replied_to_message: ChatMessagePayload["replied_to_message"] = null;
-    if (payload.replied_to) {
-      try {
-        const [orig] = await db
-          .select({
-            id: message_model.id,
-            sender_id: message_model.sender_id,
-            type: message_model.type,
-            body: message_model.body,
-            attachments: message_model.attachments,
-            sent_at: message_model.sent_at,
-          })
-          .from(message_model)
-          .where(eq(message_model.id, payload.replied_to))
-          .limit(1);
-        if (orig) {
-          // sender_name lookup is best-effort; the client falls back to
-          // its UserInfoCache if null.
-          let sender_name: string | null = null;
-          if (orig.sender_id) {
-            const [u] = await db
-              .select({ name: user_model.name })
-              .from(user_model)
-              .where(eq(user_model.id, orig.sender_id))
-              .limit(1);
-            sender_name = u?.name ?? null;
+    // Everything below is the fan-out of a committed, acked message. With
+    // sync_v2 'on' a WS frame runs it detached on the (sender, chat) chain
+    // so the socket's next vital frame commits without waiting for it
+    // (sockets/vital-chain.ts); otherwise it is awaited here, as before.
+    await run_fanout(payload.sender_id, payload.conv_id, async () => {
+      // Pre-warm replied-to preview on the broadcast payload so recipients can
+      // render the reply container on first paint without a local DB lookup.
+      let replied_to_message: ChatMessagePayload["replied_to_message"] = null;
+      if (payload.replied_to) {
+        try {
+          const [orig] = await db
+            .select({
+              id: message_model.id,
+              sender_id: message_model.sender_id,
+              type: message_model.type,
+              body: message_model.body,
+              attachments: message_model.attachments,
+              sent_at: message_model.sent_at,
+              seq: message_model.seq,
+              mod_seq: message_model.mod_seq,
+            })
+            .from(message_model)
+            // Same scope resolve_reply_target checked before the store (a
+            // delete racing in between previews as nothing, not its body).
+            .where(
+              and(
+                eq(message_model.id, payload.replied_to),
+                eq(message_model.chat_id, payload.conv_id),
+                isNull(message_model.deleted_at),
+              ),
+            )
+            .limit(1);
+          if (orig) {
+            // sender_name lookup is best-effort; the client falls back to
+            // its UserInfoCache if null.
+            let sender_name: string | null = null;
+            if (orig.sender_id) {
+              const [u] = await db
+                .select({ name: user_model.name })
+                .from(user_model)
+                .where(eq(user_model.id, orig.sender_id))
+                .limit(1);
+              sender_name = u?.name ?? null;
+            }
+            replied_to_message = {
+              id: orig.id,
+              sender_id: orig.sender_id,
+              sender_name,
+              type: orig.type,
+              body: orig.body,
+              attachments: orig.attachments,
+              sent_at: orig.sent_at,
+              // §4.1 additive ('on' only)
+              ...(v2 ? { seq: orig.seq ?? null, mod_seq: orig.mod_seq ?? null } : {}),
+            };
           }
-          replied_to_message = {
-            id: orig.id,
-            sender_id: orig.sender_id,
-            sender_name,
-            type: orig.type,
-            body: orig.body,
-            attachments: orig.attachments,
-            sent_at: orig.sent_at,
-          };
+        } catch (err) {
+          console.error("[message:new] replied_to enrichment failed:", err);
         }
-      } catch (err) {
-        console.error("[message:new] replied_to enrichment failed:", err);
       }
-    }
 
-    const updated_message_payload: ChatMessagePayload = {
-      ...payload,
-      id: payload.id, // client-generated UUIDv7, stable end-to-end — never rewritten
-      replied_to_message,
-      // Broadcast the stored sent_at, not the client claim — store_message
-      // clamps skewed client clocks to server time, and recipients must see
-      // the same value the DB holds.
-      sent_at: store_msg_result.data?.sent_at ?? payload.sent_at,
-      // Surface the server-stamped expires_at (null when chat has disappearing
-      // off) so recipients can filter expired-but-not-yet-deleted messages in
-      // the view layer. Server sweeper remains the authoritative deleter.
-      expires_at: store_msg_result.data?.expires_at ?? null,
-    };
+      const updated_message_payload: ChatMessagePayload = {
+        ...payload,
+        id: payload.id, // client-generated UUIDv7, stable end-to-end — never rewritten
+        replied_to_message,
+        // Broadcast the stored sent_at, not the client claim — store_message
+        // clamps skewed client clocks to server time, and recipients must see
+        // the same value the DB holds.
+        sent_at: store_msg_result.data?.sent_at ?? payload.sent_at,
+        // Surface the server-stamped expires_at (null when chat has disappearing
+        // off) so recipients can filter expired-but-not-yet-deleted messages in
+        // the view layer. Server sweeper remains the authoritative deleter.
+        expires_at: store_msg_result.data?.expires_at ?? null,
+        // §4.1 additive ('on' only): the stored row's seq / mod_seq / srv_ts
+        // (always the server's values, never a client-sent key).
+        ...(v2 ? msg_seq_fields(store_msg_result.data) : {}),
+      };
 
-    // Before fanning out the message: if the recipient previously hid this DM
-    // (chat_members.removed_at), revive their membership and emit a
-    // conversation:new event so their client recreates the local chat row
-    // before message:new is processed. Awaited so the conversation:new
-    // arrives on the WS wire ahead of message:new — order matters on the
-    // recipient side. Group chats short-circuit inside the helper.
-    await revive_hidden_dm_members(payload.conv_id, payload.sender_id, chat_type);
+      // Before fanning out the message: if the recipient previously hid this DM
+      // (chat_members.removed_at), revive their membership and emit a
+      // conversation:new event so their client recreates the local chat row
+      // before message:new is processed. Awaited so the conversation:new
+      // arrives on the WS wire ahead of message:new — order matters on the
+      // recipient side. Group chats short-circuit inside the helper.
+      await revive_hidden_dm_members(payload.conv_id, payload.sender_id, chat_type);
 
-    // broadcast to the chat recipients about the new message
-    // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    const sent_result = await broadcast_message({
-      to: "conversation",
-      conv_id: payload.conv_id,
-      message: {
+      // broadcast to the chat recipients about the new message
+      // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+      const sent_result = await broadcast_message({
+        to: "conversation",
+        conv_id: payload.conv_id,
+        message: {
+          type: "message:new",
+          payload: updated_message_payload,
+          ws_timestamp: new Date(),
+        },
+        exclude_user_ids: [payload.sender_id],
+      });
+
+      // NOTE: the sender's message:sent:ack is sent ABOVE, immediately after the
+      // message is stored and before this fan-out — see the comment there. Do not
+      // move it back down here: that reintroduces the 10-15s clock-tick lag in
+      // large groups by making the ack wait on the whole recipient loop.
+
+      // ── Fire-and-forget: Redis caches, DB status inserts, FCM ───────────
+      // These run after the sender ACK is sent — latency-insensitive work.
+      if (store_msg_result.data) {
+        // const conv_members = await get_conversation_members(payload.conv_id);
+        const now = new Date();
+
+        // 1. Update the last-message pointer — Redis chat_meta (display data)
+        //    AND the durable Postgres pointer, in one writer. chat_meta alone is
+        //    a cache that is never flushed, so on any wipe the pointer vanished
+        //    and every chat list blanked (the app hides chats whose last_msg_id
+        //    is null). Fire-and-forget, exactly like the old cache-only call:
+        //    set_last_message never rejects, and this runs AFTER the sender's
+        //    message:sent:ack above — nothing here may re-enter the ack path.
+        set_last_message(payload.conv_id, {
+          id: store_msg_result.data.id,
+          body: payload.body ?? "",
+          type: payload.msg_type,
+          sender_id: payload.sender_id,
+          // Prefer the stored (clock-clamped) sent_at over the raw client claim.
+          sent_at: (() => {
+            const stored = store_msg_result.data?.sent_at;
+            if (stored instanceof Date) return stored.toISOString();
+            // WS wire sends sent_at as an ISO string, but the type claims Date.
+            // Handle both safely without relying on TS's narrowing.
+            const raw = payload.sent_at as unknown;
+            if (raw instanceof Date) return raw.toISOString();
+            if (typeof raw === "string" && raw.length > 0) return raw;
+            return now.toISOString();
+          })(),
+          attachments: payload.attachments ?? null,
+          // sender_name: payload.sender_name ?? "",
+          // §3.5: with sync_v2 'on' the Redis half is a seq-CAS.
+          seq: store_msg_result.data.seq ?? null,
+          srv_ts: store_msg_result.data.created_at
+            ? new Date(store_msg_result.data.created_at).toISOString()
+            : null,
+        }, {
+          // Numbered chat (the insert returned a seq): messages_bi already
+          // moved the PG pointer — only the Redis preview is written.
+          numbered: store_msg_result.data.seq != null,
+        });
+
+        // 2. Increment unread for every chat member except the sender.
+        //
+        //    This used to also skip users whose socket carried
+        //    `active_conv_id === conv_id`, on the theory that their UI was
+        //    already showing the message. That pin is set in handle_conv_join
+        //    (:152) and NOTHING in the backend ever cleared it — there is no
+        //    conversation:leave event, handle_connection_status only touches
+        //    is_background, and the client emits nothing on leave. So after a
+        //    user opened a chat once, every later message in it silently skipped
+        //    their increment for the whole life of that socket. Redis stayed at
+        //    the "0" written by reset_unread, get_all_unread's `count > 0` filter
+        //    dropped the field, and the chat list truthfully reported 0 — which
+        //    the client then wrote over its locally-counted badge. That was the
+        //    "open a chat, go back, refresh, receive messages, refresh => badge
+        //    gone" bug, and it explained why a fresh app open was unaffected
+        //    (new socket, no pin yet).
+        //
+        //    Always incrementing is safe: the genuinely-open case is covered
+        //    twice over — the client writes 0 for its active conversation
+        //    (chat.provider _handleNewMessage) and the read-status ack drives
+        //    reset_unread in handle_message_status_ack below, within the
+        //    client's 800ms ack debounce.
+        const unread_user_ids = [
+          ...sent_result.offline,
+          ...sent_result.online,
+          ...sent_result.polling,
+        ].filter((id) => id !== payload.sender_id);
+        if (unread_user_ids.length > 0) {
+          batch_increment_unread(unread_user_ids, payload.conv_id);
+        }
+
+        // 3. Batch insert message_status in the redis (redis first to wait for status updates)
+        // const message_statuses: Array<{
+        //   user_id: string;
+        //   message_id: string;
+        //   chat_id: string;
+        //   delivered_at: Date | null;
+        //   // read_at: Date | null;
+        // }> = [];
+        // for (const member_id of conv_members) {
+        //   if (member_id !== payload.sender_id) {
+        //     message_statuses.push({
+        //       user_id: member_id,
+        //       message_id: store_msg_result.data.id,
+        //       chat_id: payload.conv_id,
+        //       delivered_at: sent_result.online.includes(member_id) ? now : null,
+        //       // read_at: sent_result.active_in_conv.includes(member_id) ? now : null,
+        //     });
+        //   }
+        // }
+        // if (message_statuses.length > 0) {
+        //   batch_insert_message_status(message_statuses);
+        // }
+
+        // 4. Update chat_member delivery/read cursors
+        // const offline_and_inactive_users = new Set([...sent_result.offline, ...sent_result.online]);
+        // for (const user_id of offline_and_inactive_users) {
+        //   db.update(chat_member_model)
+        //     .set({
+        //       last_delivered_msg_id: sent_result.online.includes(user_id) || sent_result.active_in_conv.includes(user_id)
+        //         ? store_msg_result.data.id
+        //         : sql`${chat_member_model.last_delivered_msg_id}`,
+        //       last_read_msg_id: sent_result.active_in_conv.includes(user_id)
+        //         ? store_msg_result.data.id
+        //         : sql`${chat_member_model.last_read_msg_id}`,
+        //     })
+        //     .where(
+        //       and(
+        //         eq(chat_member_model.chat_id, payload.conv_id),
+        //         eq(chat_member_model.user_id, user_id)
+        //       )
+        //     );
+        // }
+      }
+
+      // 5. (The Postgres last-message pointer used to be written here, commented
+      //     out. It now happens inside set_last_message in step 1, which writes
+      //     both halves — see the note there.)
+
+      // 6. Queue FCM for offline AND backgrounded users. Backgrounded users keep
+      //    a live WS (so they also received the frame above), but the OS may have
+      //    frozen the socket, so a push is the reliable delivery path — the client
+      //    dedupes the WS/FCM overlap by message id. Muted recipients still get
+      //    the FCM (their app needs the message to land in local DB) but with a
+      //    silent flag so the app skips painting a local notification. offline and
+      //    background are disjoint (background ⊂ online), so no double-queue.
+      const fcm_ws_message: WSMessage = {
         type: "message:new",
         payload: updated_message_payload,
         ws_timestamp: new Date(),
-      },
-      exclude_user_ids: [payload.sender_id],
-    });
-
-    // NOTE: the sender's message:sent:ack is sent ABOVE, immediately after the
-    // message is stored and before this fan-out — see the comment there. Do not
-    // move it back down here: that reintroduces the 10-15s clock-tick lag in
-    // large groups by making the ack wait on the whole recipient loop.
-
-    // ── Fire-and-forget: Redis caches, DB status inserts, FCM ───────────
-    // These run after the sender ACK is sent — latency-insensitive work.
-    if (store_msg_result.data) {
-      // const conv_members = await get_conversation_members(payload.conv_id);
-      const now = new Date();
-
-      // 1. Update the last-message pointer — Redis chat_meta (display data)
-      //    AND the durable Postgres pointer, in one writer. chat_meta alone is
-      //    a cache that is never flushed, so on any wipe the pointer vanished
-      //    and every chat list blanked (the app hides chats whose last_msg_id
-      //    is null). Fire-and-forget, exactly like the old cache-only call:
-      //    set_last_message never rejects, and this runs AFTER the sender's
-      //    message:sent:ack above — nothing here may re-enter the ack path.
-      set_last_message(payload.conv_id, {
-        id: store_msg_result.data.id,
-        body: payload.body ?? "",
-        type: payload.msg_type,
-        sender_id: payload.sender_id,
-        // Prefer the stored (clock-clamped) sent_at over the raw client claim.
-        sent_at: (() => {
-          const stored = store_msg_result.data?.sent_at;
-          if (stored instanceof Date) return stored.toISOString();
-          // WS wire sends sent_at as an ISO string, but the type claims Date.
-          // Handle both safely without relying on TS's narrowing.
-          const raw = payload.sent_at as unknown;
-          if (raw instanceof Date) return raw.toISOString();
-          if (typeof raw === "string" && raw.length > 0) return raw;
-          return now.toISOString();
-        })(),
-        attachments: payload.attachments ?? null,
-        // sender_name: payload.sender_name ?? "",
-      });
-
-      // 2. Increment unread for every chat member except the sender.
-      //
-      //    This used to also skip users whose socket carried
-      //    `active_conv_id === conv_id`, on the theory that their UI was
-      //    already showing the message. That pin is set in handle_conv_join
-      //    (:152) and NOTHING in the backend ever cleared it — there is no
-      //    conversation:leave event, handle_connection_status only touches
-      //    is_background, and the client emits nothing on leave. So after a
-      //    user opened a chat once, every later message in it silently skipped
-      //    their increment for the whole life of that socket. Redis stayed at
-      //    the "0" written by reset_unread, get_all_unread's `count > 0` filter
-      //    dropped the field, and the chat list truthfully reported 0 — which
-      //    the client then wrote over its locally-counted badge. That was the
-      //    "open a chat, go back, refresh, receive messages, refresh => badge
-      //    gone" bug, and it explained why a fresh app open was unaffected
-      //    (new socket, no pin yet).
-      //
-      //    Always incrementing is safe: the genuinely-open case is covered
-      //    twice over — the client writes 0 for its active conversation
-      //    (chat.provider _handleNewMessage) and the read-status ack drives
-      //    reset_unread in handle_message_status_ack below, within the
-      //    client's 800ms ack debounce.
-      const unread_user_ids = [
-        ...sent_result.offline,
-        ...sent_result.online,
-        ...sent_result.polling,
-      ].filter((id) => id !== payload.sender_id);
-      if (unread_user_ids.length > 0) {
-        batch_increment_unread(unread_user_ids, payload.conv_id);
+      };
+      const muted = await get_muted_user_ids(payload.conv_id);
+      const fanout = start_fanout_log("new", payload.id, payload.conv_id, sent_result);
+      for (const user_id of [...sent_result.offline, ...sent_result.background]) {
+        const on_result = fanout.fcm_queued();
+        queue_message_fcm(user_id, fcm_ws_message, {
+          silent: muted.has(user_id),
+          on_result,
+        }).catch((err) => {
+          on_result(false);
+          console.error("[FCM-BATCH] queue failed:", err);
+        });
       }
-
-      // 3. Batch insert message_status in the redis (redis first to wait for status updates)
-      // const message_statuses: Array<{
-      //   user_id: string;
-      //   message_id: string;
-      //   chat_id: string;
-      //   delivered_at: Date | null;
-      //   // read_at: Date | null;
-      // }> = [];
-      // for (const member_id of conv_members) {
-      //   if (member_id !== payload.sender_id) {
-      //     message_statuses.push({
-      //       user_id: member_id,
-      //       message_id: store_msg_result.data.id,
-      //       chat_id: payload.conv_id,
-      //       delivered_at: sent_result.online.includes(member_id) ? now : null,
-      //       // read_at: sent_result.active_in_conv.includes(member_id) ? now : null,
-      //     });
-      //   }
-      // }
-      // if (message_statuses.length > 0) {
-      //   batch_insert_message_status(message_statuses);
-      // }
-
-      // 4. Update chat_member delivery/read cursors
-      // const offline_and_inactive_users = new Set([...sent_result.offline, ...sent_result.online]);
-      // for (const user_id of offline_and_inactive_users) {
-      //   db.update(chat_member_model)
-      //     .set({
-      //       last_delivered_msg_id: sent_result.online.includes(user_id) || sent_result.active_in_conv.includes(user_id)
-      //         ? store_msg_result.data.id
-      //         : sql`${chat_member_model.last_delivered_msg_id}`,
-      //       last_read_msg_id: sent_result.active_in_conv.includes(user_id)
-      //         ? store_msg_result.data.id
-      //         : sql`${chat_member_model.last_read_msg_id}`,
-      //     })
-      //     .where(
-      //       and(
-      //         eq(chat_member_model.chat_id, payload.conv_id),
-      //         eq(chat_member_model.user_id, user_id)
-      //       )
-      //     );
-      // }
-    }
-
-    // 5. (The Postgres last-message pointer used to be written here, commented
-    //     out. It now happens inside set_last_message in step 1, which writes
-    //     both halves — see the note there.)
-
-    // 6. Queue FCM for offline AND backgrounded users. Backgrounded users keep
-    //    a live WS (so they also received the frame above), but the OS may have
-    //    frozen the socket, so a push is the reliable delivery path — the client
-    //    dedupes the WS/FCM overlap by message id. Muted recipients still get
-    //    the FCM (their app needs the message to land in local DB) but with a
-    //    silent flag so the app skips painting a local notification. offline and
-    //    background are disjoint (background ⊂ online), so no double-queue.
-    const fcm_ws_message: WSMessage = {
-      type: "message:new",
-      payload: updated_message_payload,
-      ws_timestamp: new Date(),
-    };
-    const muted = await get_muted_user_ids(payload.conv_id);
-    for (const user_id of [...sent_result.offline, ...sent_result.background]) {
-      queue_message_fcm(user_id, fcm_ws_message, {
-        silent: muted.has(user_id),
-      });
-    }
+      fanout.done_queueing();
+    });
 
     return {
       success: true,
       code: 200,
       message: "New Message is processed and broadcasted successfully",
+      data: { sent_ack },
     };
   } catch (error) {
     console.error("[WS] Error handling connection status change:", error);
@@ -933,19 +1069,60 @@ const handle_message_status_ack = async (
     // store in redis cache (fire-and-forget, flushed to DB by worker)
     batch_mark_status(recipient_id, ack_at, payload.acks);
 
+    // SYNC_V2 §3.7 dual-write (shadow/on): read acks → read_seq now (max
+    // seq of the ids); delivered-only acks → the 1 s per-worker coalescing
+    // buffer. `recipient_id` is the authenticated id here.
+    note_status_ack(recipient_id, payload.acks);
+
+    // SYNC_V2 §3.7 (sync_v2 'on', derived state ready): the read acks are
+    // applied here (awaited) and the delivered ones by the coalescer; for
+    // reads, the relay to senders, reset_unread and the sender drains then
+    // come from the committed windows (sync/receipt-effects.ts), and only
+    // chats the windows could not take (not numbered / failed) keep the
+    // relay below. Delivered-only groups ALWAYS keep the per-id relay below:
+    // a window would claim every row up to the highest acked seq, including
+    // ones lost on a half-open socket (legacy_delivered in the coalescer).
+    let acks = payload.acks;
+    let acker_drained = false;
+    if (window_effects_active()) {
+      // The acker's own message:new drain for every acked id stays
+      // immediate (as in the legacy path below), whatever the windows do.
+      const ids = payload.acks.flatMap((g) => g.msg_ids);
+      if (ids.length > 0) {
+        acker_drained = true;
+        remove_pending_messages_batch(
+          recipient_id,
+          ids.map((id) => Snowflake.correlationId(recipient_id, "message:new", id)),
+        ).catch((err) => console.error("[STATUS-ACK] pending drain failed:", err));
+      }
+      const owned = await apply_status_reads(
+        recipient_id,
+        acks.filter((g) => g.status.includes("read")),
+        ack_at.getTime() > Date.now() || Number.isNaN(ack_at.getTime()) ? new Date() : ack_at,
+      );
+      acks = acks.filter((g) => !g.status.includes("read") || !owned.has(g.chat_id.toLowerCase()));
+      if (acks.length === 0) {
+        return {
+          success: true,
+          code: 200,
+          message: "Message status ack processed and broadcasted successfully",
+        };
+      }
+    }
+
     // Read-status acks mean the user has caught up to the messages they're
     // acking — reset Redis unread for those chats. Polling-only clients
     // (which never set active_conv_id) rely on this path to keep their badge
     // counts honest. Newer messages arriving after the ack will re-bump for
     // recipients who aren't currently in the conv via handle_message_new.
-    for (const g of payload.acks) {
+    for (const g of acks) {
       if (g.status.includes("read")) {
         reset_unread(recipient_id, g.chat_id);
       }
     }
 
     // collect all msg_ids, one PK lookup to get sender_id per message
-    const all_msg_ids = payload.acks.flatMap((g) => g.msg_ids);
+    const all_msg_ids = acks.flatMap((g) => g.msg_ids);
 
     // Drain-on-ack: the acker has provably received these messages, so their
     // pending-queue copies (stored under deterministic keys
@@ -953,7 +1130,7 @@ const handle_message_status_ack = async (
     // their 10s deferred DB writes. Entries stored before this deploy carry
     // random keys, miss harmlessly, and still drain via poll/TTL.
     // Fire-and-forget: never on the ack critical path.
-    if (all_msg_ids.length > 0) {
+    if (all_msg_ids.length > 0 && !acker_drained) {
       remove_pending_messages_batch(
         recipient_id,
         all_msg_ids.map((id) =>
@@ -991,7 +1168,7 @@ const handle_message_status_ack = async (
 
       // group acks by sender so each sender gets only their messages
       const per_sender = new Map<string, MessageStatusAckPayload["acks"]>();
-      for (const group of payload.acks) {
+      for (const group of acks) {
         for (const msg_id of group.msg_ids) {
           const sid = sender_map.get(msg_id);
           if (!sid || sid === recipient_id) continue;
@@ -1074,158 +1251,219 @@ const handle_message_forward = async (
   username: string,
 ): Promise<ResultType> => {
   try {
+    const v2 = v2_on(sync_v2_flags());
     const forward_res = await forward_messages(
       {
         message_ids: payload.forwarded_message_ids,
         source_conversation_id: payload.source_conv_id,
         target_conversation_ids: payload.target_conv_ids,
+        // §3.3.7: client ids (honoured in 'on' only, inside forward_messages).
+        ...(payload.ids ? { ids: payload.ids } : {}),
       },
       payload.forwarder_id,
     );
+
+    // Refused (403: not a member of the source / any target) or nothing to
+    // forward (404): report it — the handler turns it into a socket:error for
+    // the forwarder. This used to fall through to "success".
+    if (!forward_res.success) {
+      return {
+        success: false,
+        code: forward_res.code,
+        message: forward_res.message,
+      };
+    }
 
     if (forward_res.success && forward_res.data) {
       // Collect all message status records for batch insert
       // const all_message_statuses: Array<{ user_id: string; message_id: string; chat_id: string; delivered_at: Date | null; read_at: Date | null; }> = [];
 
       // loop on all target conversations (use for...of to properly await)
-      for (const [conv_id, all_msgs_for_conv] of forward_res.data.entries()) {
-        // Get all members of this conversation for batch message status creation
-        // const conv_members = await get_conversation_members(conv_id);
-
-        // Presence buckets for this conversation, captured from the FIRST
-        // broadcast only. broadcast_message used to evict polling connections
-        // as a side effect on every call, so only the first call in a burst
-        // bucketed polling recipients correctly. Since SYNC_V2 R0 the lease is
-        // non-destructive (only a stale lease is evicted), but one bucketing
-        // per burst stays: it keeps one FCM decision for the whole burst.
-        let presence: Awaited<ReturnType<typeof broadcast_message>> | null = null;
-
-        // loop on all forward message in that target conversation
-        for (const msg of all_msgs_for_conv) {
-          const new_chat_msg_payload: ChatMessagePayload = {
-            id: msg.id,
-            sender_id: msg.sender_id ?? payload.forwarder_id,
-            // sender_name: payload.forwarder_name || username ? String(username) : undefined,
-            conv_id: conv_id,
-            // conv_type: msg.conv_type as ChatType,
-            msg_type: msg.type,
-            body: msg.body || undefined,
-            attachments: msg.attachments,
-            sent_at: msg.sent_at ? msg.sent_at : new Date(),
-          };
-
-          // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-          // NOTE: exclude_user_ids stays off deliberately. The forwarder's
-          // client performs no optimistic local insert for a forward (it only
-          // sends the frame), and in broadcast_message an excluded user returns
-          // before store_targets.push — excluding the forwarder would make the
-          // forward vanish from their own copy of the chat.
-          const sent_result = await broadcast_message({
-            to: "conversation",
-            conv_id: conv_id,
+      for (const [conv_id, stored_msgs_for_conv] of forward_res.data.entries()) {
+        // §3.3.7 replay (sync_v2 'on'): rows that already existed were fanned
+        // out by the first arrival. Only the forwarder gets them again — with
+        // their ORIGINAL seq — so its outbox learns the result.
+        const duplicates = stored_msgs_for_conv.filter((m) => m.duplicate);
+        const all_msgs_for_conv = duplicates.length === 0
+          ? stored_msgs_for_conv
+          : stored_msgs_for_conv.filter((m) => !m.duplicate);
+        for (const msg of duplicates) {
+          await broadcast_message({
+            to: "users",
+            user_ids: [payload.forwarder_id],
             message: {
               type: "message:new",
-              payload: new_chat_msg_payload,
+              payload: {
+                id: msg.id,
+                sender_id: msg.sender_id ?? payload.forwarder_id,
+                conv_id,
+                msg_type: msg.type,
+                body: msg.body || undefined,
+                attachments: msg.attachments,
+                sent_at: msg.sent_at ? msg.sent_at : new Date(),
+                ...msg_seq_fields(msg),
+              },
               ws_timestamp: new Date(),
             },
-            // exclude_user_ids: [payload.forwarder_id],
           });
-          if (presence === null) presence = sent_result;
-
-          // Prepare message status records for all members except sender
-          // for (const member_id of conv_members) {
-          //   if (member_id !== payload.forwarder_id) {
-          //
-          //     const is_member_online = socket_connections.has(member_id);
-          //     const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === conv_id;
-          //
-          //     all_message_statuses.push({
-          //       user_id: member_id,
-          //       message_id: msg.id,
-          //       chat_id: conv_id,
-          //       delivered_at: is_member_online ? new Date() : null,
-          //       read_at: is_member_in_conv ? new Date() : null,
-          //     });
-          //   }
-          // }
         }
+        if (all_msgs_for_conv.length === 0) continue;
+        // The fan-out, detached per (forwarder, chat) when this is a serial
+        // vital frame (sync_v2 'on'), awaited inline otherwise.
+        await run_fanout(payload.forwarder_id, conv_id, async () => {
+          // Get all members of this conversation for batch message status creation
+          // const conv_members = await get_conversation_members(conv_id);
 
-        // sort message based on sent_at, and extract the most recent message if sent_at is not present then sort based on message_id
-        all_msgs_for_conv.sort((a, b) => {
-          const dateA = a.sent_at ? new Date(a.sent_at).getTime() : 0;
-          const dateB = b.sent_at ? new Date(b.sent_at).getTime() : 0;
+          // Presence buckets for this conversation, captured from the FIRST
+          // broadcast only. broadcast_message used to evict polling connections
+          // as a side effect on every call, so only the first call in a burst
+          // bucketed polling recipients correctly. Since SYNC_V2 R0 the lease is
+          // non-destructive (only a stale lease is evicted), but one bucketing
+          // per burst stays: it keeps one FCM decision for the whole burst.
+          let presence: Awaited<ReturnType<typeof broadcast_message>> | null = null;
 
-          if (dateA !== dateB) {
-            return dateA - dateB;
-          } else {
-            return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-          }
-        });
-
-        // Update the conversation's last message — both the Redis preview and
-        // the durable Postgres pointer (the latter was commented out here, so
-        // a forward-only chat lost its pointer on every cache wipe).
-        const last_msg = all_msgs_for_conv[all_msgs_for_conv.length - 1];
-        set_last_message(conv_id, {
-          id: last_msg.id,
-          body: last_msg.body ?? "",
-          type: last_msg.type,
-          sender_id: last_msg.sender_id ?? payload.forwarder_id,
-          sent_at: last_msg.sent_at?.toISOString() ?? new Date().toISOString(),
-          attachments: last_msg.attachments ?? null,
-          // sender_name: payload.sender_name ?? "",
-        });
-
-        // ── The two things this path used to skip entirely ────────────────
-        // handle_message_forward only ever inserted rows and broadcast them.
-        // It never touched Redis unread and never queued FCM, so forwarded
-        // messages arrived silently and their badge died on the next chat-list
-        // refresh (the Redis field was never created, so get_all_unread
-        // reported nothing and the list shipped 0).
-        if (presence) {
-          // Bump by N in ONE pipeline — a forward is N messages, not 1. This is
-          // what made the badge rise by only 1 no matter how many were sent.
-          const forwarded_count = all_msgs_for_conv.length;
-          const unread_user_ids = [
-            ...presence.offline,
-            ...presence.online,
-            ...presence.polling,
-          ].filter((id) => id !== payload.forwarder_id);
-          if (unread_user_ids.length > 0) {
-            // fire-and-forget, matching handle_message_new
-            batch_increment_unread_by(unread_user_ids, conv_id, forwarded_count);
-          }
-
-          // FCM for offline + backgrounded recipients. Resolve mutes ONCE per
-          // conversation — get_muted_user_ids hits Redis and may hydrate from
-          // the DB, so it must never sit inside the per-message loop.
-          // The forwarder filter is mandatory here: unlike handle_message_new,
-          // this path does not pass exclude_user_ids, so the forwarder is in
-          // these buckets and would otherwise push a notification to itself.
-          const muted = await get_muted_user_ids(conv_id);
+          // loop on all forward message in that target conversation
           for (const msg of all_msgs_for_conv) {
-            const fcm_payload: ChatMessagePayload = {
+            const new_chat_msg_payload: ChatMessagePayload = {
               id: msg.id,
               sender_id: msg.sender_id ?? payload.forwarder_id,
+              // sender_name: payload.forwarder_name || username ? String(username) : undefined,
               conv_id: conv_id,
+              // conv_type: msg.conv_type as ChatType,
               msg_type: msg.type,
               body: msg.body || undefined,
               attachments: msg.attachments,
               sent_at: msg.sent_at ? msg.sent_at : new Date(),
+              // §4.1 additive ('on' only)
+              ...(v2 ? msg_seq_fields(msg) : {}),
             };
-            const fcm_ws_message: WSMessage = {
-              type: "message:new",
-              payload: fcm_payload,
-              ws_timestamp: new Date(),
-            };
-            for (const uid of [...presence.offline, ...presence.background]) {
-              if (uid === payload.forwarder_id) continue;
-              queue_message_fcm(uid, fcm_ws_message, {
-                silent: muted.has(uid),
+
+            // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            // NOTE: exclude_user_ids stays off deliberately. The forwarder's
+            // client performs no optimistic local insert for a forward (it only
+            // sends the frame), and in broadcast_message an excluded user returns
+            // before store_targets.push — excluding the forwarder would make the
+            // forward vanish from their own copy of the chat.
+            const sent_result = await broadcast_message({
+              to: "conversation",
+              conv_id: conv_id,
+              message: {
+                type: "message:new",
+                payload: new_chat_msg_payload,
+                ws_timestamp: new Date(),
+              },
+              // exclude_user_ids: [payload.forwarder_id],
+            });
+            if (presence === null) presence = sent_result;
+
+            // Prepare message status records for all members except sender
+            // for (const member_id of conv_members) {
+            //   if (member_id !== payload.forwarder_id) {
+            //
+            //     const is_member_online = socket_connections.has(member_id);
+            //     const is_member_in_conv = socket_connections.get(member_id)?.active_conv_id === conv_id;
+            //
+            //     all_message_statuses.push({
+            //       user_id: member_id,
+            //       message_id: msg.id,
+            //       chat_id: conv_id,
+            //       delivered_at: is_member_online ? new Date() : null,
+            //       read_at: is_member_in_conv ? new Date() : null,
+            //     });
+            //   }
+            // }
+          }
+
+          // sort message based on sent_at, and extract the most recent message if sent_at is not present then sort based on message_id
+          all_msgs_for_conv.sort((a, b) => {
+            const dateA = a.sent_at ? new Date(a.sent_at).getTime() : 0;
+            const dateB = b.sent_at ? new Date(b.sent_at).getTime() : 0;
+
+            if (dateA !== dateB) {
+              return dateA - dateB;
+            } else {
+              return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+            }
+          });
+
+          // Update the conversation's last message — both the Redis preview and
+          // the durable Postgres pointer (the latter was commented out here, so
+          // a forward-only chat lost its pointer on every cache wipe).
+          const last_msg = all_msgs_for_conv[all_msgs_for_conv.length - 1];
+          set_last_message(conv_id, {
+            id: last_msg.id,
+            body: last_msg.body ?? "",
+            type: last_msg.type,
+            sender_id: last_msg.sender_id ?? payload.forwarder_id,
+            sent_at: last_msg.sent_at?.toISOString() ?? new Date().toISOString(),
+            attachments: last_msg.attachments ?? null,
+            // sender_name: payload.sender_name ?? "",
+            // §3.5: the seq-CAS in 'on'.
+            seq: last_msg.seq ?? null,
+            srv_ts: last_msg.created_at ? new Date(last_msg.created_at).toISOString() : null,
+          }, { numbered: last_msg.seq != null });
+
+          // ── The two things this path used to skip entirely ────────────────
+          // handle_message_forward only ever inserted rows and broadcast them.
+          // It never touched Redis unread and never queued FCM, so forwarded
+          // messages arrived silently and their badge died on the next chat-list
+          // refresh (the Redis field was never created, so get_all_unread
+          // reported nothing and the list shipped 0).
+          if (presence) {
+            // Bump by N in ONE pipeline — a forward is N messages, not 1. This is
+            // what made the badge rise by only 1 no matter how many were sent.
+            const forwarded_count = all_msgs_for_conv.length;
+            const unread_user_ids = [
+              ...presence.offline,
+              ...presence.online,
+              ...presence.polling,
+            ].filter((id) => id !== payload.forwarder_id);
+            if (unread_user_ids.length > 0) {
+              // fire-and-forget, matching handle_message_new
+              batch_increment_unread_by(unread_user_ids, conv_id, forwarded_count);
+            }
+
+            // FCM for offline + backgrounded recipients. Resolve mutes ONCE per
+            // conversation — get_muted_user_ids hits Redis and may hydrate from
+            // the DB, so it must never sit inside the per-message loop.
+            // The forwarder filter is mandatory here: unlike handle_message_new,
+            // this path does not pass exclude_user_ids, so the forwarder is in
+            // these buckets and would otherwise push a notification to itself.
+            const muted = await get_muted_user_ids(conv_id);
+            for (const msg of all_msgs_for_conv) {
+              const fanout = start_fanout_log("fwd", msg.id, conv_id, presence, {
+                exclude: payload.forwarder_id,
               });
+              const fcm_payload: ChatMessagePayload = {
+                id: msg.id,
+                sender_id: msg.sender_id ?? payload.forwarder_id,
+                conv_id: conv_id,
+                msg_type: msg.type,
+                body: msg.body || undefined,
+                attachments: msg.attachments,
+                sent_at: msg.sent_at ? msg.sent_at : new Date(),
+                ...(v2 ? msg_seq_fields(msg) : {}),
+              };
+              const fcm_ws_message: WSMessage = {
+                type: "message:new",
+                payload: fcm_payload,
+                ws_timestamp: new Date(),
+              };
+              for (const uid of [...presence.offline, ...presence.background]) {
+                if (uid === payload.forwarder_id) continue;
+                const on_result = fanout.fcm_queued();
+                queue_message_fcm(uid, fcm_ws_message, {
+                  silent: muted.has(uid),
+                  on_result,
+                }).catch((err) => {
+                  on_result(false);
+                  console.error("[FCM-BATCH] queue failed:", err);
+                });
+              }
+              fanout.done_queueing();
             }
           }
-        }
+        });
       }
 
       // Batch insert all message statuses in ONE database call
@@ -1425,7 +1663,7 @@ const handle_call_init = async (
       });
 
       // Send ringing to callee via WebSocket if online
-      if (is_user_online(payload.callee_id)) {
+      if (await is_user_online(payload.callee_id)) {
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         await broadcast_message({
           to: "users",
@@ -1883,7 +2121,7 @@ const handle_call_termination = async (
       // Notify each party individually via WS (if online) or FCM (if offline)
       for (const id of [resolved_caller_id, resolved_callee_id]) {
         if (!id) continue;
-        if (is_user_online(id)) {
+        if (await is_user_online(id)) {
           // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
           await broadcast_message({
             to: "users",
@@ -1948,7 +2186,7 @@ register_missed_call_notifier(async (callee_id, call_id, caller_id) => {
     callee_id,
     timestamp: new Date(),
   };
-  if (is_user_online(callee_id)) {
+  if (await is_user_online(callee_id)) {
     await broadcast_message({
       to: "users",
       user_ids: [callee_id],
@@ -2022,7 +2260,7 @@ const fan_out_to_user = async (
   ws_event_type: WSMessageEventsType,
   payload: CallPayload,
 ): Promise<void> => {
-  if (is_user_online(target_id)) {
+  if (await is_user_online(target_id)) {
     await broadcast_message({
       to: "users",
       user_ids: [target_id],
@@ -2076,7 +2314,10 @@ register_call_timeout_notifier(async (call) => {
 // worker whose timeout notification would actually go out over WS. Wrapped:
 // socket.handlers imports this module, so its binding may not be initialised
 // yet while this top-level code runs.
-register_call_party_locality((user_id) => is_user_online(user_id));
+// Deliberately LOCAL and synchronous (not the async, cluster-wide
+// is_user_online): the question is "can THIS worker notify the party over
+// its own socket", and the ring tick asks it for a batch without awaiting.
+register_call_party_locality((user_id) => is_local_online(user_id));
 
 /**
  * The app reports that a Stream call reached the CONNECTED state (first media

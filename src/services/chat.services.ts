@@ -27,6 +27,24 @@ import { broadcast_recipient_model } from "@/models/broadcast.model";
 import { get_chat_type } from "@/cache-management/chat-type.cache";
 import { soft_delete_broadcast_copies } from "./chat-broadcast.service";
 import { for_each_with_concurrency, BROADCAST_FANOUT_CONCURRENCY } from "@/utils/broadcast.utils";
+import { pg_client } from "@/config/db";
+import { sync_v2_flags } from "./app-settings.service";
+import {
+  check_member_mark_hidden,
+  insert_system_row,
+  scrub_delete_message,
+  system_row_action,
+} from "./sync/write-queries";
+import { soft_delete_grouped } from "./sync/bulk-delete";
+import { not_scrubbed_tombstone } from "./sync/scrubbed";
+import { note_clear } from "./sync/watermark.service";
+import { shadow_compare_unread } from "./sync/unread-shadow";
+import { chat_list_state_sql, delete_frame_state_sql, type ChatListState, type DeleteFrameState } from "./sync/read-queries";
+import { delete_unpin_field } from "./sync/frame-fields";
+import { run_fanout } from "@/sockets/vital-chain";
+import { derived_ready, v2_on } from "./sync/flags-core";
+import { sync_proto_for } from "./sync/read-core";
+import { count } from "@/utils/counters";
 
 const build_conversation_action_message = (
   action: ConversationActionPayload["action"],
@@ -150,6 +168,63 @@ const broadcast_conversation_action = async (data: {
     ...(data.resolution !== undefined ? { resolution: data.resolution } : {}),
   };
 
+  // Persisted system row (SYNC_V2 §3.10, PD-2), behind
+  // app_settings.sync_v2_system_rows (default OFF → this block never runs and
+  // the frame is byte-identical to before). The row id IS the event_id, so an
+  // old client's synthetic row (built from event_id) and the stored row
+  // dedupe by primary key; the trigger numbers it and moves the last-message
+  // pointer. The legacy `message` field stays the text (old apps parse it as
+  // a String), so the stored row rides as the additive `system_message`.
+  // Join requests (direct-only) and chat_delete are never persisted.
+  const sys_action = system_row_action(data.action);
+  if (
+    sys_action &&
+    sync_v2_flags().system_rows &&
+    !(data.direct_user_ids && data.direct_user_ids.length > 0) &&
+    data.conv_type !== "broadcast"
+  ) {
+    try {
+      const stored = await insert_system_row(pg_client, {
+        id: payload.event_id,
+        chat_id: data.conv_id,
+        body: payload.message,
+        meta: {
+          action: sys_action,
+          members: data.members.map((m) => m.user_id).filter(Boolean),
+          actor_id: data.actor_id ?? null,
+          ...(data.title !== undefined ? { title: data.title ?? null } : {}),
+          ...(data.profile_pic_changed ? { profile_pic: data.profile_pic ?? null } : {}),
+          ...(data.owner_id !== undefined ? { owner_id: data.owner_id ?? null } : {}),
+        },
+      });
+      if (stored) {
+        payload.system_message = {
+          id: stored.id,
+          seq: stored.seq,
+          srv_ts: stored.created_at.toISOString(),
+        };
+        // Preview + the legacy PG pointer (the PG half only writes while the
+        // chat is unnumbered; numbered chats were moved by the trigger).
+        if (stored.inserted) {
+          void set_last_message(data.conv_id, {
+            id: stored.id,
+            body: payload.message,
+            type: "system",
+            sender_id: data.actor_id ?? "",
+            sent_at: stored.created_at.toISOString(),
+            attachments: null,
+            // §3.5: the seq-CAS in 'on'.
+            seq: stored.seq,
+            srv_ts: stored.created_at.toISOString(),
+          }, { numbered: stored.seq != null });
+        }
+      }
+    } catch (err) {
+      // The legacy frame still goes out: persistence is additive.
+      console.error(`[SYSROW] persist failed conv=${data.conv_id} action=${data.action}:`, err);
+    }
+  }
+
   // Targeted-only events (owner/master or requester notifications): deliver to
   // the explicit recipient list and skip the conversation fan-out entirely so
   // join-request activity never leaks to ordinary members.
@@ -226,12 +301,15 @@ type RepliedToPreview = {
   body: string | null;
   attachments: unknown;
   sent_at: Date | null;
+  // SYNC_V2 §4.1 (additive, sync_v2 'on' only; stripped otherwise).
+  seq?: number | null;
+  mod_seq?: number | null;
 };
 
 const fetch_replied_to_previews = async (
   ids: string[],
-): Promise<Map<string, RepliedToPreview>> => {
-  const out = new Map<string, RepliedToPreview>();
+): Promise<Map<string, { preview: RepliedToPreview; chat_id: string }>> => {
+  const out = new Map<string, { preview: RepliedToPreview; chat_id: string }>();
   if (ids.length === 0) return out;
   const rows = await db
     .select({
@@ -242,12 +320,25 @@ const fetch_replied_to_previews = async (
       body: message_model.body,
       attachments: message_model.attachments,
       sent_at: message_model.sent_at,
+      seq: message_model.seq,
+      mod_seq: message_model.mod_seq,
+      chat_id: message_model.chat_id,
     })
     .from(message_model)
     .leftJoin(user_model, eq(user_model.id, message_model.sender_id))
-    .where(inArray(message_model.id, ids));
+    // An admin-removed (scrubbed) message previews as null, as when the
+    // row was really deleted (sync/scrubbed.ts). So does any message deleted
+    // for everyone (or swept on expiry): soft delete keeps body/attachments,
+    // and a reply must not hand them back out.
+    .where(and(
+      inArray(message_model.id, ids),
+      not_scrubbed_tombstone(),
+      isNull(message_model.deleted_at),
+    ));
+  const v2 = v2_on(sync_v2_flags());
   for (const r of rows) {
-    out.set(r.id, r);
+    const { seq, mod_seq, chat_id, ...legacy } = r;
+    out.set(r.id, { preview: v2 ? { ...legacy, seq, mod_seq } : legacy, chat_id });
   }
   return out;
 };
@@ -268,10 +359,14 @@ const enrich_with_replied_to = async <
     ),
   );
   const previews = await fetch_replied_to_previews(ids);
-  return messages.map(m => ({
-    ...m,
-    replied_to_message: m.replied_to ? previews.get(m.replied_to) ?? null : null,
-  }));
+  return messages.map(m => {
+    const hit = m.replied_to ? previews.get(m.replied_to) : undefined;
+    // A preview only from the reply's own chat: a reference stored before
+    // message:new checked it may name another chat's message.
+    const same_chat = !!hit && (typeof m.conversation_id !== "string"
+      || hit.chat_id.toLowerCase() === m.conversation_id.toLowerCase());
+    return { ...m, replied_to_message: same_chat ? hit!.preview : null };
+  });
 };
 
 
@@ -320,122 +415,467 @@ const get_pinned_message_map = async (pinned_ids: string[]) => {
 // last_msg_id pointer (per process, since start).
 let chat_meta_mismatch_total = 0;
 
-const get_chat_list = async (user_id: string, type: string) => {
-  try {
-    // ── Single query: my memberships → chats, with DM peer via self-join ──
-    // For DMs we self-join chat_members to get the other user in the same query.
-    // For groups the peer columns come back null — no N+1.
-    const is_deleted_dm = type === "deleted_dm";
+// One statement: my memberships → chats, with the DM peer via a self-join.
+// Shared by the legacy enrichment and the sync_v2 'on' one.
+const fetch_chat_list_rows = async (user_id: string, type: string) => {
+  const is_deleted_dm = type === "deleted_dm";
+  // ── Single query: my memberships → chats, with DM peer via self-join ──
+  // For DMs we self-join chat_members to get the other user in the same query.
+  // For groups the peer columns come back null — no N+1.
 
-    // dm_peer matches the *other* member of the DM. The peer's row should be
-    // active (their removed_at is null) — even for the deleted_dm case where
-    // it's the *current* user's row that has removed_at set.
-    //
-    // Restricted to type='dm'. Without that predicate the CTE also emitted a
-    // row for every member of every GROUP, and the unconditional LEFT JOIN
-    // below then multiplied each group into (member_count - 1) duplicate
-    // chat-list rows — a 100-member group shipped 99 copies of itself, which
-    // is why a cold group chat-list could blow the client's 25s timeout.
-    // Groups need no peer at all: their peer columns are explicitly nulled out
-    // in the enrichment below, so nothing downstream can starve on this.
-    const dm_peer = db.$with("dm_peer").as(
-      db.select({
-        chat_id: chat_member_model.chat_id,
-        user_id: chat_member_model.user_id,
-      })
-        .from(chat_member_model)
-        .innerJoin(chat_model, eq(chat_model.id, chat_member_model.chat_id))
-        .where(
-          and(
-            eq(chat_model.type, "dm"),
-            ne(chat_member_model.user_id, user_id),
-            isNull(chat_member_model.removed_at),
-          )
-        )
-    );
-
-    const chats = await db
-      .with(dm_peer)
-      .select({
-        conversationId: chat_model.id,
-        type: chat_model.type,
-        title: chat_model.title,
-        profilePic: chat_model.profile_pic,
-        lastMsgId: chat_model.last_msg_id,
-        lastMsgAt: chat_model.last_msg_at,
-        createrId: chat_model.creater_id,
-        // Current group owner (transferable). Null for DMs. The client persists
-        // this on the chat row to gate delete/leave/transfer and render the
-        // Owner badge without a separate group-info fetch.
-        ownerId: chat_model.owner_id,
-        // Which message is pinned in this chat (null = none). Shipped so a
-        // fresh-login client knows a pin exists; the full message rides along
-        // in `pinnedMessage` (see enrichment below) so it renders even when the
-        // pinned message predates the client's synced history window.
-        pinnedMsgId: chat_model.pinned_msg_id,
-        // Disappearing-messages duration (null = off). Shipped on every
-        // chat-list payload so a fresh-login client can hydrate its local DB
-        // and the input-border / avatar-badge UI without needing a separate
-        // round-trip per chat.
-        disappearingAfterSec: chat_model.disappearing_after_sec,
-
-        role: chat_member_model.role,
-        // Current user's membership status: 'active' | 'left' | 'pending'. For
-        // groups, left/pending rows still come back (their removed_at is NULL)
-        // so the chat shows as a read-only shell with an "ask to join" action.
-        status: chat_member_model.status,
-        joinedAt: chat_member_model.joined_at,
-        // For deleted DMs, expose the soft-delete timestamp so the UI can
-        // show "deleted X ago". Null for active chats.
-        deletedAt: chat_member_model.removed_at,
-        // Per-user mute end time. Null when not muted. Far-future timestamp
-        // represents "forever" (see mute.service.ts MUTED_FOREVER).
-        mutedUntil: chat_member_model.muted_until,
-        // Per-user "clear chat" watermark. Everything at or before it is
-        // invisible to this user, so the last-message / pinned-message
-        // enrichment below must not hand back a pre-clear message (the Redis
-        // chat_meta hash is chat-global and knows nothing about it).
-        clearedAt: chat_member_model.cleared_at,
-
-        // DM peer info (null for groups)
-        userId: user_model.id,
-        userName: user_model.name,
-        userPhone: user_model.phone,
-        userProfilePic: user_model.profile_pic,
-        lastSeen: user_model.last_seen,
-      })
+  // dm_peer matches the *other* member of the DM. The peer's row should be
+  // active (their removed_at is null) — even for the deleted_dm case where
+  // it's the *current* user's row that has removed_at set.
+  //
+  // Restricted to type='dm'. Without that predicate the CTE also emitted a
+  // row for every member of every GROUP, and the unconditional LEFT JOIN
+  // below then multiplied each group into (member_count - 1) duplicate
+  // chat-list rows — a 100-member group shipped 99 copies of itself, which
+  // is why a cold group chat-list could blow the client's 25s timeout.
+  // Groups need no peer at all: their peer columns are explicitly nulled out
+  // in the enrichment below, so nothing downstream can starve on this.
+  const dm_peer = db.$with("dm_peer").as(
+    db.select({
+      chat_id: chat_member_model.chat_id,
+      user_id: chat_member_model.user_id,
+    })
       .from(chat_member_model)
       .innerJoin(chat_model, eq(chat_model.id, chat_member_model.chat_id))
-      .leftJoin(dm_peer, eq(dm_peer.chat_id, chat_model.id))
-      .leftJoin(user_model, eq(user_model.id, dm_peer.user_id))
       .where(
         and(
-          eq(chat_member_model.user_id, user_id),
-          is_deleted_dm
-            ? isNotNull(chat_member_model.removed_at)
-            : isNull(chat_member_model.removed_at),
-          isNull(chat_model.deleted_at),
-          // Broadcast lists only ever come back for an explicit
-          // type='broadcast' request. 'all' must exclude them: older app
-          // builds (and plenty of code) treat every non-dm row as a group.
-          // Every other value already maps to one concrete type.
-          type === "all"
-            ? ne(chat_model.type, "broadcast")
-            : type === "broadcast"
-              ? eq(chat_model.type, "broadcast")
-              : type === "group"
-                ? eq(chat_model.type, "group")
-                : type === "community_group"
-                  ? eq(chat_model.type, "community_group")
-                  : eq(chat_model.type, "dm"),
+          eq(chat_model.type, "dm"),
+          ne(chat_member_model.user_id, user_id),
+          isNull(chat_member_model.removed_at),
         )
       )
-      // NOTE: deliberately no LIMIT. This response is the client's full
-      // reconciliation set — it deletes every local chat that is absent from
-      // it — so truncating the tail would silently wipe real conversations
-      // off the device. The row count is now one-per-membership again (see
-      // the dm_peer note above), which is the fix that actually mattered.
-      .orderBy(desc(chat_model.last_msg_at));
+  );
+
+  return await db
+    .with(dm_peer)
+    .select({
+      conversationId: chat_model.id,
+      type: chat_model.type,
+      title: chat_model.title,
+      profilePic: chat_model.profile_pic,
+      lastMsgId: chat_model.last_msg_id,
+      lastMsgAt: chat_model.last_msg_at,
+      createrId: chat_model.creater_id,
+      // Current group owner (transferable). Null for DMs. The client persists
+      // this on the chat row to gate delete/leave/transfer and render the
+      // Owner badge without a separate group-info fetch.
+      ownerId: chat_model.owner_id,
+      // Which message is pinned in this chat (null = none). Shipped so a
+      // fresh-login client knows a pin exists; the full message rides along
+      // in `pinnedMessage` (see enrichment below) so it renders even when the
+      // pinned message predates the client's synced history window.
+      pinnedMsgId: chat_model.pinned_msg_id,
+      // Disappearing-messages duration (null = off). Shipped on every
+      // chat-list payload so a fresh-login client can hydrate its local DB
+      // and the input-border / avatar-badge UI without needing a separate
+      // round-trip per chat.
+      disappearingAfterSec: chat_model.disappearing_after_sec,
+
+      role: chat_member_model.role,
+      // Current user's membership status: 'active' | 'left' | 'pending'. For
+      // groups, left/pending rows still come back (their removed_at is NULL)
+      // so the chat shows as a read-only shell with an "ask to join" action.
+      status: chat_member_model.status,
+      joinedAt: chat_member_model.joined_at,
+      // For deleted DMs, expose the soft-delete timestamp so the UI can
+      // show "deleted X ago". Null for active chats.
+      deletedAt: chat_member_model.removed_at,
+      // Per-user mute end time. Null when not muted. Far-future timestamp
+      // represents "forever" (see mute.service.ts MUTED_FOREVER).
+      mutedUntil: chat_member_model.muted_until,
+      // Per-user "clear chat" watermark. Everything at or before it is
+      // invisible to this user, so the last-message / pinned-message
+      // enrichment below must not hand back a pre-clear message (the Redis
+      // chat_meta hash is chat-global and knows nothing about it).
+      clearedAt: chat_member_model.cleared_at,
+
+      // DM peer info (null for groups)
+      userId: user_model.id,
+      userName: user_model.name,
+      userPhone: user_model.phone,
+      userProfilePic: user_model.profile_pic,
+      lastSeen: user_model.last_seen,
+    })
+    .from(chat_member_model)
+    .innerJoin(chat_model, eq(chat_model.id, chat_member_model.chat_id))
+    .leftJoin(dm_peer, eq(dm_peer.chat_id, chat_model.id))
+    .leftJoin(user_model, eq(user_model.id, dm_peer.user_id))
+    .where(
+      and(
+        eq(chat_member_model.user_id, user_id),
+        is_deleted_dm
+          ? isNotNull(chat_member_model.removed_at)
+          : isNull(chat_member_model.removed_at),
+        isNull(chat_model.deleted_at),
+        // Broadcast lists only ever come back for an explicit
+        // type='broadcast' request. 'all' must exclude them: older app
+        // builds (and plenty of code) treat every non-dm row as a group.
+        // Every other value already maps to one concrete type.
+        type === "all"
+          ? ne(chat_model.type, "broadcast")
+          : type === "broadcast"
+            ? eq(chat_model.type, "broadcast")
+            : type === "group"
+              ? eq(chat_model.type, "group")
+              : type === "community_group"
+                ? eq(chat_model.type, "community_group")
+                : eq(chat_model.type, "dm"),
+      )
+    )
+    // NOTE: deliberately no LIMIT. This response is the client's full
+    // reconciliation set — it deletes every local chat that is absent from
+    // it — so truncating the tail would silently wipe real conversations
+    // off the device. The row count is now one-per-membership again (see
+    // the dm_peer note above), which is the fix that actually mattered.
+    .orderBy(desc(chat_model.last_msg_at));
+};
+
+type ChatListRow = Awaited<ReturnType<typeof fetch_chat_list_rows>>[number];
+
+// Which chat type the list query selects (null = every type but broadcast
+// lists) — the same mapping as fetch_chat_list_rows' WHERE.
+const chat_list_only_type = (type: string): string | null =>
+  type === "all" ? null
+    : type === "broadcast" || type === "group" || type === "community_group" ? type
+      : "dm";
+
+// The pre-sync-v2 enrichment (Redis chat_meta + user_unread, PG pinned map,
+// PG read-through fallback), unchanged: with sync_v2 'off' / 'shadow' the
+// payload is byte-identical to the old build. In 'on' it only serves chats
+// that are not numbered yet (normally none once the backfill marker is set).
+const legacy_enrich_chat_list = async (
+  user_id: string,
+  chats: ChatListRow[],
+  is_deleted_dm: boolean,
+  opts: { shadow: boolean },
+) => {
+  // ── Enrich from Redis: last message + unread counts ──────────────────
+  const chat_ids = chats.map(c => c.conversationId);
+  const pinned_ids = [
+    ...new Set(
+      chats.map(c => c.pinnedMsgId).filter((id): id is string => !!id)
+    ),
+  ];
+  // Broadcast rows also carry recipientCount (one grouped count, only paid
+  // for the broadcast list request — no other type can return such rows).
+  const broadcast_ids = chats
+    .filter(c => c.type === "broadcast")
+    .map(c => c.conversationId);
+  const [chat_metas, unread_counts, pinned_messages, recipient_counts] = await Promise.all([
+    get_chat_metas(chat_ids),
+    get_all_unread(user_id),
+    get_pinned_message_map(pinned_ids),
+    broadcast_ids.length > 0
+      ? db
+        .select({
+          list_id: broadcast_recipient_model.list_id,
+          count: sql<number>`count(*)::int`,
+        })
+        .from(broadcast_recipient_model)
+        .where(inArray(broadcast_recipient_model.list_id, broadcast_ids))
+        .groupBy(broadcast_recipient_model.list_id)
+        .then(rows => new Map(rows.map(r => [r.list_id, Number(r.count)])))
+      : Promise.resolve(new Map<string, number>()),
+  ]);
+
+  // ── Read-through fallback: resolve missing previews from Postgres ─────
+  // chat_meta has no TTL, but it is still a CACHE — a flush, an eviction or
+  // a brand-new Valkey wipes it. Before this, a miss shipped
+  // lastMessage:null and the list rendered blank (and DMs vanished entirely,
+  // since the client hides chats with no last-message id) until someone sent
+  // a new message. Resolve the newest still-visible message for the missing
+  // chats in ONE query instead.
+  //
+  // The visibility predicate must mirror the cache path EXACTLY or deleted /
+  // expired messages resurface as previews:
+  //   - soft-deleted rows are excluded (same predicate as the pinned lookup)
+  //   - disappearing messages past expires_at are excluded — the sweeper
+  //     deletes them asynchronously, so "not swept yet" must not mean
+  //     "still visible".
+  // The per-user "clear chat" watermark is NOT applied here on purpose: the
+  // fallback rows go through the very same is_after_clear gate below as the
+  // cached ones, so there is one implementation of that rule, not two.
+  //
+  // Two ways in, one query. For a chat that HAS a Postgres pointer we look
+  // the message up by primary key — that is the whole point of maintaining
+  // last_msg_id, and it keeps the post-cache-wipe cost flat no matter how
+  // much history a chat holds. Only pointer-less chats (rows predating the
+  // pointer writeback) fall back to scanning for their newest message.
+  //
+  // PG pointer is the truth (SYNC_V2 R0, §3.5): the Redis hash is
+  // last-writer-wins while chats.last_msg_id only moves forward, so a cached
+  // row is used ONLY when its id equals the PG pointer. On disagreement the
+  // cached row is dropped and the chat goes through the pointer lookup like
+  // a miss — so lastMessage.id == lastMsgId always holds (old clients too).
+  const pointer_ids: string[] = [];
+  const scan_chat_ids: string[] = [];
+  let meta_mismatch = 0;
+  for (const chat of chats) {
+    const cached = chat_metas.get(chat.conversationId);
+    if (cached) {
+      if (!chat.lastMsgId || cached.id === chat.lastMsgId) continue; // cache hit
+      meta_mismatch++;
+      chat_metas.delete(chat.conversationId);
+    }
+    if (chat.lastMsgId) pointer_ids.push(chat.lastMsgId);
+    else scan_chat_ids.push(chat.conversationId);
+  }
+  if (meta_mismatch > 0) {
+    chat_meta_mismatch_total += meta_mismatch;
+    console.warn(
+      `[META] meta_vs_pg_mismatch user=${user_id} chats=${meta_mismatch} total=${chat_meta_mismatch_total}`,
+    );
+  }
+
+  if (pointer_ids.length > 0 || scan_chat_ids.length > 0) {
+    const now = new Date();
+    const fallback_rows = await db
+      .selectDistinctOn([message_model.chat_id], {
+        chat_id: message_model.chat_id,
+        id: message_model.id,
+        body: message_model.body,
+        type: message_model.type,
+        sender_id: message_model.sender_id,
+        sent_at: message_model.sent_at,
+        created_at: message_model.created_at,
+        attachments: message_model.attachments,
+      })
+      .from(message_model)
+      .where(
+        and(
+          // A pointed-at message that is itself deleted/expired yields no row
+          // and therefore no preview — deliberately. The delete + sweeper
+          // paths repoint the pointer (broadcast_deletion), so that state is
+          // transient and self-healing; guessing a replacement here would
+          // mean rescanning every chat's history on every cache miss.
+          or(
+            pointer_ids.length > 0 ? inArray(message_model.id, pointer_ids) : undefined,
+            scan_chat_ids.length > 0 ? inArray(message_model.chat_id, scan_chat_ids) : undefined,
+          ),
+          isNull(message_model.deleted_at),
+          or(isNull(message_model.expires_at), gt(message_model.expires_at, now)),
+        )
+      )
+      // NULLS LAST matches scripts/backfill-last-msg.ts: sent_at is nullable
+      // on older rows and Postgres sorts NULLs FIRST on DESC, which would
+      // otherwise elect a stamp-less row as "newest". Only matters for the
+      // scan half — the pointer half returns exactly one row per chat.
+      .orderBy(
+        message_model.chat_id,
+        sql`${message_model.sent_at} DESC NULLS LAST`,
+        sql`${message_model.created_at} DESC NULLS LAST`,
+      );
+
+    for (const row of fallback_rows) {
+      // Same shape parse_chat_meta_row hands back, field for field, so the
+      // enrichment below cannot tell a cached row from a fallback row.
+      chat_metas.set(row.chat_id, {
+        id: row.id,
+        body: row.body ?? "",
+        type: row.type as MessageType,
+        sender_id: row.sender_id ?? "",
+        // sent_at is nullable on legacy rows; fall back to created_at rather
+        // than now(), which would date the message "just sent" and sail it
+        // past the clear-chat watermark below.
+        sent_at: (row.sent_at ?? row.created_at ?? now).toISOString(),
+        attachments: row.attachments ?? null,
+      });
+    }
+
+    // Deliberately NOT hydrating chat_meta from here. This is a read path
+    // that can race a concurrent handle_message_new which has already put a
+    // NEWER message in the hash — a blind update_chat_meta would rewind the
+    // preview for everyone. The cache re-fills itself on the chat's next
+    // send (set_last_message), which is the only writer that knows it holds
+    // the newest message.
+  }
+
+  const enriched = chats.map(chat => {
+    const meta = chat_metas.get(chat.conversationId);
+    const unread = unread_counts.get(chat.conversationId) ?? 0;
+    // Shell membership (left/pending): the user no longer participates, so we
+    // must NOT leak any group activity that happened after they left. Freeze
+    // the row — no last message / pinned message / unread / advancing
+    // last_msg_id. Otherwise every chat-list refresh would re-deliver the
+    // group's current last message to a left/kicked member. The client keeps
+    // whatever it had locally before leaving (insertOrIgnore won't overwrite).
+    const is_active_member = chat.status === "active";
+
+    // "Clear chat" (per-user, keeps membership). The Redis chat_meta hash is
+    // chat-global, so a cleared user would otherwise get their pre-clear last
+    // message handed straight back on the next chat-list sync — the client
+    // re-inserts it into local SQLite, resurrecting a single ghost bubble in
+    // a chat the user just emptied. Suppress unless the cache holds a message
+    // NEWER than the watermark. Same for the pinned message, whose body the
+    // payload also ships; an unresolvable pin on a cleared chat is suppressed
+    // too, since it can only be pre-clear.
+    const cleared_at = chat.clearedAt ? new Date(chat.clearedAt) : null;
+    // Fail CLOSED: anything we can't prove is newer than the watermark is
+    // treated as pre-clear and withheld. Showing one message too few in a
+    // chat the user just emptied is invisible; showing one too many un-does
+    // the thing they asked for.
+    const is_after_clear = (sent_at: Date | string | null | undefined) => {
+      if (!cleared_at) return true;
+      if (!sent_at) return false;
+      const t = new Date(sent_at).getTime();
+      return Number.isFinite(t) && t > cleared_at.getTime();
+    };
+    const last_msg_cleared = !is_after_clear(meta?.sent_at);
+    const pinned_raw = chat.pinnedMsgId
+      ? pinned_messages.get(chat.pinnedMsgId) as { sent_at?: Date | string | null } | undefined
+      : undefined;
+    const pinned_cleared = !is_after_clear(pinned_raw?.sent_at);
+    const show_last_msg = is_active_member && !last_msg_cleared;
+    const show_pinned = is_active_member && !pinned_cleared;
+
+    return {
+      ...chat,
+      // Clear DM peer fields for groups (they come back null anyway but be explicit)
+      userId: chat.type === "dm" ? chat.userId : null,
+      userName: chat.type === "dm" ? chat.userName : null,
+      userPhone: chat.type === "dm" ? chat.userPhone : null,
+      userProfilePic: chat.type === "dm" ? chat.userProfilePic : null,
+      lastSeen: chat.type === "dm" ? chat.lastSeen : null,
+      // Don't advance a shell's last-message pointer to a post-leave message.
+      // When Postgres has no pointer at all (chats written before the
+      // last-message writeback existed) fall back to the id of the message
+      // we just resolved — the client filters DMs on lastMsgId IS NOT NULL,
+      // so a null here hides the chat outright. Never overrides a pointer
+      // Postgres does have.
+      lastMsgId: show_last_msg ? (chat.lastMsgId ?? meta?.id ?? null) : null,
+      pinnedMsgId: show_pinned ? chat.pinnedMsgId : null,
+      // Redis enrichment — withheld for shells (would leak post-leave content).
+      lastMessage: show_last_msg ? (meta ?? null) : null,
+      // Full pinned message (body, sender, attachments) so the client renders
+      // the pinned pill without resolving the id against its local store —
+      // which fails for any pin older than its synced message window.
+      pinnedMessage: show_pinned && chat.pinnedMsgId
+        ? pinned_messages.get(chat.pinnedMsgId) ?? null
+        : null,
+      unreadCount: is_active_member && !last_msg_cleared ? unread : 0,
+      // Broadcast lists only: how many recipients the list has.
+      ...(chat.type === "broadcast"
+        ? { recipientCount: recipient_counts.get(chat.conversationId) ?? 0 }
+        : {}),
+    };
+  });
+
+  // SYNC_V2 §3.6 shadow (sync_v2 = shadow|on, post-backfill indexes
+  // built): compare the served counts with the derived ones, off the
+  // request path and rate-limited per user. Serves nothing.
+  if (!is_deleted_dm && opts.shadow) {
+    shadow_compare_unread(
+      user_id,
+      enriched
+        .filter((c) => c.status === "active" && c.type !== "broadcast")
+        .map((c) => ({ chat_id: c.conversationId, unread: c.unreadCount })),
+    );
+  }
+
+  return enriched;
+};
+
+/**
+ * get-chat-list rows in sync_v2 'on' (§3.5, §3.6, §4.1): the list query and
+ * chat_list_state_sql run in PARALLEL (one round trip of wall time; the
+ * legacy path is two to three sequential ones plus two Redis reads), and:
+ *   - unreadCount is DERIVED (legacy floors, cap 100) instead of Redis;
+ *   - lastMessage / pinnedMessage come from PG by primary key, with
+ *     lastMessage.id == lastMsgId by construction;
+ *   - additive: syncProto + the §4.1 clock fields + per-viewer others_*,
+ *     lastMessage.seq / srv_ts, pinnedMessage.seq / mod_seq.
+ * Every legacy key keeps its position, type and rule (shell freeze, the
+ * clear-chat suppression on sent_at), so 4.2.2 parses the rows unchanged.
+ */
+const v2_enrich_row = (
+  chat: ChatListRow,
+  st: ChatListState,
+  sync_proto: 2 | 0,
+) => {
+  const is_active_member = chat.status === "active";
+  const lm = st.last_message;
+  // Same shape as parse_chat_meta_row (the legacy lastMessage) + seq/srv_ts.
+  const meta = lm
+    ? {
+      id: lm.id,
+      body: lm.body ?? "",
+      type: lm.type as MessageType,
+      // A persisted system row previews with its ACTOR as sender, exactly
+      // like the Redis preview its writer leaves (§3.10 wire contract: old
+      // apps decode sender_id as a String).
+      sender_id: lm.sender_id ?? lm.actor_id ?? "",
+      sent_at: (lm.sent_at ?? lm.created_at ?? new Date()).toISOString(),
+      attachments: lm.attachments ?? null,
+      seq: lm.seq,
+      srv_ts: lm.created_at ? lm.created_at.toISOString() : null,
+    }
+    : null;
+  // The legacy clear-chat rule, verbatim (fail closed on sent_at).
+  const cleared_at = chat.clearedAt ? new Date(chat.clearedAt) : null;
+  const is_after_clear = (sent_at: Date | string | null | undefined) => {
+    if (!cleared_at) return true;
+    if (!sent_at) return false;
+    const t = new Date(sent_at).getTime();
+    return Number.isFinite(t) && t > cleared_at.getTime();
+  };
+  const pinned_id = st.pinned_msg_id;
+  const pinned = pinned_id && st.pinned_message?.id === pinned_id ? st.pinned_message : null;
+  const last_msg_cleared = !is_after_clear(meta?.sent_at);
+  const pinned_cleared = !is_after_clear(pinned?.sent_at);
+  const show_last_msg = is_active_member && !last_msg_cleared;
+  const show_pinned = is_active_member && !pinned_cleared;
+  return {
+    ...chat,
+    lastMsgAt: st.last_msg_at ?? chat.lastMsgAt,
+    userId: chat.type === "dm" ? chat.userId : null,
+    userName: chat.type === "dm" ? chat.userName : null,
+    userPhone: chat.type === "dm" ? chat.userPhone : null,
+    userProfilePic: chat.type === "dm" ? chat.userProfilePic : null,
+    lastSeen: chat.type === "dm" ? chat.lastSeen : null,
+    lastMsgId: show_last_msg ? st.last_msg_id : null,
+    pinnedMsgId: show_pinned ? pinned_id : null,
+    lastMessage: show_last_msg ? meta : null,
+    pinnedMessage: show_pinned && pinned_id ? pinned : null,
+    unreadCount: is_active_member && !last_msg_cleared ? st.unread : 0,
+    ...(chat.type === "broadcast" ? { recipientCount: st.recipient_count ?? 0 } : {}),
+    syncProto: sync_proto,
+    seqHead: st.seq_head,
+    lastSeq: st.last_seq,
+    readSeq: st.read_seq,
+    deliveredSeq: st.delivered_seq,
+    joinedSeq: st.joined_seq,
+    clearedSeq: st.cleared_seq,
+    leftSeq: st.left_seq,
+    pinSeq: st.pin_seq,
+    settingsSeq: st.settings_seq,
+    rosterSeq: st.roster_seq,
+    othersReadSeq: st.others_read_seq,
+    othersDeliveredSeq: st.others_delivered_seq,
+  };
+};
+
+const get_chat_list = async (user_id: string, type: string) => {
+  try {
+    const is_deleted_dm = type === "deleted_dm";
+    const f = sync_v2_flags();
+    const derived = derived_ready(f);
+    // The state statement runs alongside the list query. A failure there is
+    // not a failed list: the legacy enrichment serves instead.
+    const [chats, state] = await Promise.all([
+      fetch_chat_list_rows(user_id, type),
+      derived
+        ? chat_list_state_sql(pg_client, user_id, { deleted_dm: is_deleted_dm, only_type: chat_list_only_type(type) })
+          .catch((err) => {
+            count("UNREAD", "v2_state_failed");
+            console.error(`[UNREAD] chat list state failed user=${user_id}: ${err?.message ?? err}`);
+            return null;
+          })
+        : Promise.resolve(null),
+    ]);
 
     if (chats.length === 0) {
       // Zero chats is a legitimate state (brand-new account, every DM deleted),
@@ -444,222 +884,33 @@ const get_chat_list = async (user_id: string, type: string) => {
       return { success: true, code: 200, data: [] as typeof chats };
     }
 
-    // ── Enrich from Redis: last message + unread counts ──────────────────
-    const chat_ids = chats.map(c => c.conversationId);
-    const pinned_ids = [
-      ...new Set(
-        chats.map(c => c.pinnedMsgId).filter((id): id is string => !!id)
-      ),
-    ];
-    // Broadcast rows also carry recipientCount (one grouped count, only paid
-    // for the broadcast list request — no other type can return such rows).
-    const broadcast_ids = chats
-      .filter(c => c.type === "broadcast")
-      .map(c => c.conversationId);
-    const [chat_metas, unread_counts, pinned_messages, recipient_counts] = await Promise.all([
-      get_chat_metas(chat_ids),
-      get_all_unread(user_id),
-      get_pinned_message_map(pinned_ids),
-      broadcast_ids.length > 0
-        ? db
-          .select({
-            list_id: broadcast_recipient_model.list_id,
-            count: sql<number>`count(*)::int`,
-          })
-          .from(broadcast_recipient_model)
-          .where(inArray(broadcast_recipient_model.list_id, broadcast_ids))
-          .groupBy(broadcast_recipient_model.list_id)
-          .then(rows => new Map(rows.map(r => [r.list_id, Number(r.count)])))
-        : Promise.resolve(new Map<string, number>()),
-    ]);
-
-    // ── Read-through fallback: resolve missing previews from Postgres ─────
-    // chat_meta has no TTL, but it is still a CACHE — a flush, an eviction or
-    // a brand-new Valkey wipes it. Before this, a miss shipped
-    // lastMessage:null and the list rendered blank (and DMs vanished entirely,
-    // since the client hides chats with no last-message id) until someone sent
-    // a new message. Resolve the newest still-visible message for the missing
-    // chats in ONE query instead.
-    //
-    // The visibility predicate must mirror the cache path EXACTLY or deleted /
-    // expired messages resurface as previews:
-    //   - soft-deleted rows are excluded (same predicate as the pinned lookup)
-    //   - disappearing messages past expires_at are excluded — the sweeper
-    //     deletes them asynchronously, so "not swept yet" must not mean
-    //     "still visible".
-    // The per-user "clear chat" watermark is NOT applied here on purpose: the
-    // fallback rows go through the very same is_after_clear gate below as the
-    // cached ones, so there is one implementation of that rule, not two.
-    //
-    // Two ways in, one query. For a chat that HAS a Postgres pointer we look
-    // the message up by primary key — that is the whole point of maintaining
-    // last_msg_id, and it keeps the post-cache-wipe cost flat no matter how
-    // much history a chat holds. Only pointer-less chats (rows predating the
-    // pointer writeback) fall back to scanning for their newest message.
-    //
-    // PG pointer is the truth (SYNC_V2 R0, §3.5): the Redis hash is
-    // last-writer-wins while chats.last_msg_id only moves forward, so a cached
-    // row is used ONLY when its id equals the PG pointer. On disagreement the
-    // cached row is dropped and the chat goes through the pointer lookup like
-    // a miss — so lastMessage.id == lastMsgId always holds (old clients too).
-    const pointer_ids: string[] = [];
-    const scan_chat_ids: string[] = [];
-    let meta_mismatch = 0;
-    for (const chat of chats) {
-      const cached = chat_metas.get(chat.conversationId);
-      if (cached) {
-        if (!chat.lastMsgId || cached.id === chat.lastMsgId) continue; // cache hit
-        meta_mismatch++;
-        chat_metas.delete(chat.conversationId);
-      }
-      if (chat.lastMsgId) pointer_ids.push(chat.lastMsgId);
-      else scan_chat_ids.push(chat.conversationId);
-    }
-    if (meta_mismatch > 0) {
-      chat_meta_mismatch_total += meta_mismatch;
-      console.warn(
-        `[META] meta_vs_pg_mismatch user=${user_id} chats=${meta_mismatch} total=${chat_meta_mismatch_total}`,
-      );
+    if (!state) {
+      const enriched = await legacy_enrich_chat_list(user_id, chats, is_deleted_dm, { shadow: !v2_on(f) });
+      // Mode 'on' before the derived state is ready still advertises the
+      // capability (0 until the gate opens), so a v2 client never guesses.
+      const data = v2_on(f)
+        ? enriched.map((c) => ({ ...c, syncProto: sync_proto_for(user_id, f) }))
+        : enriched;
+      return { success: true, code: 200, data };
     }
 
-    if (pointer_ids.length > 0 || scan_chat_ids.length > 0) {
-      const now = new Date();
-      const fallback_rows = await db
-        .selectDistinctOn([message_model.chat_id], {
-          chat_id: message_model.chat_id,
-          id: message_model.id,
-          body: message_model.body,
-          type: message_model.type,
-          sender_id: message_model.sender_id,
-          sent_at: message_model.sent_at,
-          created_at: message_model.created_at,
-          attachments: message_model.attachments,
-        })
-        .from(message_model)
-        .where(
-          and(
-            // A pointed-at message that is itself deleted/expired yields no row
-            // and therefore no preview — deliberately. The delete + sweeper
-            // paths repoint the pointer (broadcast_deletion), so that state is
-            // transient and self-healing; guessing a replacement here would
-            // mean rescanning every chat's history on every cache miss.
-            or(
-              pointer_ids.length > 0 ? inArray(message_model.id, pointer_ids) : undefined,
-              scan_chat_ids.length > 0 ? inArray(message_model.chat_id, scan_chat_ids) : undefined,
-            ),
-            isNull(message_model.deleted_at),
-            or(isNull(message_model.expires_at), gt(message_model.expires_at, now)),
-          )
-        )
-        // NULLS LAST matches scripts/backfill-last-msg.ts: sent_at is nullable
-        // on older rows and Postgres sorts NULLs FIRST on DESC, which would
-        // otherwise elect a stamp-less row as "newest". Only matters for the
-        // scan half — the pointer half returns exactly one row per chat.
-        .orderBy(
-          message_model.chat_id,
-          sql`${message_model.sent_at} DESC NULLS LAST`,
-          sql`${message_model.created_at} DESC NULLS LAST`,
-        );
-
-      for (const row of fallback_rows) {
-        // Same shape parse_chat_meta_row hands back, field for field, so the
-        // enrichment below cannot tell a cached row from a fallback row.
-        chat_metas.set(row.chat_id, {
-          id: row.id,
-          body: row.body ?? "",
-          type: row.type as MessageType,
-          sender_id: row.sender_id ?? "",
-          // sent_at is nullable on legacy rows; fall back to created_at rather
-          // than now(), which would date the message "just sent" and sail it
-          // past the clear-chat watermark below.
-          sent_at: (row.sent_at ?? row.created_at ?? now).toISOString(),
-          attachments: row.attachments ?? null,
-        });
-      }
-
-      // Deliberately NOT hydrating chat_meta from here. This is a read path
-      // that can race a concurrent handle_message_new which has already put a
-      // NEWER message in the hash — a blind update_chat_meta would rewind the
-      // preview for everyone. The cache re-fills itself on the chat's next
-      // send (set_last_message), which is the only writer that knows it holds
-      // the newest message.
-    }
-
-    const enriched = chats.map(chat => {
-      const meta = chat_metas.get(chat.conversationId);
-      const unread = unread_counts.get(chat.conversationId) ?? 0;
-      // Shell membership (left/pending): the user no longer participates, so we
-      // must NOT leak any group activity that happened after they left. Freeze
-      // the row — no last message / pinned message / unread / advancing
-      // last_msg_id. Otherwise every chat-list refresh would re-deliver the
-      // group's current last message to a left/kicked member. The client keeps
-      // whatever it had locally before leaving (insertOrIgnore won't overwrite).
-      const is_active_member = chat.status === "active";
-
-      // "Clear chat" (per-user, keeps membership). The Redis chat_meta hash is
-      // chat-global, so a cleared user would otherwise get their pre-clear last
-      // message handed straight back on the next chat-list sync — the client
-      // re-inserts it into local SQLite, resurrecting a single ghost bubble in
-      // a chat the user just emptied. Suppress unless the cache holds a message
-      // NEWER than the watermark. Same for the pinned message, whose body the
-      // payload also ships; an unresolvable pin on a cleared chat is suppressed
-      // too, since it can only be pre-clear.
-      const cleared_at = chat.clearedAt ? new Date(chat.clearedAt) : null;
-      // Fail CLOSED: anything we can't prove is newer than the watermark is
-      // treated as pre-clear and withheld. Showing one message too few in a
-      // chat the user just emptied is invisible; showing one too many un-does
-      // the thing they asked for.
-      const is_after_clear = (sent_at: Date | string | null | undefined) => {
-        if (!cleared_at) return true;
-        if (!sent_at) return false;
-        const t = new Date(sent_at).getTime();
-        return Number.isFinite(t) && t > cleared_at.getTime();
-      };
-      const last_msg_cleared = !is_after_clear(meta?.sent_at);
-      const pinned_raw = chat.pinnedMsgId
-        ? pinned_messages.get(chat.pinnedMsgId) as { sent_at?: Date | string | null } | undefined
-        : undefined;
-      const pinned_cleared = !is_after_clear(pinned_raw?.sent_at);
-      const show_last_msg = is_active_member && !last_msg_cleared;
-      const show_pinned = is_active_member && !pinned_cleared;
-
-      return {
-        ...chat,
-        // Clear DM peer fields for groups (they come back null anyway but be explicit)
-        userId: chat.type === "dm" ? chat.userId : null,
-        userName: chat.type === "dm" ? chat.userName : null,
-        userPhone: chat.type === "dm" ? chat.userPhone : null,
-        userProfilePic: chat.type === "dm" ? chat.userProfilePic : null,
-        lastSeen: chat.type === "dm" ? chat.lastSeen : null,
-        // Don't advance a shell's last-message pointer to a post-leave message.
-        // When Postgres has no pointer at all (chats written before the
-        // last-message writeback existed) fall back to the id of the message
-        // we just resolved — the client filters DMs on lastMsgId IS NOT NULL,
-        // so a null here hides the chat outright. Never overrides a pointer
-        // Postgres does have.
-        lastMsgId: show_last_msg ? (chat.lastMsgId ?? meta?.id ?? null) : null,
-        pinnedMsgId: show_pinned ? chat.pinnedMsgId : null,
-        // Redis enrichment — withheld for shells (would leak post-leave content).
-        lastMessage: show_last_msg ? (meta ?? null) : null,
-        // Full pinned message (body, sender, attachments) so the client renders
-        // the pinned pill without resolving the id against its local store —
-        // which fails for any pin older than its synced message window.
-        pinnedMessage: show_pinned && chat.pinnedMsgId
-          ? pinned_messages.get(chat.pinnedMsgId) ?? null
-          : null,
-        unreadCount: is_active_member && !last_msg_cleared ? unread : 0,
-        // Broadcast lists only: how many recipients the list has.
-        ...(chat.type === "broadcast"
-          ? { recipientCount: recipient_counts.get(chat.conversationId) ?? 0 }
-          : {}),
-      };
+    const sync_proto = sync_proto_for(user_id, f);
+    // A chat the backfill has not numbered (or one created between the two
+    // statements) keeps the legacy values; normally this list is empty.
+    const legacy_rows = chats.filter((c) => !state.get(c.conversationId)?.numbered);
+    const legacy = legacy_rows.length > 0
+      ? new Map(
+        (await legacy_enrich_chat_list(user_id, legacy_rows, is_deleted_dm, { shadow: false }))
+          .map((c) => [c.conversationId, { ...c, syncProto: sync_proto }] as const),
+      )
+      : null;
+    if (legacy) count("UNREAD", "v2_legacy_rows", legacy_rows.length);
+    const data = chats.map((chat) => {
+      const st = state.get(chat.conversationId);
+      return st?.numbered ? v2_enrich_row(chat, st, sync_proto) : legacy!.get(chat.conversationId)!;
     });
-
-    return {
-      success: true,
-      code: 200,
-      data: enriched,
-    };
+    count("UNREAD", "v2_served");
+    return { success: true, code: 200, data };
   } catch (error) {
     console.error("get_chat_list error:", error);
     return {
@@ -934,6 +1185,11 @@ const clear_chat_for_user = async (conversation_id: string, user_id: string) => 
     // counter would keep a badge alive for messages the user can no longer see.
     await reset_unread(user_id, conversation_id);
 
+    // SYNC_V2 §3.12 dual-write (shadow/on only): cleared_seq = seq_head now,
+    // read/delivered follow. The legacy cleared_at above stays the served
+    // floor; apply_clear only ever moves it forward.
+    note_clear(user_id, conversation_id);
+
     return {
       success: true,
       code: 200,
@@ -1035,10 +1291,27 @@ const broadcast_deletion = async (
 ): Promise<void> => {
   if (message_ids.length === 0) return;
 
+  // SYNC_V2 §3.12 / §4.1 ('on'): the frame carries each row's new mod_seq
+  // and, when the delete's trigger unpinned the chat, the resulting pin. One
+  // read of what the commit left behind; the pointer repair below reuses it
+  // instead of its own chats read, so 'on' costs no extra round trip.
+  let frame_state: DeleteFrameState | null = null;
+  if (v2_on(sync_v2_flags())) {
+    try {
+      frame_state = await delete_frame_state_sql(pg_client, chat_id, message_ids);
+    } catch (err: any) {
+      // The delete is committed; a frame without the additive fields is the
+      // legacy frame, and v2 clients repair mods / pin through delta.
+      console.error(`[DELETE] frame state read failed chat=${chat_id}: ${err?.message ?? err}`);
+    }
+  }
+  const pin = frame_state ? delete_unpin_field(frame_state, frame_state.mods) : undefined;
   const payload: DeleteMessagePayload = {
     sender_id: actor_id ?? "",
     conv_id: chat_id,
     message_ids,
+    ...(frame_state ? { mods: frame_state.mods } : {}),
+    ...(pin ? { pin } : {}),
   };
   const ws_msg: WSMessage = {
     type: "message:delete",
@@ -1068,18 +1341,49 @@ const broadcast_deletion = async (
     await queue_message_fcm(member_id, ws_msg, { silent: muted.has(member_id) });
   }
 
-  // 3. Repoint last_msg_id and pinned_msg_id if any of the deleted rows was
-  //    the pointed-to message. Done in one round-trip select.
-  const [conversation] = await db
-    .select({
-      id: chat_model.id,
-      last_msg_id: chat_model.last_msg_id,
-      last_msg_at: chat_model.last_msg_at,
-      pinned_msg_id: chat_model.pinned_msg_id,
-    })
-    .from(chat_model)
-    .where(eq(chat_model.id, chat_id))
-    .limit(1);
+  // 3. Last-message pointer + pin after the delete.
+  await repair_pointers_after_delete(chat_id, message_ids, frame_state);
+};
+
+// Pointer / pin repair after `message_ids` of one chat were soft-deleted.
+//
+// Numbered chats (seq_head NOT NULL, SYNC_V2 §3.3.4): the delete statement's
+// own triggers already rewound last_seq / last_msg_id to the newest visible
+// row BY SEQ and cleared a dead pin (bumping pin_seq), in the same commit.
+// Writing the pointer here as well would fight them (this code orders by
+// sent_at). Only the Redis preview is dropped if it showed a deleted row;
+// get_chat_list then falls back to the PG pointer by primary key, and the
+// next send refills the hash.
+//
+// Unnumbered chats: the legacy repoint, unchanged, with every PG write
+// guarded by `seq_head IS NULL` in its WHERE — a chat the backfill numbers
+// between our read and our write is left to the triggers.
+const repair_pointers_after_delete = async (
+  chat_id: string,
+  message_ids: string[],
+  // The chat state broadcast_deletion already read after the delete
+  // (sync_v2 'on'); saves this function's own chats read.
+  preloaded?: DeleteFrameState | null,
+): Promise<void> => {
+  const [conversation] = preloaded?.chat_exists
+    ? [{
+      id: chat_id,
+      last_msg_id: preloaded.last_msg_id,
+      last_msg_at: preloaded.last_msg_at,
+      pinned_msg_id: preloaded.pinned_msg_id,
+      seq_head: preloaded.seq_head,
+    }]
+    : await db
+      .select({
+        id: chat_model.id,
+        last_msg_id: chat_model.last_msg_id,
+        last_msg_at: chat_model.last_msg_at,
+        pinned_msg_id: chat_model.pinned_msg_id,
+        seq_head: chat_model.seq_head,
+      })
+      .from(chat_model)
+      .where(eq(chat_model.id, chat_id))
+      .limit(1);
 
   if (!conversation) return;
 
@@ -1089,6 +1393,14 @@ const broadcast_deletion = async (
   // chat_meta is exactly what makes a DELETED message keep showing as the
   // chat-list preview.
   const cached_meta = await get_chat_meta(chat_id);
+
+  if (conversation.seq_head !== null && conversation.seq_head !== undefined) {
+    if (cached_meta?.id && deleted_set.has(cached_meta.id)) {
+      await clear_chat_meta_message(chat_id);
+    }
+    return;
+  }
+
   const last_msg_hit =
     (conversation.last_msg_id && deleted_set.has(conversation.last_msg_id)) ||
     (cached_meta?.id && deleted_set.has(cached_meta.id));
@@ -1151,7 +1463,10 @@ const broadcast_deletion = async (
   }
 
   if (Object.keys(updates).length > 0) {
-    await db.update(chat_model).set(updates).where(eq(chat_model.id, chat_id));
+    await db
+      .update(chat_model)
+      .set(updates)
+      .where(and(eq(chat_model.id, chat_id), isNull(chat_model.seq_head)));
   }
 };
 
@@ -1272,16 +1587,24 @@ const soft_delete_message = async (message_ids: string[], user_id: string) => {
       };
     }
 
-    // Soft delete the messages
-    const deletedMessages = messagesToDelete.length === 0 ? [] : await db
-      .update(message_model)
-      .set({ deleted_at: new Date() })
-      .where(and(
-        // Only the rows the authority check above admitted.
-        inArray(message_model.id, messagesToDelete.map(m => m.id)),
-        isNull(message_model.deleted_at),
-      ))
-      .returning();
+    // Soft delete the messages: one short statement per chat, chats in id
+    // order, each allocating its mod_seq block at once (SYNC_V2 §3.3.1). Only
+    // the rows the authority check above admitted. Returns the same columns
+    // the old multi-chat UPDATE … RETURNING did.
+    const deleted = messagesToDelete.length === 0
+      ? { rows: [], failed_chats: 0 }
+      : await soft_delete_grouped(messagesToDelete.map(m => ({ id: m.id, chat_id: m.chat_id })));
+    const deletedMessages = deleted.rows;
+
+    if (deletedMessages.length === 0 && deleted.failed_chats > 0) {
+      // Nothing committed: a transient failure (lock timeout / deadlock
+      // twice), not "not found" — 500 keeps the client's outbox retrying.
+      return {
+        success: false,
+        code: 500,
+        message: "ERROR : mark_as_delete_message",
+      };
+    }
 
     if (deletedMessages.length === 0 && heal_broadcast_ids.length === 0) {
       return {
@@ -1296,12 +1619,15 @@ const soft_delete_message = async (message_ids: string[], user_id: string) => {
     // last_msg/pinned repoint identically for user-initiated and sweeper-
     // initiated deletes — see its docs. Only rows THIS call deleted: a row a
     // concurrent delete got first was already fanned out by that call.
+    // With sync_v2 'on' a WS delete frame runs these detached on the
+    // (actor, chat) fan-out chain — behind that actor's earlier sends into
+    // the chat — once the delete is committed (sockets/vital-chain.ts).
     const conversationIds = [...new Set(deletedMessages.map(m => m.chat_id))];
     for (const conversationId of conversationIds) {
       const ids_in_conv = deletedMessages
         .filter(m => m.chat_id === conversationId)
         .map(m => m.id);
-      await broadcast_deletion(conversationId, ids_in_conv, user_id);
+      await run_fanout(user_id, conversationId, () => broadcast_deletion(conversationId, ids_in_conv, user_id));
     }
 
     // The copy cascade, with the normal per-DM deletion fan-out (recipients
@@ -1324,13 +1650,28 @@ const soft_delete_message = async (message_ids: string[], user_id: string) => {
         await for_each_with_concurrency(
           Array.from(by_dm.entries()),
           BROADCAST_FANOUT_CONCURRENCY,
-          ([dm_id, ids]) => broadcast_deletion(dm_id, ids, user_id, { skip_actor_fcm: true }),
+          ([dm_id, ids]) => run_fanout(user_id, dm_id, () => broadcast_deletion(dm_id, ids, user_id, { skip_actor_fcm: true })),
         );
       } catch (err) {
         // The broadcast message itself is already deleted; a failure here is
         // healed by a replay of the same delete (heal_broadcast_ids above).
         console.error("[delete] broadcast copy cascade failed:", err);
       }
+    }
+
+    if (deleted.failed_chats > 0) {
+      // Partly committed: the chats that succeeded are already fanned out
+      // above, but the failed chat's messages are still live for everyone.
+      // The old single UPDATE was all-or-nothing, so the client's outbox
+      // replays on any non-2xx — keep that: a 200 here would retire the
+      // delete for good. The replay is safe: rows deleted now are skipped
+      // (RETURNING decides who broadcasts), only the failed chat is retried.
+      return {
+        success: false,
+        code: 500,
+        message: "ERROR : mark_as_delete_message (partial)",
+        data: deletedMessages,
+      };
     }
 
     return {
@@ -1356,21 +1697,13 @@ const delete_message_for_me = async (
   conversation_id: string
 ) => {
   try {
-    // Verify user is an active member of the conversation
-    const membership = await db
-      .select()
-      .from(chat_member_model)
-      .where(
-        and(
-          eq(chat_member_model.chat_id, conversation_id),
-          eq(chat_member_model.user_id, user_id),
-          isNull(chat_member_model.removed_at),
-          eq(chat_member_model.status, "active")
-        )
-      )
-      .limit(1);
+    // Verify user is an active member of the conversation — and, in the same
+    // round trip, set chat_members.has_hidden (SYNC_V2 §3.6: derived unread
+    // probes message_info for hidden rows only when it is set). Set BEFORE
+    // the tombstones below so a hidden row never exists without the flag.
+    const membership_id = await check_member_mark_hidden(pg_client, conversation_id, user_id);
 
-    if (membership.length === 0) {
+    if (!membership_id) {
       return {
         success: false,
         code: 403,
@@ -1460,12 +1793,24 @@ const delete_message_for_me = async (
   }
 };
 
+// Admin "permanent" delete. SYNC_V2 §3.3.3: no longer a row DELETE but a
+// soft delete + scrub — body and attachments are wiped, the row stays as a
+// tombstone that takes a clock value (messages_bu_del), so v2 clients learn of
+// it through the delta. History, the chat list and every legacy read already
+// hide deleted_at rows, so old clients see what they saw before; the response
+// still echoes the row (now scrubbed). Nothing is broadcast, as before.
 const hard_delete_message = async (message_id: string) => {
   try {
-    const result = await db
-      .delete(message_model)
-      .where(eq(message_model.id, message_id))
-      .returning();
+    const scrubbed = await scrub_delete_message(pg_client, message_id);
+    const result = scrubbed ? [scrubbed] : [];
+    if (scrubbed) {
+      // Unnumbered chats: the legacy pointer / pin / preview repair (a row
+      // DELETE used to leave them naming a missing row). Numbered chats were
+      // repaired by the triggers in the same statement.
+      await repair_pointers_after_delete(scrubbed.chat_id, [scrubbed.id]).catch((err) =>
+        console.error(`[DELETE] pointer repair after scrub failed (${scrubbed.chat_id}):`, err),
+      );
+    }
 
     if (result.length === 0) {
       return {
@@ -1569,6 +1914,9 @@ const get_conversation_history = async (
         deleted_at: message_model.deleted_at,
         sender_name: user_model.name,
         sender_profile_pic: user_model.profile_pic,
+        seq: message_model.seq,
+        mod_seq: message_model.mod_seq,
+        meta: message_model.meta,
       })
       .from(message_model)
       // LEFT JOIN (SYNC_V2 R0): an INNER join silently dropped every sender-less
@@ -1612,7 +1960,12 @@ const get_conversation_history = async (
     // Reverse if we fetched backwards (before cursor) or initial load (newest first → oldest first for display)
     if (before_message_id || !after_message_id) messages.reverse();
 
-    const enriched = await enrich_with_replied_to(messages);
+    // SYNC_V2 §4.1: rows gain seq / mod_seq / meta with sync_v2 'on' (meta
+    // only on system rows); off / shadow keep the old keys exactly.
+    const v2 = v2_on(sync_v2_flags());
+    const enriched = await enrich_with_replied_to(
+      messages.map(({ seq, mod_seq, meta, ...m }) => (v2 ? { ...m, seq, mod_seq, meta: m.type === "system" ? meta : null } : m)),
+    );
 
     return {
       success: true,
@@ -2117,6 +2470,9 @@ const get_chat_members = async (conversation_id: string, user_id: string) => {
         phone: user_model.phone,
         profile_pic: user_model.profile_pic,
         user_role: user_model.role,
+        read_seq: chat_member_model.read_seq,
+        delivered_seq: chat_member_model.delivered_seq,
+        joined_seq: chat_member_model.joined_seq,
       })
       .from(chat_member_model)
       .innerJoin(user_model, eq(user_model.id, chat_member_model.user_id))
@@ -2129,10 +2485,16 @@ const get_chat_members = async (conversation_id: string, user_id: string) => {
       )
       .orderBy(asc(chat_member_model.joined_at));
 
+    // SYNC_V2 §4.1: readSeq / deliveredSeq / joinedSeq per member (Read-by
+    // from watermarks) with sync_v2 'on'; off / shadow keep the old keys only.
+    const v2 = v2_on(sync_v2_flags());
     return {
       success: true,
       code: 200,
-      data: { members },
+      data: {
+        members: members.map(({ read_seq, delivered_seq, joined_seq, ...m }) =>
+          v2 ? { ...m, readSeq: read_seq, deliveredSeq: delivered_seq, joinedSeq: joined_seq } : m),
+      },
     };
   } catch (error) {
     console.error("get_chat_members error:", error);
@@ -2151,6 +2513,7 @@ export {
   clear_chat_for_user,
   revive_chat,
   soft_delete_message,
+  resolve_delete_authority,
   broadcast_deletion,
   delete_message_for_me,
   hard_delete_message,

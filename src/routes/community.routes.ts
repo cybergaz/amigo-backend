@@ -1,5 +1,6 @@
 import { Elysia, t } from "elysia";
 import { app_middleware } from "@/middleware";
+import { request_auth } from "@/middleware/request-auth";
 import {
   create_community,
   get_communities,
@@ -19,22 +20,12 @@ import {
 } from "@/services/community.services";
 
 const community_routes = new Elysia({ prefix: "/community" })
-  .state({ id: "", role: "" })
-  .guard({
-    beforeHandle({ cookie, set, store, headers }) {
-      const state_result = app_middleware({ cookie, headers });
-
-      set.status = state_result.code;
-      if (!state_result.data) return state_result;
-
-      store.id = state_result.data.id;
-      store.role = state_result.data.role;
-    }
-  })
+  // Per-request identity (middleware/request-auth.ts), never the app-wide store.
+  .resolve(({ cookie, set, headers }) => request_auth(set, app_middleware({ cookie, headers })))
 
   // Community CRUD operations
-  .post("/create", async ({ set, store, body }) => {
-    const community_result = await create_community(store.id, body);
+  .post("/create", async ({ set, auth, body }) => {
+    const community_result = await create_community(auth.id, body);
     set.status = community_result.code;
     return community_result;
   }, {
@@ -45,20 +36,20 @@ const community_routes = new Elysia({ prefix: "/community" })
     })
   })
 
-  .get("/list-all", async ({ set, store }) => {
-    const communities_result = await get_communities(store.id);
+  .get("/list-all", async ({ set, auth }) => {
+    const communities_result = await get_communities(auth.id);
     set.status = communities_result.code;
     return communities_result;
   })
 
-  .get("/list-connected-communities", async ({ set, store }) => {
-    const communities_result = await get_connected_communities(store.id);
+  .get("/list-connected-communities", async ({ set, auth }) => {
+    const communities_result = await get_connected_communities(auth.id);
     set.status = communities_result.code;
     return communities_result;
   })
 
-  .get("/:community_id", async ({ set, store, params }) => {
-    const community_result = await get_community_details(params.community_id, store.id);
+  .get("/:community_id", async ({ set, auth, params }) => {
+    const community_result = await get_community_details(params.community_id, auth.id);
     set.status = community_result.code;
     return community_result;
   }, {
@@ -67,8 +58,8 @@ const community_routes = new Elysia({ prefix: "/community" })
     })
   })
 
-  .put("/:community_id", async ({ set, store, params, body }) => {
-    const update_result = await update_community(params.community_id, store.id, body);
+  .put("/:community_id", async ({ set, auth, params, body }) => {
+    const update_result = await update_community(params.community_id, auth.id, body);
     set.status = update_result.code;
     return update_result;
   }, {
@@ -82,8 +73,8 @@ const community_routes = new Elysia({ prefix: "/community" })
     })
   })
 
-  .delete("/:community_id", async ({ set, store, params }) => {
-    const delete_result = await delete_community(params.community_id, store.id);
+  .delete("/:community_id", async ({ set, auth, params }) => {
+    const delete_result = await delete_community(params.community_id, auth.id);
     set.status = delete_result.code;
     return delete_result;
   }, {
@@ -93,10 +84,10 @@ const community_routes = new Elysia({ prefix: "/community" })
   })
 
   // Community group management
-  .post("/:community_id/groups/add", async ({ set, store, params, body }) => {
+  .post("/:community_id/groups/add", async ({ set, auth, params, body }) => {
     const add_result = await add_community_groups(
       params.community_id,
-      store.id,
+      auth.id,
       { ...body, community_id: params.community_id }
     );
     set.status = add_result.code;
@@ -110,10 +101,10 @@ const community_routes = new Elysia({ prefix: "/community" })
     })
   })
 
-  .post("/:community_id/groups/remove", async ({ set, store, params, body }) => {
+  .post("/:community_id/groups/remove", async ({ set, auth, params, body }) => {
     const remove_result = await remove_community_groups(
       params.community_id,
-      store.id,
+      auth.id,
       { ...body, community_id: params.community_id }
     );
     set.status = remove_result.code;
@@ -128,8 +119,8 @@ const community_routes = new Elysia({ prefix: "/community" })
   })
 
   // Community group management
-  .post("/:community_id/groups/create", async ({ set, store, params, body }) => {
-    const group_result = await create_community_group(store.id, {
+  .post("/:community_id/groups/create", async ({ set, auth, params, body }) => {
+    const group_result = await create_community_group(auth.id, {
       ...body,
       community_id: params.community_id
     });
@@ -151,8 +142,8 @@ const community_routes = new Elysia({ prefix: "/community" })
     })
   })
 
-  .put("/groups/:conversation_id", async ({ set, store, params, body }) => {
-    const update_result = await update_community_group(store.id, {
+  .put("/groups/:conversation_id", async ({ set, auth, params, body }) => {
+    const update_result = await update_community_group(auth.id, {
       ...body,
       conversation_id: params.conversation_id
     });
@@ -173,8 +164,8 @@ const community_routes = new Elysia({ prefix: "/community" })
     })
   })
 
-  .get("/:community_id/groups", async ({ set, store, params }) => {
-    const groups_result = await get_community_groups(params.community_id, store.id);
+  .get("/:community_id/groups", async ({ set, auth, params }) => {
+    const groups_result = await get_community_groups(params.community_id, auth.id);
     set.status = groups_result.code;
     return groups_result;
   }, {
@@ -183,8 +174,8 @@ const community_routes = new Elysia({ prefix: "/community" })
     })
   })
 
-  .delete("/groups/:conversation_id", async ({ set, store, params }) => {
-    const delete_result = await delete_community_group(params.conversation_id, store.id);
+  .delete("/groups/:conversation_id", async ({ set, auth, params }) => {
+    const delete_result = await delete_community_group(params.conversation_id, auth.id);
     set.status = delete_result.code;
     return delete_result;
   }, {
@@ -200,8 +191,8 @@ const community_routes = new Elysia({ prefix: "/community" })
     return comm_group_res;
   })
 
-  .post("/create-standalone-group", async ({ set, store, body }) => {
-    const stand_group_res = await create_standalone_comminity_group(store.id, body)
+  .post("/create-standalone-group", async ({ set, auth, body }) => {
+    const stand_group_res = await create_standalone_comminity_group(auth.id, body)
     set.status = stand_group_res.code;
     return stand_group_res;
   }, {
@@ -216,8 +207,8 @@ const community_routes = new Elysia({ prefix: "/community" })
   })
 
   // Add group to multiple communities at once
-  .post("/add-group-to-communities", async ({ set, store, body }) => {
-    const result = await add_group_to_multiple_communities(body.group_id, store.id, body.community_ids);
+  .post("/add-group-to-communities", async ({ set, auth, body }) => {
+    const result = await add_group_to_multiple_communities(body.group_id, auth.id, body.community_ids);
     set.status = result.code;
     return result;
   }, {

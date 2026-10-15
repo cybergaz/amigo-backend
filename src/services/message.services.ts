@@ -20,15 +20,29 @@ import {
 } from "@/types/chat.types";
 import { ResultType } from "@/types/core.types";
 import { ChatMessagePayload, MessagePinPayload, MessageReactPayload, } from "@/types/socket.types";
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { randomUUIDv7 } from "bun";
 import {
   get_disappearing_after_sec,
   set_disappearing_after_sec,
   set_last_message,
 } from "@/cache-management/chat-meta.cache";
-import { resolve_stored_sent_at } from "@/utils/message-time.utils";
+import { resolve_expires_at, resolve_stored_sent_at } from "@/utils/message-time.utils";
+import { sync_v2_flags } from "@/services/app-settings.service";
+import { server_expiry_active, v2_on } from "@/services/sync/flags-core";
+import { count } from "@/utils/counters";
 import { get_chat_type, is_broadcast_chat } from "@/cache-management/chat-type.cache";
+import { get_pin_state, set_pin } from "@/services/sync/set-pin";
+import { is_uuid, sync_v2_gate } from "@/services/sync/read-core";
+import { sanitize_attachments } from "@/utils/attachment-thumbs";
+import { resolve_delete_authority, soft_delete_message } from "@/services/chat.services";
+import {
+  forward_source_floor,
+  forward_target_allowed,
+  is_own_resend,
+  readable_after_floor,
+  type ForwarderMembershipRow,
+} from "@/utils/sender-identity";
 
 // Product rule for broadcast lists: no pins, replies or reactions INSIDE the
 // list chat (the app hides them; this is the server-side backstop). The list
@@ -92,6 +106,43 @@ const get_user_info = async (user_id: string) => {
   return user;
 };
 
+// message:new's `replied_to` is a client claim. store_message saved it as
+// given and the fan-out / history then shipped that row's body + attachments
+// as the reply preview — so a member could quote (and so read) a message
+// deleted for everyone, an expired disappearing one, or one from a chat they
+// are not in, just by knowing its id. Keep the reference only when it is a
+// live, unexpired message of THIS chat (the same rule as /message/reply);
+// otherwise it becomes a plain message (replied_to null — wire format
+// unchanged). One PK lookup, only for replies. Throws on a DB error: the
+// caller fails the frame transiently (the client retries) rather than
+// storing an unchecked reference.
+const resolve_reply_target = async (
+  replied_to: string | null | undefined,
+  conv_id: string,
+): Promise<string | null> => {
+  if (!replied_to || typeof replied_to !== "string") return null;
+  if (!is_uuid(replied_to)) {
+    count("AUTH", "reply_target_dropped");
+    return null;
+  }
+  const [orig] = await db
+    .select({ id: message_model.id })
+    .from(message_model)
+    .where(
+      and(
+        eq(message_model.id, replied_to),
+        eq(message_model.chat_id, conv_id),
+        isNull(message_model.deleted_at),
+        or(isNull(message_model.expires_at), gt(message_model.expires_at, sql`now()`)),
+      ),
+    )
+    .limit(1);
+  if (orig) return orig.id;
+  count("AUTH", "reply_target_dropped");
+  console.warn(`[message:new] replied_to ${replied_to} is not a live message of ${conv_id}; sent as a plain message`);
+  return null;
+};
+
 // Result of storing a message. `duplicate` = a row with this exact client id
 // already existed (an idempotent re-send), so the caller must NOT fan it out again.
 interface StoreMessageResultType extends ResultType<DBInsertMessageType> {
@@ -112,9 +163,11 @@ const store_message = async (payload: ChatMessagePayload): Promise<StoreMessageR
     // the same place recipients see it.
     const sent_at_date = resolve_stored_sent_at(payload.msg_type, payload.sent_at);
     const duration_sec = await resolve_disappearing_after_sec(payload.conv_id);
-    const expires_at: Date | null = duration_sec != null
-      ? new Date(sent_at_date.getTime() + duration_sec * 1000)
-      : null;
+    // SYNC_V2 §3.10: with server expiry on, the deadline counts from server
+    // arrival, not the (possibly hours-old, offline-composed) client stamp.
+    const expires_at = resolve_expires_at(
+      duration_sec, sent_at_date, server_expiry_active(sync_v2_flags()),
+    );
 
     // Idempotent insert keyed on the client-generated message id (UUIDv7 = the PK).
     // The same logical message legitimately reaches the server more than once on a
@@ -160,7 +213,25 @@ const store_message = async (payload: ChatMessagePayload): Promise<StoreMessageR
       .where(eq(message_model.id, payload.id))
       .limit(1);
 
+    if (existing && !is_own_resend(existing, payload.sender_id, payload.conv_id)) {
+      // The id belongs to someone else's message / another chat: not a resend.
+      // Refused like a plain PK collision (409 failed-ack), carrying none of
+      // the foreign row's fields.
+      count("SEQ", "new_id_foreign");
+      console.warn(
+        `[message:new] id ${payload.id} already stored for another sender/chat; refused (sender=${payload.sender_id} conv=${payload.conv_id})`,
+      );
+      return {
+        success: false,
+        code: 409,
+        message: "message id already exists",
+      };
+    }
+
     if (existing) {
+      // [SEQ] dup_precheck: a duplicate id reached the store; the messages_bi
+      // pre-check allocated nothing for it and its original seq stands.
+      count("SEQ", "dup_precheck");
       return {
         success: true,
         code: 200,
@@ -209,103 +280,40 @@ const store_message_with_retry = async (payload: ChatMessagePayload, _retry_coun
 // Pin a message in a conversation — stores message_id in chat_model.pinned_msg_id
 // (only one pinned message per conversation; calling again overwrites the previous pin)
 //
-// validate → commit → broadcast ONCE the committed state (SYNC_V2 R0). The
-// write is a single conditional UPDATE: it only changes the row when the pin
-// actually moves (IS DISTINCT FROM — re-pinning the current pin is a no-op
-// with NO broadcast) and only to a stored, undeleted message of this chat.
-// `payload.user_id` must be the AUTHENTICATED id (ws.data / store), never a
-// client payload field — it is what receivers see as the actor.
+// validate → commit → broadcast ONCE the committed state (SYNC_V2 R0, §3.12).
+// Both legacy entry points are thin wrappers over set_pin (sync/set-pin.ts),
+// the single pin writer: one conditional UPDATE that only changes the row when
+// the pin actually moves (re-pinning the current pin is a no-op with NO
+// broadcast) and only to a stored, undeleted message of this chat; the
+// chats_bu_pin trigger stamps pin_seq. Response shapes and codes are exactly
+// the pre-sync-v2 ones. `payload.user_id` must be the AUTHENTICATED id
+// (ws.data / store), never a client payload field — receivers see it as the
+// actor.
 const pin_message = async (payload: PinMessageRequest) => {
   try {
     if (await is_broadcast_chat(payload.conv_id)) return { ...BROADCAST_UNSUPPORTED };
 
-    // Verify user is a member of the conversation
-    const membership = await verify_user_membership(payload.conv_id, payload.user_id);
-    if (!membership) {
-      console.warn(`[PIN] 403 pin conv=${payload.conv_id} msg=${payload.message_id} user=${payload.user_id}`);
-      return {
-        success: false,
-        code: 403,
-        message: "You are not a member of this conversation",
-      };
-    }
-
-    // Atomic validate-and-commit: the target must be a stored, undeleted
-    // message of THIS chat, and the pin must actually change.
-    const [updated] = await db
-      .update(chat_model)
-      .set({ pinned_msg_id: payload.message_id })
-      .where(
-        and(
-          eq(chat_model.id, payload.conv_id),
-          sql`${chat_model.pinned_msg_id} IS DISTINCT FROM ${payload.message_id}`,
-          sql`EXISTS (SELECT 1 FROM ${message_model} WHERE ${message_model.id} = ${payload.message_id} AND ${message_model.chat_id} = ${payload.conv_id} AND ${message_model.deleted_at} IS NULL)`
-        )
-      )
-      .returning({ id: chat_model.id });
-
-    if (!updated) {
-      // Nothing changed — classify: already pinned (no-op, success, nothing
-      // broadcast) vs. target not stored in this chat (404).
-      const [conv] = await db
-        .select({ pinned_msg_id: chat_model.pinned_msg_id })
-        .from(chat_model)
-        .where(eq(chat_model.id, payload.conv_id))
-        .limit(1);
-
-      if (conv && conv.pinned_msg_id === payload.message_id) {
+    // Legacy frames carry no base pin_seq (base = NULL).
+    const r = await set_pin({ chat_id: payload.conv_id, actor_id: payload.user_id, message_id: payload.message_id });
+    const data = { conv_id: payload.conv_id, message_id: payload.message_id };
+    switch (r.outcome) {
+      case "applied":
+        console.log(`[PIN] applied pin conv=${payload.conv_id} msg=${payload.message_id}`);
+        return { success: true, code: 200, message: "Message pinned successfully", data };
+      case "noop":
         console.log(`[PIN] noop pin conv=${payload.conv_id} msg=${payload.message_id}`);
-        return {
-          success: true,
-          code: 200,
-          message: "Message already pinned",
-          data: { conv_id: payload.conv_id, message_id: payload.message_id },
-        };
-      }
-
-      console.warn(`[PIN] 404 pin conv=${payload.conv_id} msg=${payload.message_id}`);
-      return {
-        success: false,
-        code: 404,
-        message: "Message not found",
-      };
+        return { success: true, code: 200, message: "Message already pinned", data };
+      case "forbidden":
+        console.warn(`[PIN] 403 pin conv=${payload.conv_id} msg=${payload.message_id} user=${payload.user_id}`);
+        return { success: false, code: 403, message: "You are not a member of this conversation" };
+      case "unsupported":
+        return { ...BROADCAST_UNSUPPORTED };
+      default:
+        // not stored / deleted / not in this chat / lost a race: the legacy
+        // answer for "the update matched nothing and it is not the pin".
+        console.warn(`[PIN] 404 pin conv=${payload.conv_id} msg=${payload.message_id} (${r.outcome})`);
+        return { success: false, code: 404, message: "Message not found" };
     }
-
-    // Message type for the broadcast payload (the row was just proven to exist).
-    const [message] = await db
-      .select({ type: message_model.type })
-      .from(message_model)
-      .where(eq(message_model.id, payload.message_id))
-      .limit(1);
-
-    console.log(`[PIN] applied pin conv=${payload.conv_id} msg=${payload.message_id}`);
-
-    // Broadcast the COMMITTED pin to all members of the conversation
-    const pinPayload: MessagePinPayload = {
-      conv_id: payload.conv_id,
-      message_id: payload.message_id,
-      message_type: (message?.type ?? "text") as MessageType,
-      sender_id: payload.user_id,
-      // sender_name: user?.name ?? undefined,
-      pin: true,
-    };
-
-    await broadcast_message({
-      to: "conversation",
-      conv_id: payload.conv_id,
-      message: {
-        type: "message:pin",
-        payload: pinPayload,
-        ws_timestamp: new Date(),
-      },
-    });
-
-    return {
-      success: true,
-      code: 200,
-      message: "Message pinned successfully",
-      data: { conv_id: payload.conv_id, message_id: payload.message_id },
-    };
   } catch (error) {
     console.error("pin_message error", error);
     return {
@@ -316,82 +324,39 @@ const pin_message = async (payload: PinMessageRequest) => {
   }
 };
 
-// Unpin a message — clears chat_model.pinned_msg_id, but only if the
-// currently pinned message matches the requested message_id. Atomic
-// compare-and-clear (UPDATE … WHERE pinned_msg_id = target) — the old
-// read-then-write let a stale unpin clear a pin set in between.
+// Unpin a message — clears chats.pinned_msg_id, but only if the currently
+// pinned message is the requested one (unpin_target: atomic compare-and-clear
+// in the same UPDATE; a stale unpin can never clear a pin set in between).
 const unpin_message = async (payload: PinMessageRequest) => {
   try {
     if (await is_broadcast_chat(payload.conv_id)) return { ...BROADCAST_UNSUPPORTED };
 
-    // Verify user is a member of the conversation
-    const membership = await verify_user_membership(payload.conv_id, payload.user_id);
-    if (!membership) {
-      console.warn(`[PIN] 403 unpin conv=${payload.conv_id} msg=${payload.message_id} user=${payload.user_id}`);
-      return {
-        success: false,
-        code: 403,
-        message: "You are not a member of this conversation",
-      };
-    }
-
-    const [cleared] = await db
-      .update(chat_model)
-      .set({ pinned_msg_id: null })
-      .where(
-        and(
-          eq(chat_model.id, payload.conv_id),
-          eq(chat_model.pinned_msg_id, payload.message_id)
-        )
-      )
-      .returning({ id: chat_model.id });
-
-    if (!cleared) {
-      // Not the current pin (already unpinned, or another message is pinned
-      // now) — nothing changes, nothing is broadcast. Same 409 as before.
-      console.warn(`[PIN] 409 unpin conv=${payload.conv_id} msg=${payload.message_id}`);
-      return {
-        success: false,
-        code: 409,
-        message: "This message is not currently pinned",
-      };
-    }
-
-    // Fetch message type for the broadcast payload (best-effort — may be deleted)
-    const [message] = await db
-      .select({ type: message_model.type })
-      .from(message_model)
-      .where(eq(message_model.id, payload.message_id))
-      .limit(1);
-
-    console.log(`[PIN] applied unpin conv=${payload.conv_id} msg=${payload.message_id}`);
-
-    // Broadcast the COMMITTED unpin to all members of the conversation
-    const unpinPayload: MessagePinPayload = {
-      conv_id: payload.conv_id,
-      message_id: payload.message_id,
-      message_type: (message?.type ?? "text") as MessageType,
-      sender_id: payload.user_id,
-      // sender_name: user?.name ?? undefined,
-      pin: false,
-    };
-
-    await broadcast_message({
-      to: "conversation",
-      conv_id: payload.conv_id,
-      message: {
-        type: "message:pin",
-        payload: unpinPayload,
-        ws_timestamp: new Date(),
-      },
+    const r = await set_pin({
+      chat_id: payload.conv_id,
+      actor_id: payload.user_id,
+      message_id: null,
+      unpin_target: payload.message_id,
     });
-
-    return {
-      success: true,
-      code: 200,
-      message: "Message unpinned successfully",
-      data: { conv_id: payload.conv_id, message_id: payload.message_id },
-    };
+    switch (r.outcome) {
+      case "applied":
+        console.log(`[PIN] applied unpin conv=${payload.conv_id} msg=${payload.message_id}`);
+        return {
+          success: true,
+          code: 200,
+          message: "Message unpinned successfully",
+          data: { conv_id: payload.conv_id, message_id: payload.message_id },
+        };
+      case "forbidden":
+        console.warn(`[PIN] 403 unpin conv=${payload.conv_id} msg=${payload.message_id} user=${payload.user_id}`);
+        return { success: false, code: 403, message: "You are not a member of this conversation" };
+      case "unsupported":
+        return { ...BROADCAST_UNSUPPORTED };
+      default:
+        // Not the current pin (already unpinned, or another message is pinned
+        // now) — nothing changes, nothing is broadcast. Same 409 as before.
+        console.warn(`[PIN] 409 unpin conv=${payload.conv_id} msg=${payload.message_id}`);
+        return { success: false, code: 409, message: "This message is not currently pinned" };
+    }
   } catch (error) {
     console.error("unpin_message error", error);
     return {
@@ -402,20 +367,49 @@ const unpin_message = async (payload: PinMessageRequest) => {
   }
 };
 
+// The user's chat_members rows for one chat (joined with its type), as
+// forward_target_allowed reads them.
+const membership_rows_for = async (user_id: string, chat_id: string): Promise<ForwarderMembershipRow[]> =>
+  db
+    .select({
+      chat_id: chat_member_model.chat_id,
+      chat_type: chat_model.type,
+      status: chat_member_model.status,
+      removed_at: chat_member_model.removed_at,
+      joined_at: chat_member_model.joined_at,
+      cleared_at: chat_member_model.cleared_at,
+    })
+    .from(chat_member_model)
+    .innerJoin(chat_model, eq(chat_model.id, chat_member_model.chat_id))
+    .where(
+      and(
+        eq(chat_member_model.user_id, user_id),
+        eq(chat_member_model.chat_id, chat_id),
+      )
+    );
+
+// "May this user post into this chat?" — the message:new / forward rule.
+const may_post_into = async (user_id: string, chat_id: string): Promise<boolean> =>
+  forward_target_allowed(await membership_rows_for(user_id, chat_id));
+
 // Reply to message
 const reply_to_message = async (request: ReplyMessageRequest, user_id: string) => {
   try {
     if (await is_broadcast_chat(request.conversation_id)) return { ...BROADCAST_UNSUPPORTED };
 
-    // Verify user membership
-    // const membership = await verify_user_membership(request.conversation_id, user_id);
-    // if (!membership) {
-    //   return {
-    //     success: false,
-    //     code: 403,
-    //     message: "You are not a member of this conversation",
-    //   };
-    // }
+    // May the replier post into this chat? The same rule as message:new's send
+    // guard and forward targets (forward_target_allowed): an active member;
+    // in a group also not removed. This check was commented out, so anyone
+    // who knew a chat id and a message id could post into any chat.
+    if (!(await may_post_into(user_id, request.conversation_id))) {
+      count("AUTH", "reply_not_member");
+      console.warn(`[reply] refused: user ${user_id} may not post into ${request.conversation_id}`);
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
 
     // Get original message info
     const [originalMessage] = await db
@@ -443,6 +437,14 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: string) =
       };
     }
 
+    // Disappearing deadline (SYNC_V2 §3.10) — only with server expiry on.
+    // Replies never carried one before, so the legacy behaviour (no expiry)
+    // is kept while the flag is off; on, a reply disappears like any other
+    // message in the chat, counted from server arrival.
+    const reply_expires_at = server_expiry_active(sync_v2_flags())
+      ? resolve_expires_at(await resolve_disappearing_after_sec(request.conversation_id), new Date(), true)
+      : null;
+
     // Create new reply message — replied_to column stores the reference.
     // Idempotent on the client id, exactly like store_message (SYNC_V2 R0):
     // a retried request used to hit the PK and come back 500. A duplicate
@@ -455,8 +457,10 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: string) =
         sender_id: user_id,
         type: "text",
         body: request.body,
-        attachments: request.attachments,
+        // §14.7 item 5: thumb / thumb_url bounded like on message:new.
+        attachments: sanitize_attachments(request.attachments, { inline_thumbs: sync_v2_flags().inline_thumbs }),
         replied_to: originalMessage.id,
+        ...(reply_expires_at ? { expires_at: reply_expires_at } : {}),
       })
       .onConflictDoNothing({ target: message_model.id })
       .returning();
@@ -514,7 +518,7 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: string) =
       sender_id: replyMessage.sender_id ?? user_id,
       sent_at: (replyMessage.sent_at ?? replyMessage.created_at ?? new Date()).toISOString(),
       attachments: replyMessage.attachments ?? null,
-    });
+    }, { numbered: replyMessage.seq != null });
 
     return {
       success: true,
@@ -534,11 +538,51 @@ const reply_to_message = async (request: ReplyMessageRequest, user_id: string) =
 };
 
 // Forward messages
+//
+// `user_id` is the AUTHENTICATED forwarder (the route's JWT id, or the WS
+// handler's connection id — message:forward's payload.forwarder_id is pinned
+// to it). It must be able to READ the source messages (active member of the
+// source chat, messages after its joined_at / cleared_at floor — the
+// get_conversation_history gate) and must be allowed to POST into each target
+// (forward_target_allowed: the message:new send-guard rule). Targets that fail
+// are skipped; when none pass, the forward is refused with 403.
 const forward_messages = async (request: ForwardMessageRequest, user_id: string) => {
   try {
+    // The forwarder's membership rows for the source + every target chat, in
+    // one round trip.
+    const gate_chat_ids = [...new Set([request.source_conversation_id, ...request.target_conversation_ids])];
+    const membership_rows: ForwarderMembershipRow[] = await db
+      .select({
+        chat_id: chat_member_model.chat_id,
+        chat_type: chat_model.type,
+        status: chat_member_model.status,
+        removed_at: chat_member_model.removed_at,
+        joined_at: chat_member_model.joined_at,
+        cleared_at: chat_member_model.cleared_at,
+      })
+      .from(chat_member_model)
+      .innerJoin(chat_model, eq(chat_model.id, chat_member_model.chat_id))
+      .where(
+        and(
+          eq(chat_member_model.user_id, user_id),
+          inArray(chat_member_model.chat_id, gate_chat_ids),
+        )
+      );
+    const rows_of = (chat_id: string) =>
+      membership_rows.filter((r) => r.chat_id?.toLowerCase() === chat_id.toLowerCase());
 
-    // Get messages to forward
-    const original_messages = await db
+    const source = forward_source_floor(rows_of(request.source_conversation_id));
+    if (!source) {
+      console.warn(`[forward] refused: user ${user_id} is not an active member of source ${request.source_conversation_id}`);
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of this conversation",
+      };
+    }
+
+    // Get messages to forward (only those the forwarder can see)
+    const original_messages = readable_after_floor(await db
       .select()
       .from(message_model)
       .where(
@@ -548,7 +592,7 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: string)
           isNull(message_model.deleted_at)
         )
       )
-      .orderBy(message_model.created_at);
+      .orderBy(message_model.created_at), source.floor);
 
     if (original_messages.length === 0) {
       return {
@@ -558,8 +602,12 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: string)
       };
     }
 
-    const forwardedMessages: Map<string, (DBMessageType & { conv_type: string; })[]> = new Map();
+    // `duplicate`: the row already existed under the client's id (a replayed
+    // forward, sync_v2 'on' only) — the caller must not fan it out again.
+    const forwardedMessages: Map<string, (DBMessageType & { conv_type: string; duplicate?: boolean; })[]> = new Map();
+    const client_ids = v2_on(sync_v2_flags()) && request.ids && typeof request.ids === "object" ? request.ids : null;
 
+    let denied_targets = 0;
     for (const target_conv_id of request.target_conversation_ids) {
       // Forwarding INTO a broadcast list isn't supported (v1): this path only
       // inserts + fans out to the target chat's members, so the message would
@@ -569,35 +617,80 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: string)
         console.warn(`[forward] skipping broadcast-list target ${target_conv_id}`);
         continue;
       }
+      // Not allowed to post there (not / no longer an active member): skip.
+      if (!forward_target_allowed(rows_of(target_conv_id))) {
+        denied_targets++;
+        count("AUTH", "forward_target_denied");
+        console.warn(`[forward] skipping target ${target_conv_id}: user ${user_id} is not an active member`);
+        continue;
+      }
 
-      const all_msgs: (DBMessageType & { conv_type: string; })[] = [];
+      const all_msgs: (DBMessageType & { conv_type: string; duplicate?: boolean; })[] = [];
 
       const [conv] = await db
         .select({ conv_type: chat_model.type })
         .from(chat_model)
         .where(eq(chat_model.id, target_conv_id));
 
+      const target_ids = client_ids?.[target_conv_id];
 
       for (const message of original_messages) {
+        const values = {
+          chat_id: target_conv_id,
+          sender_id: user_id,
+          type: message.type,
+          body: message.body,
+          attachments: message.attachments,
+          sent_at: new Date(),
+        };
+        // §3.3.7: the client's id for this (target, source message), if any.
+        const wanted = Array.isArray(target_ids) ? target_ids[request.message_ids.indexOf(message.id)] : undefined;
+        if (!is_uuid(wanted)) {
+          const [inserted_msg] = await db
+            .insert(message_model)
+            .values({ id: randomUUIDv7(), ...values }).returning();
+
+          all_msgs.push({
+            ...inserted_msg,
+            conv_type: conv.conv_type
+          });
+          continue;
+        }
+        const id = wanted.toLowerCase();
         const [inserted_msg] = await db
           .insert(message_model)
-          .values({
-            id: randomUUIDv7(),
-            chat_id: target_conv_id,
-            sender_id: user_id,
-            type: message.type,
-            body: message.body,
-            attachments: message.attachments,
-            sent_at: new Date(),
-          }).returning();
-
-        all_msgs.push({
-          ...inserted_msg,
-          conv_type: conv.conv_type
-        });
+          .values({ id, ...values })
+          .onConflictDoNothing({ target: message_model.id })
+          .returning();
+        if (inserted_msg) {
+          all_msgs.push({ ...inserted_msg, conv_type: conv.conv_type });
+          continue;
+        }
+        const [existing] = await db.select().from(message_model).where(eq(message_model.id, id)).limit(1);
+        if (existing && existing.chat_id === target_conv_id && existing.sender_id === user_id) {
+          // A replay: the original row (and its seq) stands; nothing is stored twice.
+          count("SEQ", "forward_duplicate");
+          all_msgs.push({ ...existing, conv_type: conv.conv_type, duplicate: true });
+          continue;
+        }
+        // The id belongs to someone else's row: no idempotency is possible
+        // for it, so store under a server id as an old client would.
+        count("SEQ", "forward_id_foreign");
+        const [fresh] = await db
+          .insert(message_model)
+          .values({ id: randomUUIDv7(), ...values }).returning();
+        all_msgs.push({ ...fresh, conv_type: conv.conv_type });
       }
 
       forwardedMessages.set(target_conv_id, all_msgs);
+    }
+
+    if (forwardedMessages.size === 0 && denied_targets > 0) {
+      return {
+        success: false,
+        code: 403,
+        message: "You are not a member of the target conversation(s)",
+      };
     }
 
     return {
@@ -617,22 +710,25 @@ const forward_messages = async (request: ForwardMessageRequest, user_id: string)
   }
 };
 
-// Delete messages
+// Delete messages (DELETE /message/delete — always delete-for-everyone).
+//
+// Authority is the same server-side rule as soft_delete_message
+// (resolve_delete_authority): an active member may delete their OWN messages;
+// another member's only as the chat's owner / a group admin / global staff,
+// and global admin / sub_admin may delete anything. This route used to check
+// nothing — any authenticated user could delete any message by id (the
+// UPDATE was not even scoped to conversation_id). Delete-for-me is a separate
+// per-user route (/message/delete-for-me) and is unaffected.
 const delete_messages = async (request: DeleteMessageRequest, user_id: string) => {
   try {
-    // Verify user membership
-    // const membership = await verify_user_membership(request.conversation_id, user_id);
-    // if (!membership) {
-    //   return {
-    //     success: false,
-    //     code: 403,
-    //     message: "You are not a member of this conversation",
-    //   };
-    // }
-
-    // Get messages to delete
+    // The live messages to delete — only those IN request.conversation_id
+    // (soft_delete_message itself takes ids from any chat).
     const messages = await db
-      .select()
+      .select({
+        id: message_model.id,
+        chat_id: message_model.chat_id,
+        sender_id: message_model.sender_id,
+      })
       .from(message_model)
       .where(
         and(
@@ -650,38 +746,49 @@ const delete_messages = async (request: DeleteMessageRequest, user_id: string) =
       };
     }
 
-    // Delete for everyone - only message sender or admin can do this
-    // const validMessages = messages.filter(msg =>
-    //   msg.sender_id === user_id || membership.role === "admin"
-    // );
-    //
-    // if (validMessages.length === 0) {
-    //   return {
-    //     success: false,
-    //     code: 403,
-    //     message: "You can only delete your own messages or you need admin privileges",
-    //   };
-    // }
+    // Delete for everyone - only the message sender, or an elevated member /
+    // master (see resolve_delete_authority), can do this.
+    const authority = await resolve_delete_authority(user_id, [request.conversation_id]);
+    const validMessages = messages.filter((msg) => authority.can_delete(msg));
+    if (validMessages.length < messages.length) {
+      count("AUTH", "delete_refused", messages.length - validMessages.length);
+      console.warn(
+        `[DELETE] /message/delete refused ${messages.length - validMessages.length}/${messages.length} message(s) for user ${user_id} (not sender / not member / not elevated)`,
+      );
+    }
 
-    const deletedMessages = [];
-    // Mark messages as deleted
-    for (const message of request.message_ids) {
-      const [deletedMessage] = await db
-        .update(message_model)
-        .set({
-          deleted_at: new Date(),
-        })
-        .where(eq(message_model.id, message))
-        .returning();
+    if (validMessages.length === 0) {
+      return {
+        success: false,
+        code: 403,
+        message: "You can only delete your own messages or you need admin privileges",
+      };
+    }
 
-      deletedMessages.push(deletedMessage);
+    // The one delete-for-everyone path: soft_delete_message re-checks the
+    // same authority, then does what a raw UPDATE here skipped — the mod_seq
+    // clock (SYNC_V2 §3.3.1), the broadcast-list copy cascade, the last /
+    // pinned message repoint and the WS + FCM fan-out to the chat's members.
+    // Only the authorised rows of THIS conversation are passed in (the
+    // SELECT above is scoped to request.conversation_id).
+    const result = await soft_delete_message(validMessages.map((m) => m.id), user_id);
+    if (!result.success) {
+      // 404 = nothing left to delete (a concurrent delete got there first);
+      // 500 = transient, the client's outbox retries. `data` (partial 500:
+      // the rows that DID commit) is passed through.
+      return {
+        success: false,
+        code: result.code,
+        message: result.message,
+        ...("data" in result && Array.isArray(result.data) ? { data: result.data } : {}),
+      };
     }
 
     return {
       success: true,
       code: 200,
       message: "Messages deleted for everyone",
-      data: deletedMessages,
+      data: result.data,
     };
 
     // } else {
@@ -704,14 +811,30 @@ const delete_messages = async (request: DeleteMessageRequest, user_id: string) =
   }
 };
 
-// Get pinned messages for a conversation
-// TODO: needs dedicated pinned_message_id column on chat_model (metadata column was removed)
+// GET /message/pinned/:conversation_id (SYNC_V2 §3.12): the chat's current
+// pin {pinned_msg_id, pin_seq, pinned_message} for any active member, whatever
+// their clear / join floors (PD-3). Behind the Sync v2 gate: with every flag at
+// its default it keeps answering the old 501, so nothing changes for 4.2.2.
 const get_pinned_messages = async (conversation_id: string, user_id: string) => {
-  return {
-    success: false,
-    code: 501,
-    message: "Get pinned feature pending migration — metadata column removed",
-  };
+  if (!sync_v2_gate(user_id, sync_v2_flags()).ok) {
+    return {
+      success: false,
+      code: 501,
+      message: "Get pinned feature pending migration — metadata column removed",
+    };
+  }
+  if (!is_uuid(conversation_id)) {
+    return { success: false, code: 404, message: "Conversation not found" };
+  }
+  try {
+    const r = await get_pin_state(user_id, conversation_id);
+    if (r.code === 404) return { success: false, code: 404, message: "Conversation not found" };
+    if (r.code === 403) return { success: false, code: 403, message: "You are not a member of this conversation" };
+    return { success: true, code: 200, data: r.state };
+  } catch (error) {
+    console.error("get_pinned_messages error", error);
+    return { success: false, code: 500, message: "ERROR: get_pinned_messages" };
+  }
 };
 
 // TODO: needs dedicated star tracking (e.g. via message_info_model) — metadata column was removed
@@ -804,6 +927,7 @@ const react_to_message = async (request: ReactMessageRequest, user_id: string, u
 
 export {
   store_message,
+  resolve_reply_target,
   store_message_with_retry,
   pin_message,
   unpin_message,

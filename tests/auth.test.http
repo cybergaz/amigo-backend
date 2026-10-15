@@ -203,7 +203,7 @@ Content-Type: application/json
 
 {
   "email": "admin@gmail.com",
-  "password": "Admin@123"
+  "password": "<admin-password>"
 }
 
 
@@ -214,18 +214,15 @@ Content-Type: application/json
 
 {
   "email": "admin@gmail.com",
-  "password": "Admin@123"
+  "password": "<admin-password>"
 }
 
 
 ### 
 
-GET http://localhost:5000/api/admin/seed-admin HTTP/1.1
-
-
-### 
-
-GET https://api.amigochats.com/api/admin/seed-admin HTTP/1.1
+# The seed-admin HTTP route is gone. Create the super admin from a shell:
+#   ADMIN_SEED_PASSWORD=... bun db:admin:seed [--email <e>] [--reset-password]
+# (see scripts/seed-admin.ts, `bun db:admin:seed --help`)
 
 
 ### 

@@ -1,4 +1,5 @@
 import { app_middleware } from "@/middleware";
+import { request_auth } from "@/middleware/request-auth";
 import FcmService from "@/services/fcm.service";
 import { LivekitService } from "@/services/livekit.service";
 import { broadcast_message, is_user_online } from "@/sockets/socket.handlers";
@@ -149,7 +150,7 @@ const livekit_routes = new Elysia({
         ws_message: { type: "call:accept", payload: callee_payload },
       });
 
-      if (!is_user_online(caller_id)) {
+      if (!(await is_user_online(caller_id))) {
         await FcmService.send_notification({
           type: "call",
           fcm_mode: "data-only",
@@ -223,7 +224,7 @@ const livekit_routes = new Elysia({
           },
         };
 
-        if (is_user_online(call_info.caller_id)) {
+        if (await is_user_online(call_info.caller_id)) {
           await broadcast_message({
             to: "users",
             user_ids: [call_info.caller_id],
@@ -309,7 +310,7 @@ const livekit_routes = new Elysia({
         // the local one because its Flutter side may come back to life later
         // and would otherwise restore a call that no longer exists.
         for (const id of [caller_id, callee_id]) {
-          if (is_user_online(id)) {
+          if (await is_user_online(id)) {
             await broadcast_message({
               to: "users",
               user_ids: [id],
@@ -345,22 +346,9 @@ const livekit_routes = new Elysia({
 
   // <-----------------Protected routes------------------>
 
-  .state({
-    id: "",
-    role: "",
-  })
-  .guard({
-    beforeHandle({ cookie, set, store, headers }) {
-      const state_result = app_middleware({ cookie, headers });
-
-      set.status = state_result.code;
-
-      if (!state_result.data) return state_result;
-
-      store.id = state_result.data.id;
-      store.role = state_result.data.role;
-    },
-  })
+  // Per-request identity (middleware/request-auth.ts), never the app-wide
+  // store. Local to the routes below: the public routes above stay open.
+  .resolve(({ cookie, set, headers }) => request_auth(set, app_middleware({ cookie, headers })))
 
   // Mint a room token for a call the requester is part of.
   //
@@ -370,10 +358,10 @@ const livekit_routes = new Elysia({
   // This lets a (re)starting client pull a fresh one instead of waiting for a
   // replay that will never come. Also covers rejoining after a process death
   // mid-call.
-  .post("/join/:call_id", async ({ set, params, store }): Promise<ResultType> => {
+  .post("/join/:call_id", async ({ set, params, auth }): Promise<ResultType> => {
     try {
       const call_id = params.call_id;
-      const user_id = store.id;
+      const user_id = auth.id;
 
       const call_info = (await LivekitService.get_call_info(call_id)).data;
 
@@ -454,9 +442,9 @@ const livekit_routes = new Elysia({
   })
 
   // active calls of a user:
-  .get("/active", async ({ set, store }): Promise<ResultType> => {
+  .get("/active", async ({ set, auth }): Promise<ResultType> => {
     try {
-      const user_id = store.id;
+      const user_id = auth.id;
       const active_calls =
         await LivekitService.get_active_call_by_user_id(user_id);
 

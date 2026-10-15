@@ -9,42 +9,36 @@ import {
 } from "@/services/media.service";
 import { get_allowed_file_types, S3_FOLDERS } from "@/services/s3.service";
 import { app_middleware } from "@/middleware";
+import { request_auth } from "@/middleware/request-auth";
+import { MAX_UPLOAD_FILE_BYTES } from "@/config/upload-limits";
 
 const media_routes = new Elysia({ prefix: "/media" })
-  .state({ id: "", role: "" })
-  .guard({
-    beforeHandle({ cookie, set, store, headers }) {
-      const state_result = app_middleware({ cookie, headers });
-
-      set.status = state_result.code;
-      if (!state_result.data) return state_result;
-
-      store.id = state_result.data.id;
-      store.role = state_result.data.role;
-    }
-  })
+  // Per-request identity (middleware/request-auth.ts), never the app-wide store.
+  .resolve(({ cookie, set, headers }) => request_auth(set, app_middleware({ cookie, headers })))
 
   // Generic file upload
-  .post("/upload", async ({ set, store, body }) => {
-    const result = await upload_media_file(store.id, body.file);
+  .post("/upload", async ({ set, auth, body }) => {
+    const result = await upload_media_file(auth.id, body.file);
     set.status = result.code;
     return result;
   },
     {
       body: t.Object({
         file: t.File({
-          // Coarse backstop at the largest per-type service limit (docs,
-          // 1GB — see get_file_size_limit in s3.service.ts, which does
-          // the real per-type validation). Note t.File maxSize validates
-          // after the body is received; it does not abort the transfer.
-          maxSize: 500 * 1024 * 1024,
+          // Coarse backstop at the largest per-type service limit (95 MiB,
+          // config/upload-limits.ts — Cloudflare free plan caps bodies at
+          // 100 MB); get_file_size_limit in s3.service.ts does the real
+          // per-type validation. Note t.File maxSize validates after the
+          // body is received; Bun's maxRequestBodySize (server.ts) is what
+          // refuses an oversized body before it is read.
+          maxSize: MAX_UPLOAD_FILE_BYTES,
         }),
       }),
     }
   )
 
   // Image upload
-  .post("/upload/image", async ({ set, store, body }) => {
+  .post("/upload/image", async ({ set, auth, body }) => {
     try {
       if (!body.file) {
         set.status = 400;
@@ -54,7 +48,7 @@ const media_routes = new Elysia({ prefix: "/media" })
         };
       }
 
-      const result = await upload_image(store.id, body.file);
+      const result = await upload_image(auth.id, body.file);
       set.status = result.code;
       return result;
     } catch (error: any) {
@@ -77,7 +71,7 @@ const media_routes = new Elysia({ prefix: "/media" })
   )
 
   // Audio upload
-  .post("/upload/audio", async ({ set, store, body }) => {
+  .post("/upload/audio", async ({ set, auth, body }) => {
     try {
       if (!body.file) {
         set.status = 400;
@@ -87,7 +81,7 @@ const media_routes = new Elysia({ prefix: "/media" })
         };
       }
 
-      const result = await upload_audio(store.id, body.file);
+      const result = await upload_audio(auth.id, body.file);
       set.status = result.code;
       return result;
     } catch (error: any) {
@@ -110,7 +104,7 @@ const media_routes = new Elysia({ prefix: "/media" })
   )
 
   // Video upload
-  .post("/upload/video", async ({ set, store, body }) => {
+  .post("/upload/video", async ({ set, auth, body }) => {
     try {
       if (!body.file) {
         set.status = 400;
@@ -120,7 +114,7 @@ const media_routes = new Elysia({ prefix: "/media" })
         };
       }
 
-      const result = await upload_video(store.id, body.file);
+      const result = await upload_video(auth.id, body.file);
       set.status = result.code;
       return result;
     } catch (error: any) {
@@ -139,14 +133,14 @@ const media_routes = new Elysia({ prefix: "/media" })
           // Keep in sync with get_file_size_limit (s3.service.ts). Note
           // t.File maxSize validates after the body is received — it is
           // not a transfer abort.
-          maxSize: 100 * 1024 * 1024, // 100MB
+          maxSize: MAX_UPLOAD_FILE_BYTES, // 95 MiB (config/upload-limits.ts)
         }),
       }),
     }
   )
 
   // Document upload
-  .post("/upload/document", async ({ set, store, body }) => {
+  .post("/upload/document", async ({ set, auth, body }) => {
     try {
       if (!body.file) {
         set.status = 400;
@@ -156,7 +150,7 @@ const media_routes = new Elysia({ prefix: "/media" })
         };
       }
 
-      const result = await upload_document(store.id, body.file);
+      const result = await upload_document(auth.id, body.file);
       set.status = result.code;
       return result;
     } catch (error: any) {
@@ -179,7 +173,7 @@ const media_routes = new Elysia({ prefix: "/media" })
   )
 
   // Delete file
-  .delete("/delete", async ({ set, store, body }) => {
+  .delete("/delete", async ({ set, auth, body }) => {
     try {
       if (!body.key) {
         set.status = 400;
@@ -190,7 +184,7 @@ const media_routes = new Elysia({ prefix: "/media" })
       }
 
       // Basic security check - ensure the key contains the user's ID
-      if (!body.key.includes(`/${store.id}/`)) {
+      if (!body.key.includes(`/${auth.id}/`)) {
         set.status = 403;
         return {
           success: false,

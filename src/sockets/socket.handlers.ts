@@ -15,16 +15,12 @@ import {
   DeleteMessagePayload,
 } from "@/types/socket.types";
 import { ElysiaWS } from "elysia/dist/ws";
-import { get_conversation_members } from "@/cache-management/conv.cache";
-import {
-  socket_connections,
-  handlePongResponse,
-  polling_connections,
-} from "./socket.server";
-import {
-  is_allowed_event,
-  store_pending_message_for_users,
-} from "@/cache-management/polling.cache";
+import { get_conversation_members, is_member } from "@/cache-management/conv.cache";
+import { handlePongResponse } from "./socket.server";
+import { socket_connections } from "./connections";
+import { is_allowed_event } from "@/cache-management/polling.cache";
+import { deliver, is_user_online } from "@/cluster/router";
+import { fanout_frames } from "@/cluster/router-core";
 import {
   handle_call_accept,
   handle_call_init,
@@ -41,6 +37,8 @@ import {
 import { pin_message, unpin_message } from "@/services/message.services";
 import { soft_delete_message } from "@/services/chat.services";
 import { ws_send } from "./ws-send";
+import { pin_identity, pin_refused, type PinResult } from "@/utils/sender-identity";
+import { count } from "@/utils/counters";
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -53,21 +51,17 @@ const get_ws_data = (ws: ElysiaWS, key: keyof WebSocketData) => {
   return (ws.data as WebSocketData)[key];
 };
 
-const is_user_online = (user_id: string): boolean => {
-  // Check WebSocket connections
-  const ws_connection = socket_connections.get(user_id);
-  if (ws_connection && ws_connection.ws.readyState === 1) {
-    return true;
-  }
-  return false;
-};
-
 type BroadcastData = {
   to: "conversation" | "users";
   conv_id?: string;
   user_ids?: string[];
   message: WSMessage;
   exclude_user_ids?: string[];
+  // SYNC_V2 §3.12: the frame sent to LIVE sockets when it must differ from
+  // the stored one (message:pin's pinned_message travels on the live WS
+  // only — never into the pending store, polling replies or FCM). The
+  // pending store always gets `message`.
+  live_message?: WSMessage;
 };
 
 // Fire a message to EVERY client connected to THIS instance. Used for global,
@@ -96,129 +90,49 @@ const broadcast_message = async (data: BroadcastData) => {
   // sender_id to "" before passing it in (system messages have sender_id=NULL),
   // and "" downstream lands in the uuid-typed missed_ws_messages.user_id and
   // crashes the worker.
-  let recipients_list = Array.from(
+  const excluded = data.exclude_user_ids?.length ? new Set(data.exclude_user_ids) : null;
+  const recipients_list = Array.from(
     new Set([...members, ...(data.user_ids ? data.user_ids : [])]),
-  ).filter(Boolean);
-  // if (data.user_ids) {
-  //   recipients_list = recipients_list.concat(data.user_ids);
-  // }
+  ).filter((id) => !!id && !excluded?.has(id));
 
-  // const active_in_conv: Set<string> = new Set<string>();
-  const online_users_id: Set<string> = new Set<string>();
-  const offline_users_id: Set<string> = new Set<string>();
-  const polling_users_id: Set<string> = new Set<string>();
-  // Subset of online_users_id whose client has reported it is backgrounded.
-  // These users still receive the live WS frame (they remain in online_users_id
-  // so presence/unread behaviour is unchanged), but they are ALSO eligible for
-  // an FCM push. Only handle_message_new consumes this set — every other caller
-  // ignores it, so non-message events (typing, acks, ...) are never pushed.
-  const background_users_id: Set<string> = new Set<string>();
-
-  // console.log("all ws connections:", socket_connections)
-
-  const serialized_payload = JSON.stringify(data.message);
-
-  // Recipients whose pending-queue copy is written AFTER the send loop, in
-  // ONE pipelined batch — the old per-recipient store awaited ~3 Redis round
-  // trips inside this loop for every member.
-  const store_targets: string[] = [];
-
-  // Separate online and offline users across all transport types
-  // console.log("recipients_list : ", recipients_list);
-  // console.log("data : ", data);
-  await Promise.all(
-    recipients_list.map(async (user_id) => {
-      if (data.exclude_user_ids && data.exclude_user_ids.includes(user_id)) {
-        return; // Skip excluded users
-      }
-
-      // Check WebSocket connections
-      const ws_connection = socket_connections.get(user_id);
-      // check polling connections for users who are not connected via WebSocket
-      const poll_connection = polling_connections.get(user_id);
-
-      if (ws_connection && ws_connection.ws.readyState === 1) {
-        // User is online via WebSocket
-        online_users_id.add(user_id);
-        // Backgrounded clients keep a live WS (so we still send the frame below),
-        // but the OS may have frozen the socket, so they ALSO need a push. Flag
-        // them so handle_message_new queues FCM in addition to the WS frame.
-        if (ws_connection.is_background) {
-          background_users_id.add(user_id);
-        }
-        // if (data.conv_id && ws_connection.active_conv_id === data.conv_id) {
-        //   // User is active in the conversation
-        //   active_in_conv.add(user_id);
-        // }
-
-        // Send message immediately via WebSocket. ws_send never throws and
-        // marks the connection congested on backpressure (§14.5 item 4); a
-        // dropped vital frame is still covered by the pending store below.
-        ws_send(ws_connection.ws, serialized_payload, ws_connection, user_id);
-
-        // store every message as missed_ws_message and remove upon recieving delivery reciept from client
-        // return;
-      } else if (poll_connection) {
-        // Non-destructive lease (SYNC_V2 R0). The entry used to be deleted on
-        // EVERY broadcast, fresh or not — so only the first broadcast after a
-        // poll saw the user as polling; every later one (until the next poll)
-        // found no entry, bucketed them offline and FCM'd a foreground poller.
-        // A stale lease, meanwhile, landed in NO bucket (no FCM at all).
-        // Now: a fresh poller stays in the polling bucket across broadcasts;
-        // only a STALE lease is evicted, and that user is offline.
-        const timeSinceLastPoll = poll_connection.last_poll_at
-          ? Date.now() - poll_connection.last_poll_at.getTime()
-          : Infinity;
-        // Consider users with a poll in the last 10 seconds as online for polling transport
-        if (timeSinceLastPoll < 10000) {
-          polling_users_id.add(user_id);
-          // A backgrounded app keeps polling until the OS freezes it, but
-          // notifications are painted only from FCM — push it too (client
-          // dedupes poll/FCM by id). Disjoint from offline, so no double-queue.
-          if (poll_connection.connection_status === "background") {
-            background_users_id.add(user_id);
-          }
-        } else {
-          // remove the stale polling connection — the user is offline
-          polling_connections.delete(user_id);
-          offline_users_id.add(user_id);
-        }
-
-        // don't return as we yet to store message for polling users
-        // return;
-      } else {
-        // User is offline
-        offline_users_id.add(user_id);
-      }
-
-      // Store missed messages in three-tier polling cache — for EVERY
-      // recipient (store-for-everyone: a ws.send into a ghost connection
-      // "succeeds", so online is not proof of delivery). Collected here,
-      // written in one pipelined batch below; drained by delivery acks.
-      if (is_allowed_event(data.message.type)) {
-        store_targets.push(user_id);
-      }
-    }),
+  // Delivery and FCM classification live in the router (SYNC_V2 §13.6,
+  // RC-2): local sockets first (synchronously, no Redis), then pollers /
+  // other workers / offline per CLUSTER_ROUTING. Vital events are stored in
+  // the pending queue for EVERY recipient (store-for-everyone: a ws.send
+  // into a ghost connection "succeeds", so online is not proof of delivery);
+  // drained by delivery acks.
+  // Return shape unchanged: { online, offline, polling, background }.
+  // `background` ⊆ online ∪ polling: users who get the live frame AND an
+  // FCM push (only handle_message_new consumes it — every other caller
+  // ignores it, so non-message events are never pushed).
+  const { live, store } = fanout_frames(data.message, data.live_message);
+  return deliver(
+    recipients_list,
+    live,
+    is_allowed_event(store.type) ? (store as VitalWSMessage) : undefined,
   );
+};
 
-  if (store_targets.length > 0) {
-    try {
-      await store_pending_message_for_users(
-        store_targets,
-        data.message as VitalWSMessage,
-      );
-    } catch (err) {
-      console.error("[BROADCAST] Error storing pending messages:", err);
-    }
-  }
-
-  return {
-    online: Array.from(online_users_id),
-    offline: Array.from(offline_users_id),
-    polling: Array.from(polling_users_id),
-    background: Array.from(background_users_id),
-    // active_in_conv: Array.from(active_in_conv),
-  };
+// A message:new / message:forward frame pin_identity refused. With no
+// authenticated id there is nobody to tell (pin_identity counted
+// AUTH/no_identity): send nothing. With a missing payload the sender gets the
+// usual socket:error (no auth_error field: it is a bad frame, never a logout).
+const refuse_unpinned_frame = async (user_id: string, result: PinResult, event: string) => {
+  if (result === "no_identity" || !user_id) return;
+  count("AUTH", "no_payload");
+  // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+  await broadcast_message({
+    to: "users",
+    user_ids: [user_id],
+    message: {
+      type: "socket:error",
+      payload: {
+        code: 400,
+        message: `Invalid ${event} payload`,
+      },
+      ws_timestamp: new Date(),
+    },
+  });
 };
 
 const socket_message_handler = async (
@@ -228,25 +142,21 @@ const socket_message_handler = async (
     // user_pfp?: string;
   },
   message: WSMessage,
-) => {
+): Promise<MessageNewResult | undefined> => {
+  // message:new only: the handler's result, whose data.sent_ack is the ack
+  // the sender got — POST /chat/poll/send-message returns it (§4.1).
+  let sent_result: MessageNewResult | undefined;
   const user_id = user_details.user_id || "";
   const user_name = user_details.user_name || "Unknown User";
   // const user_pfp = user_details.user_pfp || "";
 
   if (!user_id) {
-    // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    await broadcast_message({
-      to: "users",
-      user_ids: [user_id],
-      message: {
-        type: "socket:error",
-        payload: {
-          message: "Unauthorized: User ID not found in connection",
-          code: 4001,
-        },
-        ws_timestamp: new Date(),
-      },
-    });
+    // No authenticated identity: refuse EVERY frame (fail closed). There is
+    // nobody to address an error frame to (it used to be "sent" to user_ids
+    // [""], which delivered nothing), so just count + log. The auth layer
+    // (socket open / poll guard) owns telling the client to re-authenticate.
+    count("AUTH", "no_identity");
+    console.warn(`[AUTH] ${message?.type}: no authenticated user id; frame refused`);
     return;
   }
 
@@ -351,6 +261,18 @@ const socket_message_handler = async (
       case "conversation:typing": {
         // --------------------------------------------------
         const payload = message.payload as TypingPayload;
+        // The typer is the authenticated connection, never payload.sender_id.
+        // Ephemeral: a refused frame is dropped without an error frame.
+        if (pin_refused(pin_identity(payload, "sender_id", user_id, "conversation_typing"))) break;
+        // Only a member may type into a chat (it was broadcast to ANY conv_id's
+        // members). Same cached helper as message:new's send guard: the
+        // member set broadcast_message loads below anyway, so a warm cache
+        // costs no extra round trip. No DB fallback (typing is not worth one):
+        // a user re-opening a DM they hid shows as typing once they send.
+        if (typeof payload.conv_id !== "string" || !(await is_member(user_id, payload.conv_id))) {
+          count("AUTH", "typing_not_member");
+          break;
+        }
 
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
         await broadcast_message({
@@ -370,11 +292,21 @@ const socket_message_handler = async (
       // ----------------------------------------------------
       case "message:new": {
         // --------------------------------------------------
-        const result = await handle_message_new(
+        // The sender is the authenticated user of this connection (WS) or
+        // request (POST /chat/poll/send-message), never payload.sender_id —
+        // which used to be trusted, so anyone could send as anyone. Pinned in
+        // place: store, acks and fan-out all read payload.sender_id. A no-op
+        // for an honest client (it sends its own id).
+        const pinned = pin_identity(message.payload as ChatMessagePayload, "sender_id", user_id, "message_new");
+        if (pin_refused(pinned)) {
+          await refuse_unpinned_frame(user_id, pinned, "message:new");
+          break;
+        }
+        const result = sent_result = await handle_message_new(
           message.payload as ChatMessagePayload,
           user_name,
           // Authenticated id of this connection — the broadcast-list branch
-          // refuses a payload.sender_id that doesn't match it.
+          // still re-checks payload.sender_id against it (defence in depth).
           user_id,
         );
         // console.log("result -> ", result);
@@ -493,6 +425,14 @@ const socket_message_handler = async (
       // ----------------------------------------------------
       case "message:forward": {
         // --------------------------------------------------
+        // The forwarder is the authenticated user, never payload.forwarder_id
+        // (it becomes the forwarded rows' sender_id and the actor of every
+        // membership gate in forward_messages).
+        const pinned = pin_identity(message.payload as MessageForwardPayload, "forwarder_id", user_id, "message_forward");
+        if (pin_refused(pinned)) {
+          await refuse_unpinned_frame(user_id, pinned, "message:forward");
+          break;
+        }
         const result = await handle_message_forward(
           message.payload as MessageForwardPayload,
           user_name,
@@ -768,7 +708,10 @@ const socket_message_handler = async (
       },
     });
   }
+  return sent_result;
 };
+
+type MessageNewResult = Awaited<ReturnType<typeof handle_message_new>>;
 
 export {
   set_ws_data,

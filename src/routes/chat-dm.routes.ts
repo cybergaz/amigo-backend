@@ -1,23 +1,14 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
+import { request_auth } from "@/middleware/request-auth";
 import { create_dm, dm_delete_status } from "@/services/chat-dm.service";
 
 export const chat_dm_routes = new Elysia({ prefix: "/chat/dm" })
-  .state({ id: "", role: "" })
-  .guard({
-    beforeHandle({ cookie, set, store, headers }) {
-      const state_result = app_middleware({ cookie, headers });
+  // Per-request identity (middleware/request-auth.ts), never the app-wide store.
+  .resolve(({ cookie, set, headers }) => request_auth(set, app_middleware({ cookie, headers })))
 
-      set.status = state_result.code;
-      if (!state_result.data) return state_result;
-
-      store.id = state_result.data.id;
-      store.role = state_result.data.role;
-    }
-  })
-
-  .post("/create-dm/:reciver_id", async ({ set, store, params }) => {
-    const chat_result = await create_dm(store.id, params.reciver_id);
+  .post("/create-dm/:reciver_id", async ({ set, auth, params }) => {
+    const chat_result = await create_dm(auth.id, params.reciver_id);
     set.status = chat_result.code;
     return chat_result;
   }, {
@@ -26,8 +17,8 @@ export const chat_dm_routes = new Elysia({ prefix: "/chat/dm" })
     })
   })
 
-  .delete("/soft-delete-dm/:conversation_id", async ({ set, store, params }) => {
-    const delete_result = await dm_delete_status(params.conversation_id, store.id, true);
+  .delete("/soft-delete-dm/:conversation_id", async ({ set, auth, params }) => {
+    const delete_result = await dm_delete_status(params.conversation_id, auth.id, true);
     set.status = delete_result.code;
     return delete_result;
   }, {

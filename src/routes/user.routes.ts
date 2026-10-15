@@ -12,38 +12,29 @@ import { eq, and, ne } from "drizzle-orm";
 import { record_admin_pin_event } from "@/services/admin-pin-event.service";
 import { raise_pin_reset_request } from "@/services/pin-reset.service";
 import { app_middleware } from "@/middleware";
+import { request_auth } from "@/middleware/request-auth";
 import { ROLE_CONST } from "@/types/user.types";
 import FCMService from "@/services/fcm.service";
 
 const user_routes = new Elysia({ prefix: "/user" })
-  .state({ id: "", role: "" })
-  .guard({
-    beforeHandle({ cookie, set, store, headers }) {
-      const state_result = app_middleware({ cookie, headers });
+  // Per-request identity (middleware/request-auth.ts), never the app-wide store.
+  .resolve(({ cookie, set, headers }) => request_auth(set, app_middleware({ cookie, headers })))
 
-      set.status = state_result.code;
-      if (!state_result.data) return state_result;
-
-      store.id = state_result.data.id;
-      store.role = state_result.data.role;
-    }
-  })
-
-  .get("/get-user", async ({ set, store }) => {
-    const user_Details = await get_user_details(store.id);
+  .get("/get-user", async ({ set, auth }) => {
+    const user_Details = await get_user_details(auth.id);
     set.status = user_Details.code;
     return user_Details;
   })
 
-  .post("/update-user", async ({ set, store, body }) => {
-    // SECURITY: this is a SELF-update (store.id). A user must NOT be able to change
+  .post("/update-user", async ({ set, auth, body }) => {
+    // SECURITY: this is a SELF-update (auth.id). A user must NOT be able to change
     // their own `role` (privilege escalation → the JWT role is re-read from the DB on
     // the next mint) or `phone` (account takeover, no verification) here. Both are
     // admin-only mutations (/admin/update-user-role, /admin/user/update-phone-number),
     // so strip them before the mass-assign regardless of what the body carried.
     const { role: _role, phone: _phone, ...safe } = body;
     void _role; void _phone;
-    const user_Details = await update_user_details(store.id, safe);
+    const user_Details = await update_user_details(auth.id, safe);
     set.status = user_Details.code;
     return user_Details;
   },
@@ -79,8 +70,8 @@ const user_routes = new Elysia({ prefix: "/user" })
     }
   })
 
-  .post("/get-available-users", async ({ set, store, body }) => {
-    const user_Details = await get_available_users(store.id, body.phone_numbers);
+  .post("/get-available-users", async ({ set, auth, body }) => {
+    const user_Details = await get_available_users(auth.id, body.phone_numbers);
     set.status = user_Details.code;
     return user_Details;
   },
@@ -91,7 +82,7 @@ const user_routes = new Elysia({ prefix: "/user" })
     }
   )
 
-  .post("/update-profile-image", async ({ set, store, body }) => {
+  .post("/update-profile-image", async ({ set, auth, body }) => {
     try {
       if (!body.image) {
         set.status = 400;
@@ -101,7 +92,7 @@ const user_routes = new Elysia({ prefix: "/user" })
         };
       }
 
-      const result = await update_profile_image(store.id, body.image);
+      const result = await update_profile_image(auth.id, body.image);
       set.status = result.code;
       return result;
     } catch (error: any) {
@@ -123,8 +114,8 @@ const user_routes = new Elysia({ prefix: "/user" })
     }
   )
 
-  .post("/update-fcm-token", async ({ set, store, body }) => {
-    const result = await FCMService.update_user_fcm_token(store.id, body.fcm_token);
+  .post("/update-fcm-token", async ({ set, auth, body }) => {
+    const result = await FCMService.update_user_fcm_token(auth.id, body.fcm_token);
 
     set.status = result.code;
     return result;
@@ -142,11 +133,11 @@ const user_routes = new Elysia({ prefix: "/user" })
   //
   // The number is read from the token's user row, never from the request body, so
   // this endpoint cannot be used to send a code to an arbitrary phone.
-  .post("/generate-pin-otp", async ({ set, store, body }) => {
+  .post("/generate-pin-otp", async ({ set, auth, body }) => {
     const [user] = await db
       .select({ phone: user_model.phone })
       .from(user_model)
-      .where(eq(user_model.id, store.id))
+      .where(eq(user_model.id, auth.id))
       .limit(1);
 
     if (!user?.phone) {
@@ -176,8 +167,8 @@ const user_routes = new Elysia({ prefix: "/user" })
   //                   is also recoverable by proving the login PIN.
   //   - neither       only when the target PIN is not set yet.
   // Used by the Settings PIN rows and the App Lock enable flow.
-  .post("/set-pin", async ({ set, store, body }) => {
-    const result = await set_user_pin(store.id, body.kind, body.pin, body.current_pin, body.otp);
+  .post("/set-pin", async ({ set, auth, body }) => {
+    const result = await set_user_pin(auth.id, body.kind, body.pin, body.current_pin, body.otp);
     set.status = result.code;
     return result;
   },
@@ -194,8 +185,8 @@ const user_routes = new Elysia({ prefix: "/user" })
   // App-lock: check a candidate PIN against the account's stored hashes and return
   // { match: 'password' | 'admin' | null }. Used to ARM the on-device app-lock
   // verifier for camouflage. Business error only — carries no auth_error.
-  .post("/verify-pin", async ({ set, store, body }) => {
-    const result = await verify_pin(store.id, body.pin);
+  .post("/verify-pin", async ({ set, auth, body }) => {
+    const result = await verify_pin(auth.id, body.pin);
     set.status = result.code;
     return result;
   },
@@ -209,10 +200,10 @@ const user_routes = new Elysia({ prefix: "/user" })
   // App-lock: record an ADMIN-PIN unlock (camouflage/duress). Fire-and-forget from
   // the app; idempotent on the client-provided `id` (retried offline sends won't
   // duplicate). Surfaced on the admin panel's Admin PIN Usage page.
-  .post("/admin-pin-event", async ({ set, store, body }) => {
+  .post("/admin-pin-event", async ({ set, auth, body }) => {
     const result = await record_admin_pin_event({
       id: body.id,
-      user_id: store.id,
+      user_id: auth.id,
       device_id: body.device_id,
       device_name: body.device_name,
       platform: body.platform,
@@ -242,12 +233,12 @@ const user_routes = new Elysia({ prefix: "/user" })
   //
   // Nothing is written here — the OTP is the only side effect. The account is
   // not moved until /confirm-phone-change.
-  .post("/request-phone-change", async ({ set, store, body }) => {
+  .post("/request-phone-change", async ({ set, auth, body }) => {
     // Per-ACTOR throttle. generate_otp's own limiter is keyed by TARGET number,
     // so it does nothing here: every fresh number the caller names arrives with
     // a fresh quota, which would turn an authenticated session into a way to
     // send paid messages to arbitrary numbers.
-    const actor_gate = await check_actor_send_allowed(store.id);
+    const actor_gate = await check_actor_send_allowed(auth.id);
     if (!actor_gate.allowed) {
       set.status = actor_gate.code;
       return {
@@ -273,7 +264,7 @@ const user_routes = new Elysia({ prefix: "/user" })
     const [me] = await db
       .select({ phone: user_model.phone })
       .from(user_model)
-      .where(eq(user_model.id, store.id))
+      .where(eq(user_model.id, auth.id))
       .limit(1);
 
     if (me?.phone === canonical_phone) {
@@ -291,7 +282,7 @@ const user_routes = new Elysia({ prefix: "/user" })
     const [taken] = await db
       .select({ id: user_model.id })
       .from(user_model)
-      .where(and(eq(user_model.phone, canonical_phone), ne(user_model.id, store.id)))
+      .where(and(eq(user_model.phone, canonical_phone), ne(user_model.id, auth.id)))
       .limit(1);
 
     if (taken) {
@@ -329,7 +320,7 @@ const user_routes = new Elysia({ prefix: "/user" })
     const result = await generate_otp(canonical_phone, "phone_change", body.channel ?? "whatsapp");
     // Count it only once the provider actually took the message, so a delivery
     // failure doesn't cost the user their quota.
-    if (result.success) await register_actor_send(store.id);
+    if (result.success) await register_actor_send(auth.id);
 
     set.status = result.code;
     return result;
@@ -351,7 +342,7 @@ const user_routes = new Elysia({ prefix: "/user" })
   // Only a PASSWORD-PIN match is accepted. The ADMIN pin is the duress/camouflage
   // decoy (see app_lock) — someone coerced into opening the fake app must not be
   // able to walk the real account onto a number they control.
-  .post("/confirm-phone-change", async ({ set, store, body }) => {
+  .post("/confirm-phone-change", async ({ set, auth, body }) => {
     const parsed = parse_phone(body.phone);
     if (!parsed.country || !parsed.valid) {
       set.status = 400;
@@ -365,7 +356,7 @@ const user_routes = new Elysia({ prefix: "/user" })
     const [me] = await db
       .select({ password_pin_hash: user_model.password_pin_hash })
       .from(user_model)
-      .where(eq(user_model.id, store.id))
+      .where(eq(user_model.id, auth.id))
       .limit(1);
 
     if (!me) {
@@ -379,7 +370,7 @@ const user_routes = new Elysia({ prefix: "/user" })
         return { success: false, code: 400, message: "Your login PIN is required." };
       }
       // verify_pin carries the per-number brute-force lockout.
-      const pin_result = await verify_pin(store.id, body.pin);
+      const pin_result = await verify_pin(auth.id, body.pin);
       if (!pin_result.success) {
         set.status = pin_result.code;
         return pin_result;
@@ -397,7 +388,7 @@ const user_routes = new Elysia({ prefix: "/user" })
       return otp_result;
     }
 
-    const result = await change_own_phone_number(store.id, canonical_phone);
+    const result = await change_own_phone_number(auth.id, canonical_phone);
     set.status = result.code;
     return result;
   },
@@ -413,8 +404,8 @@ const user_routes = new Elysia({ prefix: "/user" })
   // Forgot-PIN: raise a request for an admin to reset this user's login PIN.
   // Identity comes from the token (can't be spoofed); idempotent (one pending
   // request per user). Used by Settings → Security. No body.
-  .post("/request-pin-reset", async ({ set, store }) => {
-    const result = await raise_pin_reset_request(store.id);
+  .post("/request-pin-reset", async ({ set, auth }) => {
+    const result = await raise_pin_reset_request(auth.id);
     set.status = result.code;
     return result;
   });

@@ -20,6 +20,13 @@ interface WebSocketData {
   // Closed by the shutdown drain (1012 + socket:restart): the close callback
   // skips the offline debounce and the last_seen write (SYNC_V2 §13.7 A6).
   draining?: boolean;
+  // Closed with 4009 because a newer socket of the same user replaced it
+  // (SYNC_V2 §13.6.5, RC-2): the user is not leaving — the close callback
+  // skips the offline broadcast, last_seen and the presence release.
+  replaced?: boolean;
+  // SYNC_V2 §3.3.5 (sync_v2 'on'): tail of this socket's serial vital-frame
+  // chain (sockets/vital-chain.ts). Never rejects.
+  vital_tail?: Promise<unknown>;
 }
 
 // Transport types for fallback support
@@ -33,8 +40,15 @@ type KeepaliveMode = 'fg' | 'bg' | 'reliable';
 
 interface UserConnection {
   ws: ElysiaWS;
+  // ws.data.cid of this socket: the presence key names it ("wid|cid|bg"),
+  // so refresh / release / evict compare against it (RC-2).
+  cid?: string;
+  // `on` mode: the open's presence claim failed (Redis error / deadline), so
+  // the key may still name this user's previous socket. The next 15 s
+  // refresh re-claims instead of reading that leftover as "replaced
+  // elsewhere" and closing this — live — socket as a ghost.
+  presence_unclaimed?: boolean;
   missed_pings: number;
-  active_conv_id?: string;
   is_background?: boolean;
   // ---- liveness / keepalive (SYNC_V2 §14.5) ----
   // ms epoch of the last frame received on THIS socket (any type).
@@ -60,6 +74,9 @@ interface PollingConnection {
   connection_status: ConnectionStatusType;
   last_poll_at?: Date;
   client_ip?: string;
+  // Poll v2 (R3): epoch ms until which a parked long-poll keeps the lease
+  // fresh (router-core lease_seen_ms). Never set by poll v1.
+  held_until?: number;
 }
 
 // Regular WebSocket message with payload
@@ -82,7 +99,8 @@ type WSMessage = {
   | ConversationActionPayload
   | UserUpdatePayload
   | MarqueeBannerPayload
-  | ConversationDisappearingPayload;
+  | ConversationDisappearingPayload
+  | ChatWmPayload;
   ws_timestamp?: Date;
   // Client clock echo on socket:ping / socket:pong (§14.5): the server copies
   // the ping's `t` into its pong so the app can measure RTT.
@@ -123,6 +141,12 @@ type ConvJoinPayload = {
   conv_id: string;
   user_id: string;
   last_read_msg_id: string;
+  // SYNC_V2 §3.7 / §4.1 — additive, sync_v2 'on' only.
+  // Inbound (optional): the reader's exact read seq.
+  // Outbound (to senders, from apply_receipts' window): the reader, its new
+  // read_seq; last_read_msg_id is then the id with the max seq <= read_seq.
+  read_seq?: number;
+  reader_id?: string;
 };
 
 type ChatMessagePayload = {
@@ -132,7 +156,8 @@ type ChatMessagePayload = {
   msg_type: MessageType;
   body?: string;
   attachments?: any;
-  replied_to?: string;
+  // null on the wire for a plain message (the app sends it explicitly).
+  replied_to?: string | null;
   // Pre-warmed compact preview of the replied-to message so the client can
   // render the reply container on first paint without a local DB lookup.
   replied_to_message?: {
@@ -143,6 +168,9 @@ type ChatMessagePayload = {
     body: string | null;
     attachments: unknown;
     sent_at: Date | null;
+    // SYNC_V2 §4.1 (additive, 'on' only)
+    seq?: number | null;
+    mod_seq?: number | null;
   } | null;
   sent_at: Date;
   // Set by the server on message:new broadcast when the chat has disappearing
@@ -150,6 +178,18 @@ type ChatMessagePayload = {
   // rows from the view; the server sweeper is what actually soft-deletes the
   // row and broadcasts message:delete.
   expires_at?: Date | string | null;
+  // SYNC_V2 §3.10 (additive; only with sync_v2_system_rows on): this
+  // message:new is a system row whose wire sender_id is the ACTOR (old apps
+  // decode sender_id as a non-null String); the stored row has sender_id NULL.
+  system_actor?: boolean;
+  // SYNC_V2 §4.1 (additive, sync_v2 'on' only): the stored row's clock
+  // values and server arrival time (srv_ts = created_at).
+  seq?: number | null;
+  mod_seq?: number | null;
+  srv_ts?: Date | string | null;
+  // SYNC_V2 §4.1 (inbound, optional, v2 senders): split-message diagnostics.
+  split_group?: string;
+  part_index?: number;
 };
 
 type MessageSentAckPayload = {
@@ -168,6 +208,10 @@ type MessageSentAckPayload = {
   // with no recipients is refused (is_sent:false, error_code:422) rather than
   // acked with an empty array. See BROADCAST_LISTS.md.
   broadcast_copies?: BroadcastCopyRef[];
+  // SYNC_V2 §4.1 (additive, sync_v2 'on' only): the stored row's seq and
+  // server arrival time. A duplicate re-ack carries the ORIGINAL values.
+  seq?: number | null;
+  srv_ts?: Date | string | null;
 };
 
 // One server-made copy of a broadcast message: the recipient, the DM it was
@@ -185,7 +229,14 @@ type MessageStatusAckPayload = {
     chat_id: string;
     msg_ids: string[];
     status: ('delivered' | 'read')[];   // 1 or 2 elements
+    // SYNC_V2 §4.1 (additive, outbound, 'on' only): seq of each msg_ids entry.
+    seqs?: number[];
   }[];
+  // SYNC_V2 §4.1 (additive, outbound, 'on' only): the reader and its absolute
+  // watermarks in the chat the acks are about (single-chat frames).
+  reader_id?: string;
+  delivered_seq?: number;
+  read_seq?: number;
 };
 
 type TypingPayload = {
@@ -199,6 +250,10 @@ type MessagePinPayload = {
   message_type: MessageType;
   sender_id: string;
   pin: boolean;
+  // SYNC_V2 §3.12 / §4.1 (additive, 'on' only). pinned_message travels on the
+  // LIVE WS frame only, never in the pending store or FCM.
+  pin_seq?: number;
+  pinned_message?: unknown;
 };
 
 type MessageForwardPayload = {
@@ -207,12 +262,28 @@ type MessageForwardPayload = {
   forwarder_name?: string;
   forwarded_message_ids: string[];
   target_conv_ids: string[];
+  // SYNC_V2 §3.3.7 (optional, honoured in 'on'): client ids per target chat,
+  // one per forwarded_message_ids entry (same order).
+  ids?: Record<string, string[]>;
 };
 
 type DeleteMessagePayload = {
   conv_id: string;
   sender_id: string;
   message_ids: string[];
+  // SYNC_V2 §3.12 / §4.1 (additive, outbound, 'on' only): each deleted row's
+  // new mod_seq, and — when the delete unpinned the chat (the trigger
+  // allocated pin_seq) — the resulting pin state.
+  mods?: { id: string; mod_seq: number }[];
+  pin?: { pinned_msg_id: null; pin_seq: number };
+};
+
+// SYNC_V2 §3.7 / §4.1 chat:wm — the per-viewer "others" receipt watermarks
+// after the receipt mins rose. Live only, to proto-2 sockets; never stored.
+type ChatWmPayload = {
+  conv_id: string;
+  others_read_seq: number;
+  others_delivered_seq: number;
 };
 
 type MessageReactPayload = {
@@ -291,6 +362,11 @@ type ConversationActionPayload = {
   profile_pic_changed?: boolean;
   owner_id?: string | null;
   resolution?: 'approved' | 'rejected';
+  // SYNC_V2 §3.10 (additive; only with app_settings.sync_v2_system_rows on):
+  // the persisted type='system' row for this action, id = event_id. The
+  // spec calls it `message`, but `message` is already the display text that
+  // old apps decode as a String, so it travels under this name instead.
+  system_message?: { id: string; seq: number | null; srv_ts: string };
 };
 
 // Broadcast when a user changes the disappearing-messages duration on a chat.
@@ -352,6 +428,9 @@ const WS_MESSAGE_EVENTS_CONST = [
   'message:forward',
   'message:delete',
   'message:react',
+
+  // SYNC_V2 §4.1: server → proto-2 WS only, never stored (not vital).
+  'chat:wm',
 
   'call:init',
   'call:init:ack',
@@ -443,6 +522,7 @@ export type {
   UserUpdatePayload,
   MarqueeBannerPayload,
   ConversationDisappearingPayload,
+  ChatWmPayload,
   // SyncMessageItem,
   // SyncMessagesPayload,
   // MessageDeliveredPayload,

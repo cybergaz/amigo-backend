@@ -1,5 +1,6 @@
 import Elysia, { t } from "elysia";
 import { app_middleware } from "@/middleware";
+import { request_auth } from "@/middleware/request-auth";
 import { add_new_member, create_group, demote_to_member, get_group_info, leave_group, list_join_requests, promote_to_admin, remove_member, request_join, respond_join_request, transfer_ownership, update_group_profile_pic, update_group_title } from "@/services/chat-group.service";
 import { compute_group_caps, GroupCaps, load_group_actor_context } from "@/services/group-caps";
 
@@ -20,21 +21,11 @@ const actor_caps = async (conversation_id: string, actor_id: string): Promise<Gr
 };
 
 export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
-  .state({ id: "", role: "" })
-  .guard({
-    beforeHandle({ cookie, set, store, headers }) {
-      const state_result = app_middleware({ cookie, headers });
+  // Per-request identity (middleware/request-auth.ts), never the app-wide store.
+  .resolve(({ cookie, set, headers }) => request_auth(set, app_middleware({ cookie, headers })))
 
-      set.status = state_result.code;
-      if (!state_result.data) return state_result
-
-      store.id = state_result.data.id;
-      store.role = state_result.data.role;
-    }
-  })
-
-  .post("/create-group", async ({ set, store, body }) => {
-    const group_result = await create_group(store.id, body.title, body.member_ids);
+  .post("/create-group", async ({ set, auth, body }) => {
+    const group_result = await create_group(auth.id, body.title, body.member_ids);
     set.status = group_result.code;
     return group_result;
   }, {
@@ -44,7 +35,7 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     })
   })
 
-  .get("/get-group-info/:conversation_id", async ({ set, store, params }) => {
+  .get("/get-group-info/:conversation_id", async ({ set, auth, params }) => {
     const chats_result = await get_group_info(params.conversation_id);
     set.status = chats_result.code;
     return chats_result;
@@ -54,8 +45,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     }
   )
 
-  .post("/add-members", async ({ set, store, body }) => {
-    const caps = await actor_caps(body.conversation_id, store.id);
+  .post("/add-members", async ({ set, auth, body }) => {
+    const caps = await actor_caps(body.conversation_id, auth.id);
     if (!caps?.canManageMembers) {
       set.status = 403;
       return { success: false, code: 403, message: "You can't add members to this group" };
@@ -70,7 +61,7 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
       body.conversation_id,
       body.user_ids,
       body.role,
-      store.id,
+      auth.id,
     );
     set.status = member_result.code;
     return member_result;
@@ -82,8 +73,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     })
   })
 
-  .delete("/remove-member", async ({ set, store, body }) => {
-    const caps = await actor_caps(body.conversation_id, store.id);
+  .delete("/remove-member", async ({ set, auth, body }) => {
+    const caps = await actor_caps(body.conversation_id, auth.id);
     if (!caps?.canManageMembers) {
       set.status = 403;
       return { success: false, code: 403, message: "You can't remove members from this group" };
@@ -91,7 +82,7 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     const member_result = await remove_member(
       body.conversation_id,
       body.user_id,
-      store.id,
+      auth.id,
     );
     set.status = member_result.code;
     return member_result;
@@ -102,8 +93,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     })
   })
 
-  .post("/promote-to-admin", async ({ set, store, body }) => {
-    const caps = await actor_caps(body.conversation_id, store.id);
+  .post("/promote-to-admin", async ({ set, auth, body }) => {
+    const caps = await actor_caps(body.conversation_id, auth.id);
     if (!caps?.canPromoteDemote) {
       set.status = 403;
       return { success: false, code: 403, message: "Only the owner can assign admins" };
@@ -111,7 +102,7 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     const promotion_result = await promote_to_admin(
       body.conversation_id,
       body.user_id,
-      store.id,
+      auth.id,
     );
     set.status = promotion_result.code;
     return promotion_result;
@@ -122,8 +113,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     })
   })
 
-  .post("/demote-to-member", async ({ set, store, body }) => {
-    const caps = await actor_caps(body.conversation_id, store.id);
+  .post("/demote-to-member", async ({ set, auth, body }) => {
+    const caps = await actor_caps(body.conversation_id, auth.id);
     if (!caps?.canPromoteDemote) {
       set.status = 403;
       return { success: false, code: 403, message: "Only the owner can change admins" };
@@ -131,7 +122,7 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     const promotion_result = await demote_to_member(
       body.conversation_id,
       body.user_id,
-      store.id,
+      auth.id,
     );
     set.status = promotion_result.code;
     return promotion_result;
@@ -142,8 +133,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     })
   })
 
-  .put("/update-group-title", async ({ set, store, body }) => {
-    const title_result = await update_group_title(body.conversation_id, body.title, store.id);
+  .put("/update-group-title", async ({ set, auth, body }) => {
+    const title_result = await update_group_title(body.conversation_id, body.title, auth.id);
     set.status = title_result.code;
     return title_result;
   }, {
@@ -153,12 +144,12 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
     })
   })
 
-  .post("/update-group-profile-image", async ({ set, store, body }) => {
+  .post("/update-group-profile-image", async ({ set, auth, body }) => {
     if (!body.image) {
       set.status = 400;
       return { success: false, message: "No image file provided" };
     }
-    const result = await update_group_profile_pic(body.conversation_id, store.id, body.image);
+    const result = await update_group_profile_pic(body.conversation_id, auth.id, body.image);
     set.status = result.code;
     return result;
   }, {
@@ -173,8 +164,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
 
   // Leave a group. Owner must supply new_owner_id (an active member) to hand
   // off ownership first; everyone else leaves freely. The service enforces this.
-  .post("/leave-group", async ({ set, store, body }) => {
-    const result = await leave_group(body.conversation_id, store.id, body.new_owner_id);
+  .post("/leave-group", async ({ set, auth, body }) => {
+    const result = await leave_group(body.conversation_id, auth.id, body.new_owner_id);
     set.status = result.code;
     return result;
   }, {
@@ -185,8 +176,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
   })
 
   // Hand off ownership without leaving (owner / master only — service-gated).
-  .post("/transfer-ownership", async ({ set, store, body }) => {
-    const result = await transfer_ownership(body.conversation_id, store.id, body.new_owner_id);
+  .post("/transfer-ownership", async ({ set, auth, body }) => {
+    const result = await transfer_ownership(body.conversation_id, auth.id, body.new_owner_id);
     set.status = result.code;
     return result;
   }, {
@@ -197,8 +188,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
   })
 
   // An ex-member (status 'left') requests to rejoin.
-  .post("/request-join", async ({ set, store, body }) => {
-    const result = await request_join(body.conversation_id, store.id);
+  .post("/request-join", async ({ set, auth, body }) => {
+    const result = await request_join(body.conversation_id, auth.id);
     set.status = result.code;
     return result;
   }, {
@@ -208,8 +199,8 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
   })
 
   // Owner / master lists pending join requests (service-gated).
-  .get("/join-requests/:conversation_id", async ({ set, store, params }) => {
-    const result = await list_join_requests(params.conversation_id, store.id);
+  .get("/join-requests/:conversation_id", async ({ set, auth, params }) => {
+    const result = await list_join_requests(params.conversation_id, auth.id);
     set.status = result.code;
     return result;
   }, {
@@ -217,10 +208,10 @@ export const chat_group_routes = new Elysia({ prefix: "/chat/group" })
   })
 
   // Owner / master approves or rejects a pending request (service-gated).
-  .post("/respond-join-request", async ({ set, store, body }) => {
+  .post("/respond-join-request", async ({ set, auth, body }) => {
     const result = await respond_join_request(
       body.conversation_id,
-      store.id,
+      auth.id,
       body.user_id,
       body.action,
     );
