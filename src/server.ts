@@ -2,7 +2,7 @@ import { Elysia } from "elysia";
 import "dotenv/config";
 import cors from "@elysiajs/cors";
 import type { Server } from "bun";
-import { wait_for_db } from "@/config/db";
+import { close_db, wait_for_db } from "@/config/db";
 import { wait_for_redis } from "@/config/redis";
 import auth_routes from "./routes/auth.routes";
 import user_routes from "./routes/user.routes";
@@ -16,22 +16,37 @@ import sub_admin_routes from "./routes/sub-admin.routes";
 import app_version_routes from "./routes/app-version.routes";
 import health_routes from "./routes/health.routes";
 import web_socket_server, {
-  polling_connections,
+  fresh_poll_lease_count,
   socket_connections,
   start_socket_timers,
 } from "./sockets/socket.server";
-// Explicit: its Redis subscriber (global broadcasts, single-device force
+// Explicit: its bus handlers (global broadcasts, single-device force
 // logout) must register on every worker. It used to load only as a side
 // effect of admin.routes importing it (SYNC_V2 §13.7 "new").
 import "./sockets/ws-broadcast";
+// Explicit for the same reason: importing the router subscribes this
+// worker's inbox (ws:deliver:{wid}) on the bus (SYNC_V2 §13.6.2).
+import "./cluster/router";
+import { ROUTING_MODE } from "./cluster/mode";
 import { chat_dm_routes } from "./routes/chat-dm.routes";
 import { chat_group_routes } from "./routes/chat-group.routes";
 import { chat_broadcast_routes } from "./routes/chat-broadcast.routes";
 import { chat_poll_routes } from "./routes/chat-poll.routes";
+import { sync_routes } from "./routes/sync.routes";
+import { net_routes } from "./routes/net.routes";
+import { start_ack_fallback } from "./services/fcm-ack-fallback";
+import { start_fcm_health } from "./services/fcm-health";
+import { start_net_beacons } from "./services/net-beacon.service";
+import { build_media_upload_routes } from "./routes/media-upload.routes";
+import { chunked_upload, chunked_upload_enabled, start_upload_gc } from "./services/chunked-upload.service";
+import { app_middleware } from "./middleware";
 import { message_routes } from "./routes/message.routes";
 import { start_receipts_flush } from "./cache-management/receipt-flush";
 import { start_message_status_flush } from "./cache-management/message-status-flush";
 import { start_disappearing_sweeper } from "./cache-management/disappearing-sweeper";
+import { start_sync_v2_flags } from "./services/app-settings.service";
+import { start_watermark_workers } from "./services/sync/watermark.service";
+import { missing_model_columns } from "./services/sync/schema-guard";
 import { start_ring_deadlines } from "./services/livekit.service";
 import {
   CLUSTER_MAX,
@@ -50,8 +65,11 @@ import {
 } from "./cluster/lifecycle";
 import { wait_for_rfast } from "./cluster/redis-fast";
 import { beat_now, run_boot_guard, start_beat } from "./cluster/beat";
+import { start_reaper } from "./cluster/reaper";
+import { start_settings_listener } from "./cluster/settings-listener";
 import { register_drain_resources, run_drain } from "./cluster/drain";
 import { admit_upload, release_upload } from "./utils/upload-gate";
+import { MAX_REQUEST_BODY_BYTES } from "./config/upload-limits";
 
 if (!SERVER_PORT || isNaN(SERVER_PORT)) {
   throw new Error("SERVER_PORT environment variable is not set or invalid");
@@ -132,8 +150,18 @@ const app = new Elysia({ prefix: "/api" })
   .use(chat_group_routes)
   .use(chat_broadcast_routes)
   .use(chat_poll_routes)
+  // Sync v2 pull + intents (/chat/sync/*). 404 for everyone until
+  // app_settings.sync_v2 = 'on' and the backfill markers are set.
+  .use(sync_routes)
+  // Network beacon (§14.14). 404 until sync_v2_net_telemetry is on and the
+  // 20261023 net_beacons table exists.
+  .use(net_routes)
   .use(message_routes)
   .use(community_routes)
+  // Chunked resumable uploads (§14.11, M track). 404 until
+  // sync_v2_chunked_upload is on and the 20261024 media_uploads table exists;
+  // the single-request routes below stay unchanged for old builds.
+  .use(build_media_upload_routes({ service: chunked_upload, enabled: chunked_upload_enabled, auth: app_middleware }))
   .use(media_routes)
   // .use(call_routes)
   // LiveKit calling: status/accept/decline/end (used by the native
@@ -173,6 +201,28 @@ const listen_with_retry = async (
   return null;
 };
 
+// true = the R1a columns exist (or the probe could not run: see below).
+const check_schema = async (): Promise<boolean> => {
+  for (let attempt = 1; attempt <= 3 && !is_draining(); attempt++) {
+    try {
+      const missing = await missing_model_columns();
+      if (missing.length === 0) return true;
+      console.error(
+        `[BOOT] database schema is behind this build — missing ${missing.length} column(s): ${missing.slice(0, 12).join(", ")}${missing.length > 12 ? ", …" : ""}. ` +
+        "Run `bun run script:migrate up 20261020a-sync-v2-columns` (and 20261020b) first; exiting so the running process keeps serving.",
+      );
+      return false;
+    } catch (err: any) {
+      console.error(`[BOOT] schema probe failed (attempt ${attempt}/3): ${err?.message ?? err}`);
+      await drain_sleep(1_000 * attempt);
+    }
+  }
+  // The DB answered SELECT 1 but not the catalog query: do not turn a
+  // transient error into an outage. A real gap fails loudly on first use.
+  console.warn("[BOOT] schema probe unavailable, proceeding without it");
+  return true;
+};
+
 // SYNC_V2 §13.9.2. Nothing listens until the DB and Redis answer and the boot
 // guard passed, so nginx never routes to a process that cannot serve; a
 // dependency outage at boot is retried with backoff instead of exiting into a
@@ -183,7 +233,7 @@ async function boot() {
   install_signal_handlers(run_drain);
   start_lag_sampler();
   console.log(
-    `[BOOT] wid=${WORKER_ID} rev=${GIT_REV} ns=${REDIS_NS} cluster_max=${CLUSTER_MAX} pid=${process.pid} ports=${SERVER_PORT}/${SOCKET_PORT}`,
+    `[BOOT] wid=${WORKER_ID} rev=${GIT_REV} ns=${REDIS_NS} cluster_max=${CLUSTER_MAX} routing=${ROUTING_MODE} pid=${process.pid} ports=${SERVER_PORT}/${SOCKET_PORT}`,
   );
 
   // 1–2. Dependencies.
@@ -191,8 +241,28 @@ async function boot() {
   if (!(await wait_for_redis(is_draining))) return;
   if (!(await wait_for_rfast(is_draining))) return;
 
+  // Sync v2 (R1a): refuse to serve on a database without the R1a columns
+  // (20261020a not run there yet). Every model select names them, so this
+  // build would 42703 on every send / history / chat-list read. Exit before
+  // listening (and before writing sync_v2_code_deployed, which would unlock
+  // 20261020c / the backfill): the previous process keeps serving.
+  if (!(await check_schema())) {
+    await close_db(1);
+    process.exit(1);
+  }
+
+  // Sync v2 (R1a): write sync_v2_code_deployed (the backfill's precondition)
+  // and load the flags BEFORE anything is served, so the first request
+  // already sees the right mode (defaults = everything new off).
+  const stop_sync_v2_flags = await start_sync_v2_flags({ wid: WORKER_ID, rev: GIT_REV });
+  // RC-3 E5–E7: settings writes on any worker (or a CLI script) reach this
+  // worker's marquee / app-version / flags caches at once (bus subscriber).
+  start_settings_listener();
+
   // 3. Beat (ready:false until we listen, so nobody counts us yet).
-  start_beat(() => ({ ws: socket_connections.size, poll: polling_connections.size }));
+  // poll = FRESH v1 leases only: the map keeps stale entries until a fan-out
+  // or a poll touches them, and the dashboard sums these numbers (A10).
+  start_beat(() => ({ ws: socket_connections.size, poll: fresh_poll_lease_count() }));
 
   // 4. Boot guard (CLUSTER_MAX=1): wait while another READY worker of this
   //    deployment is live and no swap was authorised.
@@ -209,13 +279,39 @@ async function boot() {
       start_message_status_flush(),
       start_disappearing_sweeper(),
       start_ring_deadlines(),
+      // Sync v2 receipts: delivered coalescing flush + receipt-mins runner.
+      // Idle (no Redis / PG work) while sync_v2 is off.
+      start_watermark_workers(),
+      stop_sync_v2_flags,
+      // RC-3: dead-worker reaper (routing mode `on` only; a no-op otherwise).
+      start_reaper(),
+      // R1b: FCM push for message:new a foreground socket did not ack
+      // (sync_v2_ack_fallback; idle while off). Its stopper drops what is
+      // waiting (counted) — the sockets are being handed to a sibling.
+      start_ack_fallback(),
+      // R1b §14.13 / §14.14: FCM health counters + beacon flusher and
+      // retention (sync_v2_net_telemetry; idle while off).
+      start_fcm_health(),
+      start_net_beacons(),
+      // M track §14.11: daily GC of expired chunked uploads (idle until the
+      // 20261024 media_uploads marker is set).
+      start_upload_gc(),
     ],
   });
   start_socket_timers();
 
   // 5. Listen.
   const http_server = await listen_with_retry("HTTP", () =>
-    app.listen({ port: SERVER_PORT, reusePort: false, idleTimeout: HTTP_IDLE_TIMEOUT_S }).server,
+    app.listen({
+      port: SERVER_PORT,
+      reusePort: false,
+      idleTimeout: HTTP_IDLE_TIMEOUT_S,
+      // 95 MiB file + 1 MiB multipart framing (config/upload-limits.ts).
+      // Bun answers 413 from Content-Length before reading the body, so an
+      // oversized upload is never buffered. Default would be 128 MiB, above
+      // what Cloudflare's free plan (100 MB) ever lets through.
+      maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
+    }).server,
   );
   if (!http_server) return;
   register_drain_resources({ http_server });

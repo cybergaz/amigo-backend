@@ -1,67 +1,81 @@
 import "dotenv/config";
-import LRUCache from "@/utils/cache.utils";
 import { redis } from "@/config/redis";
-import db from "@/config/db";
-import { missed_ws_messages_model } from "@/models/message.model";
-import { VITAL_WS_EVENTS_CONST, VitalWSMessage, VitalWSMessageEventsType, WSMessage, WSMessageEventsType } from "@/types/socket.types";
-import { eq, and, lt, asc, gt, inArray } from "drizzle-orm";
+import db, { pg_client } from "@/config/db";
+import { message_model, missed_ws_messages_model } from "@/models/message.model";
+import { VITAL_WS_EVENTS_CONST, VitalWSMessage, VitalWSMessageEventsType, WSMessageEventsType } from "@/types/socket.types";
+import { eq, and, lt, asc, gt, inArray, isNull, or } from "drizzle-orm";
 import Snowflake from "@/utils/snowflake.utils";
 import { sort_pending_for_replay } from "@/utils/pending-order.utils";
+import {
+  RETURN_META_TTL_SECONDS,
+  classify_pending_read,
+  finalize_pending_read,
+  format_return_meta,
+  message_id_of,
+  newer_pending_entry,
+  parse_return_meta,
+  stale_meta_keys,
+  type ReturnMeta,
+} from "@/utils/poll-ack-drain.utils";
+import {
+  TOMBSTONE_WINDOW_MS,
+  create_deferred_writer,
+  create_pending_redis,
+  db_delete_exact,
+  db_delete_versions,
+  db_upsert_entries,
+  encode_entry,
+  parse_value,
+  redis_entries_key,
+  redis_return_meta_key,
+  uuid7_ms,
+  type DrainItem,
+  type PendingEntry,
+} from "./pending-store-core";
+import { is_uuid } from "@/utils/broadcast.utils";
+import { count } from "@/utils/counters";
+import { debug_log } from "@/utils/debug-log";
+import { strip_ws_thumbs } from "@/utils/attachment-thumbs";
 import { randomUUIDv7 } from "bun";
 import { run_batched_singleton, run_daily } from "@/cluster/jobs";
 import { is_draining, track } from "@/cluster/lifecycle";
+import { ROUTING_MODE, presence_authoritative } from "@/cluster/mode";
+import { is_sole_worker } from "@/cluster/beat";
+import { was_recent_lease_holder } from "@/services/sync/pending-suppress";
 
 // ============================================================================
-// Three-tier Polling Cache for Missed WS Messages
-//   Tier 1: LRU Cache (in-memory)   → 10 minutes TTL
-//   Tier 2: Redis                   → 1 week TTL
-//   Tier 3: PostgreSQL DB           → 1 month (cleaned by cron/scheduled task)
+// Two-tier pending queue for missed WS messages (vital events)
+//   Redis hash poll:user:{uid}:messages_v2 → 1 week TTL (refreshed per store)
+//   PostgreSQL missed_ws_messages          → 30 days (daily cleanup job)
+// RC-3 (§13.7 C1) removed the third, per-PROCESS LRU tier: at N>1 an entry
+// drained on one worker was re-delivered from another worker's LRU copy.
+// Redis is written synchronously by every store, so the LRU never held
+// anything Redis did not.
 //
-// Deduplication strategy — DETERMINISTIC correlation keys (see
-// correlation_key below): `{user_id}:{event_type}:{natural_id}`.
-//   Tier 1: Map<correlation_key, CachedPollMessage>
-//   Tier 2: Redis Hash keyed by correlation_key (HSET/HGETALL/HDEL)
-//   Tier 3: DB onConflictDoUpdate (upsert by id = correlation_key)
-// Two properties fall out of the key shape:
+// Deduplication — DETERMINISTIC correlation keys (see correlation_key):
+// `{user_id}:{event_type}:{natural_id}`. Redis field and DB primary key.
 //   • self-compaction — a re-broadcast of the same logical event (duplicate
 //     re-ack after a client resend, LWW state like pin/user:update)
-//     OVERWRITES its previous pending entry instead of piling up a new
-//     random-keyed copy;
-//   • targeted drain — the delivery-ack path can compute the exact key a
-//     message was stored under and delete it (impossible with the old
-//     randomUUIDv7 keys, which forced delete-on-poll as the ONLY drain).
+//     OVERWRITES its previous pending entry instead of piling up a new copy;
+//   • targeted drain — the delivery-ack path computes the exact key a
+//     message was stored under and deletes it.
+//
+// Versions + tombstones (RC-3 §13.7 C2/C3; pending-store-core.ts has the
+// why): every store mints `v` (UUIDv7) inside the entry and into the DB row's
+// entry_v; every drain is a compare-and-delete "stored v ≤ the v delivered"
+// (acks that name a message use "any version"); a drain that may race a
+// deferred DB write on ANOTHER worker leaves a short-lived tombstone that the
+// writer checks before and after its insert.
 // ============================================================================
 
-interface CachedPollMessage {
-  message_id: string;
-  ws_message: VitalWSMessage;
-  created_at: number; // epoch ms
-}
+type CachedPollMessage = PendingEntry;
 
 // --- Constants ---
-const LRU_TTL_MS = 10 * 60 * 1000;            // 10 minutes
-const REDIS_TTL_SECONDS = 7 * 24 * 60 * 60;   // 1 week
 const DB_RETENTION_DAYS = 30;                 // 1 month
-const MAX_MESSAGES_PER_USER = 500;            // cap per-user queue in Redis/LRU
+const MAX_MESSAGES_PER_USER = 500;            // cap per-user queue in Redis
+const REDIS_TTL_SECONDS = 7 * 24 * 60 * 60;   // 1 week
 
-// --- Tier 1: LRU in-memory cache ---
-// user_id → Map<message_id, CachedPollMessage> for O(1) dedup by message_id
-const polling_lru = new LRUCache<string, Map<string, CachedPollMessage>>(5000, LRU_TTL_MS);
-
-// --- Delayed DB write timers ---
-// Key: "user_id:message_id" → timer handle. If remove_pending_message(s) is
-// called before the timer fires, clearTimeout() cancels the DB write entirely.
-// With drain-on-ack (handle_message_status_ack → remove_pending_messages_batch)
-// reachable users who ack within 10s now genuinely never touch the DB — under
-// the old random keys nothing could cancel these timers except a poll, so for
-// pure-WS recipients EVERY deferred insert always fired.
-const DB_WRITE_DELAY_MS = 10_000; // 10 seconds
-const pending_db_timers = new Map<string, ReturnType<typeof setTimeout>>();
-const db_timer_key = (user_id: string, message_id: string) => `${user_id}:${message_id}`;
-
-// --- Helper: Redis key for a user's pending poll messages ---
-// NOTE: Using _v2 suffix to avoid WRONGTYPE conflicts with old Set-typed keys
-const redis_poll_key = (user_id: string) => `poll:user:${user_id}:messages_v2`;
+const pending_redis = create_pending_redis(redis);
 
 // --- Guard: check if event type is allowed for polling cache ---
 const is_allowed_event = (event_type: WSMessageEventsType): event_type is VitalWSMessageEventsType => {
@@ -107,70 +121,77 @@ const correlation_key = (user_id: string, ws_message: VitalWSMessage): string =>
     natural_event_id(ws_message) ?? randomUUIDv7(),
   );
 
-// ============================================================================
-// WRITE PATH — store a missed WS message for an offline user
-// Writes to ALL three tiers simultaneously (fan-out).
-// ============================================================================
-// --- Tier 1 helper: LRU store with cap trim ---
-const lru_store = (user_id: string, entry: CachedPollMessage): void => {
-  const existing = polling_lru.get(user_id) ?? new Map<string, CachedPollMessage>();
-  existing.set(entry.message_id, entry); // overwrites if same key (idempotent)
-  if (existing.size > MAX_MESSAGES_PER_USER) {
-    const sorted = Array.from(existing.entries()).sort((a, b) => a[1].created_at - b[1].created_at);
-    const excess = existing.size - MAX_MESSAGES_PER_USER;
-    sorted.slice(0, excess).forEach(([id]) => existing.delete(id));
-  }
-  polling_lru.set(user_id, existing, LRU_TTL_MS);
-};
+// Can a deferred DB write for an entry be pending on ANOTHER worker right
+// now? Only then do drains leave tombstones and does the writer consult
+// Redis (C3). `local` routing (default at N=1) = no: zero added Redis work,
+// exactly today's path. `on` with no live sibling = no. `shadow` = yes, so
+// the scripts run on prod at N=1 before anything depends on them.
+const remote_writers_possible = (): boolean =>
+  ROUTING_MODE !== "local" && !(presence_authoritative() && is_sole_worker());
 
-// --- Tier 2 helper: trim a user's Redis hash back to cap (rare path) ---
-const trim_redis_queue = async (user_id: string, hash_len: number): Promise<void> => {
+// Tombstones expire per field on Redis ≥ 7.4 (HPEXPIRE). On an older Redis
+// nothing but the 500-field cap trim removes them, and an online user's hash
+// would collect one per message received; so there they are written only
+// when a remote write is REAL (routing `on` with a live sibling), not in
+// shadow. Learnt from the first drain that wrote one.
+let field_ttl_ok = true;
+const tombstones_wanted = (): boolean =>
+  remote_writers_possible() && (field_ttl_ok || presence_authoritative());
+
+// The DB tier: written ~10 s after the store unless an ack drains it first
+// (pending-store-core create_deferred_writer has the rules).
+const db_writer = create_deferred_writer({
+  redis: pending_redis,
+  upsert: (rows) => {
+    // §3.13: DB writes for proto-2 lease holders should be ≈ 0 once their
+    // derivable events are no longer stored (pending-suppress.ts); what is
+    // left is the non-derivable residue. A recent-holder hint, no lookup.
+    let v2 = 0;
+    for (const r of rows) if (was_recent_lease_holder(r.user_id)) v2++;
+    if (v2 > 0) count("POLL", "v2_undrained_db_writes", v2);
+    return db_upsert_entries(pg_client, rows);
+  },
+  delete_exact: (items) => db_delete_exact(pg_client, items),
+  guarded: remote_writers_possible,
+  count: (name, n) => count("POLL", name, n),
+  track,
+});
+
+// ============================================================================
+// WRITE PATH — store a missed WS message
+// ============================================================================
+
+// --- trim a user's Redis hash back to cap (rare path) ---
+// Tombstones past their window go first (on Redis < 7.4 nothing else expires
+// them); then the oldest real entries beyond the cap. Trimmed entries keep
+// their deferred DB write: the DB is then their only copy.
+const trim_redis_queue = async (user_id: string): Promise<void> => {
   try {
-    const key = redis_poll_key(user_id);
+    const key = redis_entries_key(user_id);
     const all = await redis.hgetall(key);
-    const sorted = Object.entries(all).sort((a, b) => {
-      const pa = JSON.parse(a[1]) as CachedPollMessage;
-      const pb = JSON.parse(b[1]) as CachedPollMessage;
-      return pa.created_at - pb.created_at;
-    });
-    const to_delete = sorted.slice(0, hash_len - MAX_MESSAGES_PER_USER).map(([id]) => id);
+    const now = Date.now();
+    const entries: [string, number][] = [];
+    const to_delete: string[] = [];
+    for (const [field, raw] of Object.entries(all)) {
+      const parsed = parse_value(raw);
+      if (!parsed) continue;
+      if (parsed.kind === "tomb") {
+        const t = uuid7_ms(parsed.v);
+        if (t === undefined || now - t >= TOMBSTONE_WINDOW_MS) to_delete.push(field);
+        continue;
+      }
+      entries.push([field, parsed.entry.created_at]);
+    }
+    if (entries.length > MAX_MESSAGES_PER_USER) {
+      entries.sort((a, b) => a[1] - b[1]);
+      for (const [field] of entries.slice(0, entries.length - MAX_MESSAGES_PER_USER)) to_delete.push(field);
+    }
     if (to_delete.length > 0) {
       await redis.hdel(key, ...to_delete);
     }
   } catch (err) {
     console.error(`[POLL-CACHE] Redis trim error for user ${user_id}:`, err);
   }
-};
-
-// --- Tier 3 helper: delayed DB write (cancelled by drain within 10s) ---
-const schedule_db_write = (user_id: string, entry: CachedPollMessage): void => {
-  const { message_id: pending_message_id, ws_message } = entry;
-  const tk = db_timer_key(user_id, pending_message_id);
-  if (pending_db_timers.has(tk)) clearTimeout(pending_db_timers.get(tk)!);
-  const timer = setTimeout(async () => {
-    pending_db_timers.delete(tk);
-    try {
-      await db
-        .insert(missed_ws_messages_model)
-        .values({
-          id: pending_message_id,
-          user_id,
-          event_type: ws_message.type,
-          ws_message,
-        })
-        .onConflictDoUpdate({
-          target: missed_ws_messages_model.id,
-          set: {
-            user_id,
-            event_type: ws_message.type,
-            ws_message,
-          }
-        });
-    } catch (err) {
-      console.error(`[POLL-CACHE] DB write error for user ${user_id}:`, err);
-    }
-  }, DB_WRITE_DELAY_MS);
-  pending_db_timers.set(tk, timer);
 };
 
 async function store_pending_message(
@@ -182,99 +203,158 @@ async function store_pending_message(
 
 // Store for multiple users at once — THE fan-out path (broadcast_message).
 // One Redis pipeline covers the entire recipient list: hset + expire + hlen
-// per user, single round trip. The old per-recipient version awaited 3
-// sequential round trips per user (≈450 commands one-by-one for a
-// 150-member group message, on the shared connection).
+// per user, single round trip. The DB write is queued locally (no I/O here).
 async function store_pending_message_for_users(
   user_ids: string[],
   ws_message: VitalWSMessage,
 ): Promise<void> {
   if (user_ids.length === 0 || !is_allowed_event(ws_message.type)) return;
+  // One copy per recipient, in Redis (noeviction) and missed_ws_messages:
+  // inline thumbs (§14.7 item 5) stay out of it, the app takes them from
+  // history / sync. Identity for every message without one.
+  ws_message = strip_ws_thumbs(ws_message);
 
   const now = Date.now();
+  // One version per store call: it only has to order versions of ONE field,
+  // and every recipient's field is distinct.
+  const v = randomUUIDv7();
   const pipeline = redis.pipeline();
-  const entries: { user_id: string; entry: CachedPollMessage; }[] = [];
+  const users: string[] = [];
+  const keys: string[] = [];
 
   for (const user_id of user_ids) {
-    const entry: CachedPollMessage = {
+    const entry: PendingEntry = {
+      v,
       message_id: correlation_key(user_id, ws_message),
       ws_message,
       created_at: now,
     };
-    entries.push({ user_id, entry });
+    users.push(user_id);
+    keys.push(entry.message_id);
+    db_writer.schedule(user_id, entry);
 
-    // Tier 1 + Tier 3 are local (Map / setTimeout) — do them inline.
-    lru_store(user_id, entry);
-    schedule_db_write(user_id, entry);
-
-    // Tier 2 queued into the shared pipeline.
-    const key = redis_poll_key(user_id);
-    pipeline.hset(key, entry.message_id, JSON.stringify(entry));
+    const key = redis_entries_key(user_id);
+    pipeline.hset(key, entry.message_id, encode_entry(entry));
     pipeline.expire(key, REDIS_TTL_SECONDS);
     pipeline.hlen(key);
   }
 
   try {
     const results = await pipeline.exec();
-    // Every 3rd result is the user's hlen — trim the (rare) over-cap queues.
-    for (let i = 0; i < entries.length; i++) {
+    // Per user: hset (1 = the field is new → its drain may skip the PG
+    // DELETE, see mark_fresh), expire, hlen (trim the rare over-cap queues).
+    for (let i = 0; i < users.length; i++) {
+      const hset_result = results?.[i * 3];
+      if (hset_result && !hset_result[0] && hset_result[1] === 1) {
+        db_writer.mark_fresh(users[i], keys[i], v);
+      }
       const hlen_result = results?.[i * 3 + 2];
       const hash_len = typeof hlen_result?.[1] === "number" ? hlen_result[1] : 0;
       if (hash_len > MAX_MESSAGES_PER_USER) {
-        await trim_redis_queue(entries[i].user_id, hash_len);
+        await trim_redis_queue(users[i]);
       }
     }
   } catch (err) {
     console.error(`[POLL-CACHE] Redis pipeline write error (${user_ids.length} users):`, err);
   }
+  debug_log("PENDING", () =>
+    `store type=${ws_message.type} id=${natural_event_id(ws_message) ?? "-"} users=${user_ids.length} v=${v}`,
+  );
 }
 
 // ============================================================================
-// READ PATH — fetch pending messages for a user (3-tier UNION)
-//   LRU ∪ Redis ∪ DB, deduped by correlation key.
-// After reading, messages are cleared from all tiers.
+// READ PATH — fetch pending messages for a user (Redis ∪ DB)
 //
-// SYNC_V2 R0: this used to be a fallthrough — Redis was read only when this
-// process's LRU was empty, and the DB only when Redis was empty too. The LRU
-// is PER PROCESS and the DB tier holds entries Redis no longer has (trimmed /
-// expired), so a non-empty upper tier SHADOWED entries that existed only below
-// it: they stayed undelivered until the upper tier happened to be empty.
-// Every tier is now read on every poll and merged.
+// SYNC_V2 R0: both tiers are read on every poll and merged (a fallthrough
+// let a non-empty upper tier shadow entries that existed only below it).
+// RC-3: merged by key keeping the NEWEST version (v), not "Redis wins".
+//
+// SYNC_V2 R0.1 (field bug F2-1): no delete-on-read for message:new. Returned
+// entries the client acks stay queued until the delivered ack drains them
+// (re-sent with a growing hold meanwhile, expired 7 days after the FIRST
+// return); every other type is still deleted once returned — compare-and-
+// delete on the version returned, so a newer version stored meanwhile
+// survives. See poll-ack-drain.utils for the rules and why.
 // ============================================================================
 
 // [POLL] cursor_would_drop counter (per process, since start).
 let cursor_would_drop_total = 0;
 
+// Of the message ids about to be RE-sent, the ones still live (not deleted,
+// not expired). A re-send happens when an earlier response was lost; if that
+// response also carried the message:delete (delete-on-read, gone now), a
+// blind re-send would bring a deleted message back on the phone. Only runs
+// when something is being re-sent (rare). null = lookup failed → keep all.
+async function live_message_ids(ids: string[]): Promise<Set<string> | null> {
+  const valid = ids.filter(is_uuid);
+  if (valid.length === 0) return new Set();
+  try {
+    const rows = await db
+      .select({ id: message_model.id })
+      .from(message_model)
+      .where(and(
+        inArray(message_model.id, valid),
+        isNull(message_model.deleted_at),
+        or(isNull(message_model.expires_at), gt(message_model.expires_at, new Date())),
+      ));
+    // Lower-cased both sides: Postgres returns uuids lower-case, a client
+    // may have minted its id upper-case, and a miss here DROPS the entry.
+    return new Set(rows.map(r => r.id.toLowerCase()));
+  } catch (err) {
+    console.error(`[POLL-CACHE] live-message check failed (${valid.length} ids):`, err);
+    return null;
+  }
+}
+
 async function fetch_pending_messages(
   user_id: string,
   after_message_id?: string,
+  for_sync: boolean = false,
 ): Promise<CachedPollMessage[]> {
 
-  // Map<message_id, CachedPollMessage> for dedup across tiers. Merge order is
-  // DB → LRU → Redis, each overwriting the previous for the same correlation
-  // key: Redis is written synchronously by EVERY worker's fan-out, so for a
-  // self-compacting key (pin / react / user:update ...) it holds the latest
-  // version; this process's LRU can hold an older one written here before
-  // another worker overwrote it; the DB copy is a deferred snapshot.
+  // Map<key, entry> for dedup across tiers, newest version per key.
   const messages = new Map<string, CachedPollMessage>();
 
+  // Entries and return meta in ONE round trip. meta_ok=false (meta unread)
+  // disables every meta write below: writing without having read would reset
+  // first-return times, i.e. push expiry out.
   const redis_read = (async () => {
     const out: [string, CachedPollMessage][] = [];
+    const meta = new Map<string, ReturnMeta>();
+    let entries_ok = false;
+    let meta_ok = false;
     try {
-      const raw_hash = await redis.hgetall(redis_poll_key(user_id));
-      if (raw_hash) {
-        for (const [msg_id, str] of Object.entries(raw_hash)) {
-          try {
-            out.push([msg_id, JSON.parse(str) as CachedPollMessage]);
-          } catch (err) {
-            console.error(`[POLL-CACHE] Error parsing Redis message for user ${user_id}:`, err);
-          }
+      const results = await redis
+        .pipeline()
+        .hgetall(redis_entries_key(user_id))
+        .hgetall(redis_return_meta_key(user_id))
+        .exec();
+      const [entries_err, raw_hash] = results?.[0] ?? [new Error("no result"), null];
+      const [meta_err, raw_meta] = results?.[1] ?? [new Error("no result"), null];
+      if (entries_err) {
+        console.error(`[POLL-CACHE] Redis read error for user ${user_id}:`, entries_err);
+      } else {
+        entries_ok = true;
+        for (const [key, str] of Object.entries((raw_hash ?? {}) as Record<string, string>)) {
+          const parsed = parse_value(str);
+          if (parsed?.kind === "entry") out.push([key, parsed.entry]);
+          else if (!parsed) console.error(`[POLL-CACHE] unparsable pending entry for user ${user_id} key=${key}`);
+          // tombstones: drained, skip
+        }
+      }
+      if (meta_err) {
+        console.error(`[POLL-CACHE] Redis return-meta read error for user ${user_id}:`, meta_err);
+      } else {
+        meta_ok = true;
+        for (const [key, raw] of Object.entries((raw_meta ?? {}) as Record<string, string>)) {
+          const m = parse_return_meta(raw);
+          if (m) meta.set(key, m);
         }
       }
     } catch (err) {
       console.error(`[POLL-CACHE] Redis read error for user ${user_id}:`, err);
     }
-    return out;
+    return { out, meta, entries_ok, meta_ok };
   })();
 
   const db_read = (async () => {
@@ -289,6 +369,7 @@ async function fetch_pending_messages(
 
       for (const row of db_messages) {
         out.push([row.id, {
+          v: row.entry_v ?? "",
           message_id: row.id,
           ws_message: row.ws_message as VitalWSMessage,
           created_at: new Date(row.created_at).getTime(),
@@ -300,50 +381,115 @@ async function fetch_pending_messages(
     return out;
   })();
 
-  const [redis_entries, db_entries] = await Promise.all([redis_read, db_read]);
+  const [redis_res, db_entries] = await Promise.all([redis_read, db_read]);
+  const { meta, meta_ok } = redis_res;
 
-  // --- Tier 3: DB ---
+  // DB first, then Redis: on equal versions (both legacy "") Redis wins, as
+  // before; otherwise the newer version wins whichever tier holds it.
   for (const [id, msg] of db_entries) messages.set(id, msg);
-  // --- Tier 1: LRU ---
-  const lru_map = polling_lru.get(user_id);
-  if (lru_map && lru_map.size > 0) {
-    lru_map.forEach((msg, id) => messages.set(id, msg));
+  for (const [id, msg] of redis_res.out) {
+    const prev = messages.get(id);
+    messages.set(id, prev ? newer_pending_entry(prev, msg) : msg);
   }
-  // --- Tier 2: Redis ---
-  for (const [id, msg] of redis_entries) messages.set(id, msg);
 
   // Replay order: created_at, with conversation:new first on a same-ms tie
   // (see pending-order.utils — e.g. a new DM's conversation:new and its first
   // message:new).
   const sorted = sort_pending_for_replay(Array.from(messages.values()));
 
+  const now = Date.now();
+  const classified = classify_pending_read(user_id, sorted, meta, now, for_sync);
+
+  // Re-sends whose message was deleted / expired meanwhile are dropped for
+  // good instead of re-sent (see live_message_ids).
+  let candidates = classified.candidates;
+  const dead_keys: string[] = [];
+  if (classified.resend_keys.size > 0) {
+    const resend_ids = candidates
+      .filter(e => classified.resend_keys.has(e.message_id))
+      .map(e => message_id_of(e))
+      .filter((id): id is string => !!id);
+    const live = await live_message_ids(resend_ids);
+    if (live) {
+      candidates = candidates.filter(e => {
+        if (!classified.resend_keys.has(e.message_id)) return true;
+        const id = message_id_of(e);
+        if (!id || !is_uuid(id) || live.has(id.toLowerCase())) return true;
+        dead_keys.push(e.message_id);
+        return false;
+      });
+    }
+  }
+
   // Cap one response at MAX_MESSAGES_PER_USER, oldest first: the tier union
-  // can reach ~1000 entries, and poll v1 deletes on read, so a bigger
-  // response lost mid-transfer on flaky wifi is lost for good. The rest stays
-  // queued for the next poll (same size as the old one-tier-per-poll read).
-  const result = sorted.length > MAX_MESSAGES_PER_USER
-    ? sorted.slice(0, MAX_MESSAGES_PER_USER)
-    : sorted;
-  if (result.length < sorted.length) {
+  // can reach ~1000 entries, and a big response is the one most likely to be
+  // lost mid-transfer on flaky Wi-Fi. The rest stays queued for the next poll.
+  const plan = finalize_pending_read(user_id, candidates, meta, MAX_MESSAGES_PER_USER, now);
+  const result = plan.result;
+  if (result.length < candidates.length) {
     console.log(
-      `[POLL] capped user=${user_id} returned=${result.length} remaining=${sorted.length - result.length}`,
+      `[POLL] capped user=${user_id} returned=${result.length} remaining=${candidates.length - result.length}`,
     );
   }
 
-  // Remove the RETURNED entries from all 3 tiers — batched: one variadic
-  // HDEL + one IN-list DB delete instead of 2 round trips per entry (a
-  // 500-entry backlog used to cost ~1000 sequential ops per poll).
-  await remove_pending_messages_batch(user_id, result.map(m => m.message_id));
+  if (plan.resent > 0) count("POLL", "resend_unacked", plan.resent);
+  if (classified.held > 0) count("POLL", "held_unacked", classified.held);
+  if (dead_keys.length > 0) count("POLL", "dropped_deleted", dead_keys.length);
+  if (classified.expired_keys.length > 0) {
+    count("POLL", "expired_unacked", classified.expired_keys.length);
+    // Rare and the one way this path still drops a message: always logged.
+    console.warn(
+      `[POLL] expired_unacked user=${user_id} n=${classified.expired_keys.length}`,
+    );
+  }
+  debug_log("PENDING", () =>
+    `read user=${user_id} union=${sorted.length} returned=${result.length} ` +
+    `deleted_on_read=${plan.delete_keys.length} resent=${plan.resent} held=${classified.held} ` +
+    `expired=${classified.expired_keys.length} dead=${dead_keys.length}`,
+  );
 
-  // Cursor (after_message_id): NO slicing (SYNC_V2 R0). Everything above was
-  // just DELETED from every tier, so slicing "after the cursor" dropped the
-  // entries at/before it for good. The cursor entry can only still be in the
-  // queue because it was RE-STORED after the client saw it (a self-compacting
-  // key such as message:pin / message:react / user:update overwritten with a
-  // newer state, or a sibling worker's deferred DB write) — so it and the
-  // entries sorted before it are new to the client. Return them all; client
-  // handlers are idempotent per id. Counted so the old loss is visible.
-  if (after_message_id) {
+  // Writes, in parallel, all awaited before the response so a second poll
+  // racing this one (reconnect sync GET + first _poll fire within ~1 s) sees
+  // the return marks and holds instead of re-sending.
+  //   - delete-on-read types that were returned, plus expired / dead
+  //     ack-drained entries: compare-and-delete on the version read here;
+  //   - return marks for the ack-drained entries returned now, and cleanup
+  //     of marks whose entry is gone.
+  const to_remove: DrainItem[] = [...plan.delete_keys, ...classified.expired_keys, ...dead_keys]
+    .map((key) => ({ key, v: messages.get(key)?.v ?? "" }));
+  const writes: Promise<unknown>[] = [drain_pending(user_id, to_remove)];
+  if (meta_ok && redis_res.entries_ok) {
+    const stale = stale_meta_keys(meta, new Set(messages.keys()));
+    if (plan.meta_updates.size > 0 || stale.length > 0) {
+      const key = redis_return_meta_key(user_id);
+      const pipe = redis.pipeline();
+      if (plan.meta_updates.size > 0) {
+        const fields: Record<string, string> = {};
+        for (const [k, m] of plan.meta_updates) fields[k] = format_return_meta(m);
+        pipe.hset(key, fields);
+        pipe.expire(key, RETURN_META_TTL_SECONDS);
+      }
+      if (stale.length > 0) pipe.hdel(key, ...stale);
+      writes.push(
+        pipe.exec().catch(err =>
+          console.error(`[POLL-CACHE] Redis return-meta write error for user ${user_id}:`, err),
+        ),
+      );
+    }
+  }
+  await Promise.all(writes);
+
+  // Cursor (after_message_id): NO slicing (SYNC_V2 R0). Slicing "after the
+  // cursor" dropped the entries at/before it for good (they had just been
+  // deleted). The cursor entry can only still be in the queue because it was
+  // RE-STORED after the client saw it (a self-compacting key such as
+  // message:pin / message:react / user:update overwritten with a newer state,
+  // a sibling worker's deferred DB write) or, since R0.1, because it is an
+  // un-acked message:new being re-sent — so it and the entries sorted before
+  // it are new to the client or harmless repeats. Return them all; client
+  // handlers are idempotent per id. Counted so the old loss is visible (a
+  // re-sent cursor entry did not exist under delete-on-read: not counted).
+  if (after_message_id && !classified.resend_keys.has(after_message_id)) {
     const idx = result.findIndex(m => m.message_id === after_message_id);
     if (idx !== -1) {
       cursor_would_drop_total += idx + 1;
@@ -356,90 +502,173 @@ async function fetch_pending_messages(
   return result;
 }
 
-// Batch removal from all 3 tiers. Used by the poll drain and by
-// drain-on-ack (handle_message_status_ack / mark_message_delivered), which
-// can now compute the exact correlation keys to delete. Keys that don't
-// exist (e.g. pre-deploy random-keyed entries) miss harmlessly.
-async function remove_pending_messages_batch(user_id: string, message_ids: string[]): Promise<void> {
-  if (message_ids.length === 0) return;
+// ============================================================================
+// POLL V2 (R3) — the Redis tier read and the return marks
+// ============================================================================
+// Poll v2 reads the DB tier inside its single statement (poll-queries.ts)
+// and plans the response itself (poll-core plan_pending_v2); these are its
+// Redis halves. Nothing here deletes: v2 never deletes on read, its acks and
+// expiries go through drain_pending with explicit versions.
 
-  // Cancel delayed DB writes that haven't fired yet
-  for (const message_id of message_ids) {
-    const tk = db_timer_key(user_id, message_id);
-    const timer = pending_db_timers.get(tk);
-    if (timer) {
-      clearTimeout(timer);
-      pending_db_timers.delete(tk);
+type PendingRedisRead = {
+  entries: PendingEntry[];
+  meta: Map<string, ReturnMeta>;
+  entries_ok: boolean;
+  meta_ok: boolean;
+};
+
+// Entries (tombstones skipped) and return marks, ONE round trip.
+async function read_pending_redis(user_id: string): Promise<PendingRedisRead> {
+  const out: PendingRedisRead = { entries: [], meta: new Map(), entries_ok: false, meta_ok: false };
+  try {
+    const results = await redis
+      .pipeline()
+      .hgetall(redis_entries_key(user_id))
+      .hgetall(redis_return_meta_key(user_id))
+      .exec();
+    const [entries_err, raw_hash] = results?.[0] ?? [new Error("no result"), null];
+    const [meta_err, raw_meta] = results?.[1] ?? [new Error("no result"), null];
+    if (!entries_err) {
+      out.entries_ok = true;
+      for (const [key, str] of Object.entries((raw_hash ?? {}) as Record<string, string>)) {
+        const parsed = parse_value(str);
+        if (parsed?.kind === "entry") out.entries.push({ ...parsed.entry, message_id: key });
+        else if (!parsed) console.error(`[POLL-CACHE] unparsable pending entry for user ${user_id} key=${key}`);
+      }
+    } else {
+      console.error(`[POLL-CACHE] Redis read error for user ${user_id}:`, entries_err);
     }
-  }
-
-  // LRU
-  try {
-    const lru_map = polling_lru.get(user_id);
-    if (lru_map) {
-      for (const message_id of message_ids) lru_map.delete(message_id);
-      if (lru_map.size === 0) polling_lru.delete(user_id);
+    if (!meta_err) {
+      out.meta_ok = true;
+      for (const [key, raw] of Object.entries((raw_meta ?? {}) as Record<string, string>)) {
+        const m = parse_return_meta(raw);
+        if (m) out.meta.set(key, m);
+      }
     }
-  } catch (e) {
-    console.error(`[POLL-CACHE] LRU batch remove error for user ${user_id}:`, e);
-  }
-
-  // Redis — one variadic HDEL
-  try {
-    await redis.hdel(redis_poll_key(user_id), ...message_ids);
   } catch (err) {
-    console.error(`[POLL-CACHE] Redis batch remove error for user ${user_id}:`, err);
+    console.error(`[POLL-CACHE] Redis read error for user ${user_id}:`, err);
   }
+  return out;
+}
 
-  // DB — one IN-list delete
+// Record what a v2 response handed out (holds / expiry, F's ret_v1 hash with
+// the returned version) and prune marks whose entry is gone. One pipeline;
+// awaited by the caller before it answers, so the client's very next request
+// already sees the holds. Never throws.
+async function write_return_meta(
+  user_id: string,
+  updates: Map<string, ReturnMeta>,
+  stale: string[],
+): Promise<void> {
+  if (updates.size === 0 && stale.length === 0) return;
+  const key = redis_return_meta_key(user_id);
+  const pipe = redis.pipeline();
+  if (updates.size > 0) {
+    const fields: Record<string, string> = {};
+    for (const [k, m] of updates) fields[k] = format_return_meta(m);
+    pipe.hset(key, fields);
+    pipe.expire(key, RETURN_META_TTL_SECONDS);
+  }
+  if (stale.length > 0) pipe.hdel(key, ...stale);
   try {
-    await db
-      .delete(missed_ws_messages_model)
-      .where(inArray(missed_ws_messages_model.id, message_ids));
+    await pipe.exec();
   } catch (err) {
-    console.error(`[POLL-CACHE] DB batch remove error for user ${user_id}:`, err);
+    console.error(`[POLL-CACHE] Redis return-meta write error for user ${user_id}:`, err);
   }
 }
 
-// Remove pending message from 3 tiers after successful delivery
-async function remove_pending_message(user_id: string, message_id: string): Promise<void> {
-  // Cancel delayed DB write if it hasn't fired yet
-  const tk = db_timer_key(user_id, message_id);
-  const timer = pending_db_timers.get(tk);
-  if (timer) {
-    clearTimeout(timer);
-    pending_db_timers.delete(tk);
-  }
+// ============================================================================
+// DRAIN — compare-and-delete from every tier (RC-3 C2/C3)
+// ============================================================================
+// THE removal path: the poll read (delete-on-read types, expired / dead
+// entries; with the version it read), drain-on-ack (handle_message_status_ack
+// / mark_message_delivered; any version — the ack names a message, and every
+// version of a message:new / sent:ack key is the same message) and, from R3,
+// the poll v2 ack {key, v}. Keys that don't exist miss harmlessly.
+//
+//   1. local deferred writes: a queued one for a drained version is
+//      cancelled; one being written right now is marked, and its writer
+//      deletes its own row after the insert;
+//   2. Redis: PENDING_DRAIN (+ the return marks), tombstones only while a
+//      write on another worker is possible;
+//   3. Postgres: delete rows whose version is ≤ the drained one. Skipped
+//      when every item was a message:new / sent:ack whose FIRST version
+//      (the store created the Redis field) was still queued here: no
+//      version of that key was ever written to the DB. A re-store over an
+//      older version keeps the DELETE (a flushed 500 sent-ack refusal must
+//      not outlive the retry's success). That skip is what keeps an online
+//      recipient's ack free of a DELETE on RDS.
+// Never throws.
+// Drain listeners: every drained key, as it is drained, synchronously (the
+// FCM ack fallback cancels its deadline for `{uid}:message:new:{id}` — every
+// delivered / read ack path ends here). A listener must be cheap and must
+// not throw into the drain.
+type DrainListener = (user_id: string, keys: string[]) => void;
+const drain_listeners: DrainListener[] = [];
+function on_pending_drain(fn: DrainListener): () => void {
+  drain_listeners.push(fn);
+  return () => {
+    const i = drain_listeners.indexOf(fn);
+    if (i >= 0) drain_listeners.splice(i, 1);
+  };
+}
 
-  // Remove from LRU
-  try {
-    const lru_map = polling_lru.get(user_id);
-    if (lru_map) {
-      lru_map.delete(message_id);
-      if (lru_map.size === 0) {
-        polling_lru.delete(user_id);
+async function drain_pending(user_id: string, items: DrainItem[]): Promise<void> {
+  if (items.length === 0) return;
+  debug_log("PENDING", () => `drain user=${user_id} n=${items.length}`);
+  if (drain_listeners.length > 0) {
+    const keys = items.map((i) => i.key);
+    for (const fn of drain_listeners) {
+      try {
+        fn(user_id, keys);
+      } catch (err) {
+        console.error("[POLL-CACHE] drain listener failed:", err);
       }
-      // No need to re-set since we mutated the Map in place; TTL refresh is optional
     }
-  } catch (e) {
-    console.error(`[POLL-CACHE] LRU remove error for user ${user_id}:`, e);
   }
 
-  // Remove from Redis (O(1) HDEL by field name)
-  try {
-    await redis.hdel(redis_poll_key(user_id), message_id);
-  } catch (err) {
-    console.error(`[POLL-CACHE] Redis remove error for user ${user_id}:`, err);
-  }
+  const pg_unneeded = db_writer.note_drain(user_id, items);
 
-  // Remove from DB
-  try {
-    await db
-      .delete(missed_ws_messages_model)
-      .where(eq(missed_ws_messages_model.id, message_id));
-  } catch (err) {
-    console.error(`[POLL-CACHE] DB remove error for user ${user_id}:`, err);
+  const tomb = tombstones_wanted();
+  const redis_p = pending_redis
+    .drain([{ user_id, items, tomb }])
+    .then(({ drained: [n], field_ttl_refused }) => {
+      if (field_ttl_refused && field_ttl_ok) {
+        field_ttl_ok = false;
+        console.warn("[POLL-CACHE] Redis refused HPEXPIRE (< 7.4): tombstones only with live siblings in routing mode `on`");
+      }
+      if (n < 0) throw new Error("drain script failed");
+    })
+    .catch((err) => console.error(`[POLL-CACHE] Redis drain error for user ${user_id}:`, err));
+
+  let db_p: Promise<unknown> = Promise.resolve();
+  if (pg_unneeded) {
+    count("POLL", "drain_pg_skipped");
+  } else {
+    // With tombstones (a remote deferred write may race us) the PG DELETE
+    // goes out only after the tombstone is in Redis: a writer whose
+    // post-insert re-check missed the tombstone then read Redis before it
+    // existed, so its insert committed before our DELETE runs, and the
+    // DELETE removes it. Sent in parallel, our DELETE could reach RDS
+    // before its INSERT committed AND our tombstone land after its re-check:
+    // the row would survive and be re-delivered. One extra Redis RTT, in
+    // guarded mode only (never in `local`).
+    if (tomb) await redis_p;
+    db_p = db_delete_versions(pg_client, user_id, items).catch((err) =>
+      console.error(`[POLL-CACHE] DB drain error for user ${user_id}:`, err),
+    );
   }
+  await Promise.all([redis_p, db_p]);
+}
+
+// Drain by key, any version — the pre-RC-3 API, kept for the ack paths
+// (message-status.service, socket.service).
+async function remove_pending_messages_batch(user_id: string, message_ids: string[]): Promise<void> {
+  await drain_pending(user_id, message_ids.map((key) => ({ key })));
+}
+
+async function remove_pending_message(user_id: string, message_id: string): Promise<void> {
+  await drain_pending(user_id, [{ key: message_id }]);
 }
 
 
@@ -501,16 +730,14 @@ function start_cleanup_cron() {
   console.log("[POLL-CACHE] Started daily cleanup cron for missed messages");
 }
 
-// Drain (SYNC_V2 §13.9.3): cancel the deferred DB inserts that have not fired.
-// This is what an exit always did implicitly; it is now explicit and counted.
-// The entries stay in Redis (7-day TTL), so the poll / reconnect replay still
-// finds them — only the 30-day DB backstop copy is skipped. Running them
-// early instead would race the recipient's ack-drain (RC-3 C3 handles that).
+// Drain (SYNC_V2 §13.9.3, §13.7 C3): drop the deferred DB writes that have
+// not been flushed and stop queueing new ones. Returns how many were dropped
+// (also counted as [POLL] db_writes_dropped). The entries stay in Redis
+// (7-day TTL), so the poll / reconnect replay still finds them — only the
+// 30-day DB backstop copy is skipped. Writing them early instead would race
+// the recipients' ack drains. A flush already running finishes (tracked).
 function drop_pending_db_timers(): number {
-  const n = pending_db_timers.size;
-  for (const timer of pending_db_timers.values()) clearTimeout(timer);
-  pending_db_timers.clear();
-  return n;
+  return db_writer.drop();
 }
 
 // Stops asking; a run already in flight is awaited by the drain via track()
@@ -522,11 +749,13 @@ function stop_cleanup_cron() {
   }
 }
 
-function log_current_cache_state(user_id: string) {
-  const lru_map = polling_lru.get(user_id);
-  console.log(`[POLL-CACHE] Current LRU cache for user ${user_id}:`, lru_map?.size ?? 0);
+// Diagnostics for the admin / debug paths.
+function pending_db_write_stats() {
+  return db_writer.stats();
+}
 
-  redis.hlen(redis_poll_key(user_id)).then(count => {
+function log_current_cache_state(user_id: string) {
+  redis.hlen(redis_entries_key(user_id)).then(count => {
     console.log(`[POLL-CACHE] Current Redis cache for user ${user_id}:`, count);
   }).catch(err => {
     console.error(`[POLL-CACHE] Error fetching Redis cache for user ${user_id}:`, err);
@@ -548,13 +777,19 @@ export {
   store_pending_message,
   store_pending_message_for_users,
   fetch_pending_messages,
+  read_pending_redis,
+  write_return_meta,
+  drain_pending,
+  on_pending_drain,
   remove_pending_message,
   remove_pending_messages_batch,
   cleanup_expired_messages,
   start_cleanup_cron,
   stop_cleanup_cron,
   drop_pending_db_timers,
+  pending_db_write_stats,
   is_allowed_event,
   log_current_cache_state,
   type CachedPollMessage,
 };
+export type { DrainItem, PendingEntry, PendingRedisRead };

@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
-import db from "@/config/db";
+import db, { pg_client } from "@/config/db";
+import type postgres from "postgres";
 import { count, observe_ms } from "@/utils/counters";
 import { WORKER_ID } from "./identity";
 import { k } from "./keys";
@@ -57,6 +58,45 @@ const run_pg_singleton = async <T>(
       acquired = true;
       return fn(tx);
     });
+    count("JOBS", acquired ? `${name}_ran` : `${name}_skipped`);
+    if (acquired) observe_ms("JOBS", `${name}_ms`, performance.now() - t0);
+    return out;
+  } catch (err: any) {
+    count("JOBS", `${name}_failed`);
+    console.error(
+      `[JOBS] ${name} failed ${Math.round(performance.now() - t0)}ms: ${err?.message ?? err}`,
+    );
+    throw err;
+  }
+};
+
+/**
+ * run_pg_singleton for work written against the raw postgres-js client
+ * (the Sync v2 write-path SQL in services/sync/write-queries.ts takes a
+ * postgres-js `Sql`, so the PGlite harness can run the very same statements).
+ * Same lock namespace, statement timeout, counters and return contract.
+ *
+ * `opts.label` names the [JOBS] counters / log line instead of `name`, for
+ * locks whose name carries an id (chunked uploads lock 'upload:'+id): the
+ * counters must keep a bounded set of names.
+ */
+const run_pg_singleton_sql = async <T>(
+  lock_name: string,
+  fn: (tx: postgres.TransactionSql<{}>) => Promise<T>,
+  opts: { label?: string } = {},
+): Promise<T | undefined> => {
+  const name = opts.label ?? lock_name;
+  const t0 = performance.now();
+  let acquired = false;
+  try {
+    const out = (await pg_client.begin(async (tx) => {
+      const rows = await tx<{ ok: boolean }[]>`
+        SELECT pg_try_advisory_xact_lock(${LOCK_NS_JOBS}::int, hashtext(${lock_name}::text)) AS ok,
+               set_config('statement_timeout', ${JOB_STATEMENT_TIMEOUT}, true) AS st`;
+      if (rows[0]?.ok !== true) return undefined;
+      acquired = true;
+      return fn(tx);
+    })) as T | undefined;
     count("JOBS", acquired ? `${name}_ran` : `${name}_skipped`);
     if (acquired) observe_ms("JOBS", `${name}_ms`, performance.now() - t0);
     return out;
@@ -157,5 +197,8 @@ const run_daily = async (
   }
 };
 
-export { run_pg_singleton, run_batched_singleton, run_daily, LOCK_NS_JOBS };
+// redis_lease lives in lease.ts (main Redis connection, usable from CLI
+// scripts); re-exported so §13.8's "jobs.ts: redis_lease" still holds.
+export { redis_lease } from "./lease";
+export { run_pg_singleton, run_pg_singleton_sql, run_batched_singleton, run_daily, LOCK_NS_JOBS };
 export type { Tx, DailyOutcome };

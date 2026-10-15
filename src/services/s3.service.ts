@@ -1,6 +1,19 @@
-import { PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import {
+  PutObjectCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand,
+  DeleteObjectsCommand,
+  HeadObjectCommand,
+  type S3Client,
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { s3Client } from "@/config/s3";
+import { MAX_UPLOAD_FILE_BYTES } from "@/config/upload-limits";
+import type { UploadStore } from "@/services/chunked-upload-core";
 
 const BUCKET_NAME = process.env.S3_BUCKET_NAME || "amigo-profile-images";
 
@@ -80,6 +93,97 @@ export const is_valid_file_type = (mimeType: string): boolean => {
   return mimeType in FILE_TYPE_MAPPINGS;
 };
 
+// Media is served straight from S3 (no API proxy, no CDN yet: D-N7). S3
+// answers `Range: bytes=N-` with 206 + Content-Range, which is all the app's
+// resumable downloads need (SYNC_V2 §14.10); see deploy/S3-LIFECYCLE.md
+// "Downloads" for the exact client rules (If-Range / If-Match / ETag check).
+export const public_object_url = (key: string): string =>
+  `https://${BUCKET_NAME}.s3.${process.env.AWS_REGION || "ap-south-1"}.amazonaws.com/${key}`;
+
+// Same caching contract as upload_file_to_s3: keys are unique and never
+// overwritten (SYNC_V2 §14.7 item 8).
+const IMMUTABLE = "public, max-age=31536000, immutable";
+
+const is_s3_error = (err: unknown, ...names: string[]): boolean => {
+  const e = err as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } } | null;
+  if (!e) return false;
+  return names.includes(e.name ?? "") || names.includes(e.Code ?? "")
+    || (names.includes("NotFound") && e.$metadata?.httpStatusCode === 404);
+};
+
+/**
+ * The S3 half of chunked resumable uploads (services/chunked-upload-core.ts,
+ * SYNC_V2 §14.11). Staging chunks are PRIVATE objects under staging/ (no
+ * ACL: a half-uploaded file is never publicly readable); the final object and
+ * posters are public-read + immutable like every other media object. The
+ * client and bucket are injectable so tests never touch AWS.
+ *
+ * IAM (ops): s3:PutObject (+ PutObjectAcl), s3:GetObject (staging reads),
+ * s3:DeleteObject, s3:AbortMultipartUpload — see deploy/S3-LIFECYCLE.md.
+ */
+export const make_s3_upload_store = (client: S3Client = s3Client, bucket: string = BUCKET_NAME): UploadStore => ({
+  async create_multipart(key, mime) {
+    const r = await client.send(new CreateMultipartUploadCommand({
+      Bucket: bucket, Key: key, ContentType: mime, ACL: "public-read", CacheControl: IMMUTABLE,
+    }));
+    if (!r.UploadId) throw new Error("CreateMultipartUpload returned no UploadId");
+    return r.UploadId;
+  },
+  async put_staging(key, body) {
+    await client.send(new PutObjectCommand({
+      Bucket: bucket, Key: key, Body: body, ContentType: "application/octet-stream",
+    }));
+  },
+  async put_public(key, body, mime) {
+    await client.send(new PutObjectCommand({
+      Bucket: bucket, Key: key, Body: body, ContentType: mime, ACL: "public-read", CacheControl: IMMUTABLE,
+    }));
+  },
+  async get_bytes(key) {
+    const r = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    if (!r.Body) throw new Error(`GetObject ${key}: empty body`);
+    return await r.Body.transformToByteArray();
+  },
+  async upload_part(key, upload_id, n, body) {
+    const r = await client.send(new UploadPartCommand({
+      Bucket: bucket, Key: key, UploadId: upload_id, PartNumber: n, Body: body, ContentLength: body.byteLength,
+    }));
+    if (!r.ETag) throw new Error(`UploadPart ${n} returned no ETag`);
+    return r.ETag;
+  },
+  async complete_multipart(key, upload_id, parts) {
+    await client.send(new CompleteMultipartUploadCommand({
+      Bucket: bucket, Key: key, UploadId: upload_id,
+      MultipartUpload: { Parts: parts.map((p) => ({ PartNumber: p.n, ETag: p.etag })) },
+    }));
+  },
+  async abort_multipart(key, upload_id) {
+    try {
+      await client.send(new AbortMultipartUploadCommand({ Bucket: bucket, Key: key, UploadId: upload_id }));
+    } catch (err) {
+      if (!is_s3_error(err, "NoSuchUpload")) throw err;
+    }
+  },
+  async delete_keys(keys) {
+    for (let i = 0; i < keys.length; i += 1000) {
+      const batch = keys.slice(i, i + 1000);
+      await client.send(new DeleteObjectsCommand({
+        Bucket: bucket, Delete: { Objects: batch.map((Key) => ({ Key })), Quiet: true },
+      }));
+    }
+  },
+  async head_size(key) {
+    try {
+      const r = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+      return typeof r.ContentLength === "number" ? r.ContentLength : null;
+    } catch (err) {
+      if (is_s3_error(err, "NotFound", "NoSuchKey")) return null;
+      throw err;
+    }
+  },
+  public_url: (key) => public_object_url(key),
+});
+
 // Generic file upload function
 export const upload_file_to_s3 = async (
   file: File,
@@ -125,7 +229,7 @@ export const upload_file_to_s3 = async (
     const command = new PutObjectCommand(uploadParams);
     await s3Client.send(command);
 
-    const fileUrl = `https://${BUCKET_NAME}.s3.${process.env.AWS_REGION || "ap-south-1"}.amazonaws.com/${fullKey}`;
+    const fileUrl = public_object_url(fullKey);
 
     return {
       success: true,
@@ -221,7 +325,10 @@ export const generate_profile_image_key = (userId: string, fileName: string): st
   return generate_file_key(userId, fileName, S3_FOLDERS.PROFILE_IMAGES);
 };
 
-// Get file size limits based on file type
+// Per-type upload ceilings. Nothing may exceed MAX_UPLOAD_FILE_BYTES (95 MiB):
+// Cloudflare's free plan refuses bodies over 100 MB — see
+// config/upload-limits.ts. The app mirrors these values
+// (MediaUploadManager._maxUploadBytes) and refuses before uploading.
 export const get_file_size_limit = (mimeType: string): number => {
   const category = get_file_category(mimeType);
 
@@ -230,13 +337,10 @@ export const get_file_size_limit = (mimeType: string): number => {
     case S3_FOLDERS.PROFILE_IMAGES:
       return 15 * 1024 * 1024;
     case S3_FOLDERS.AUDIOS:
-      return 100 * 1024 * 1024;
     case S3_FOLDERS.VIDEOS:
-      return 400 * 1024 * 1024;
     case S3_FOLDERS.DOCS:
-      return 500 * 1024 * 1024;
     default:
-      return 500 * 1024 * 1024;
+      return MAX_UPLOAD_FILE_BYTES;
   }
 };
 

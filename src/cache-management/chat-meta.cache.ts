@@ -3,6 +3,11 @@ import db from "@/config/db";
 import { chat_model } from "@/models/chat.model";
 import { and, eq, isNull, lte, or, sql } from "drizzle-orm";
 import { MessageType } from "@/types/chat.types";
+import { sync_v2_flags } from "@/services/app-settings.service";
+import { v2_on } from "@/services/sync/flags-core";
+import { count } from "@/utils/counters";
+import { bind_meta_cas } from "./chat-meta-cas";
+import { strip_list } from "@/utils/attachment-thumbs";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Redis hash: chat_meta:{chat_id}
@@ -22,6 +27,40 @@ type ChatMetaFields = {
   // sender_name: string;
   sent_at: string; // ISO timestamp
   attachments?: unknown; // [{url, mime, size, key, thumbnail}] — null/missing for text
+  // SYNC_V2 §3.5 (write side only; never read back into a payload): the
+  // message's seq and server arrival time. With sync_v2 'on' a write that
+  // carries a seq is a compare-and-set on the hash's `seq` field.
+  seq?: number | null;
+  srv_ts?: string | null;
+};
+
+// Bound lazily: only sync_v2 'on' ever runs the script.
+let meta_cas: ReturnType<typeof bind_meta_cas> | null = null;
+const cas = () => (meta_cas ??= bind_meta_cas(redis));
+
+// Use the seq-CAS for this write? Only in 'on' and only when the caller knows
+// the seq (a numbered chat's insert returned it). Off / shadow keep the plain
+// last-writer-wins HSET, byte-for-byte the old hash.
+const use_cas = (msg: ChatMetaFields): msg is ChatMetaFields & { seq: number } =>
+  typeof msg.seq === "number" && Number.isFinite(msg.seq) && v2_on(sync_v2_flags());
+
+// A list preview never needs the inline thumbs (§14.7 item 5): they stay out
+// of the chat_meta hash (strip_list is identity when there are none).
+const meta_attachments = (a: unknown): string => (a != null ? JSON.stringify(strip_list(a)) : "");
+
+const meta_hash_fields = (msg: ChatMetaFields): Record<string, string> => ({
+  id: msg.id,
+  body: msg.body ?? "",
+  type: msg.type,
+  sender_id: msg.sender_id,
+  sent_at: msg.sent_at,
+  attachments: meta_attachments(msg.attachments),
+});
+
+const note_cas = (r: number, chat_id: string): void => {
+  if (r === 1) count("META", "cas_written");
+  else if (r === 0) count("META", "cas_refused");
+  else console.error(`[CACHE] chat_meta CAS failed for chat ${chat_id}`);
 };
 
 // Cached chats.disappearing_after_sec. Separate field on the same hash so
@@ -60,6 +99,12 @@ const parse_chat_meta_row = (raw: Record<string, string> | null | undefined): Ch
  */
 const update_chat_meta = async (chat_id: string, msg: ChatMetaFields): Promise<void> => {
   try {
+    if (use_cas(msg)) {
+      const fields = meta_hash_fields(msg);
+      if (msg.srv_ts) fields.srv_ts = msg.srv_ts;
+      note_cas(await cas().cas(chat_meta_key(chat_id), msg.seq, fields), chat_id);
+      return;
+    }
     await redis.hset(chat_meta_key(chat_id), {
       id: msg.id,
       body: msg.body ?? "",
@@ -67,7 +112,7 @@ const update_chat_meta = async (chat_id: string, msg: ChatMetaFields): Promise<v
       sender_id: msg.sender_id,
       // sender_name: msg.sender_name ?? "",
       sent_at: msg.sent_at,
-      attachments: msg.attachments != null ? JSON.stringify(msg.attachments) : "",
+      attachments: meta_attachments(msg.attachments),
     });
   } catch (err) {
     console.error(`[CACHE] update_chat_meta failed for chat ${chat_id}:`, err);
@@ -76,7 +121,9 @@ const update_chat_meta = async (chat_id: string, msg: ChatMetaFields): Promise<v
 
 // Fields of the hash that describe the last message. Deliberately enumerated
 // so a clear never touches DISAPPEARING_FIELD, which lives on the same hash.
-const LAST_MESSAGE_FIELDS = ["id", "body", "type", "sender_id", "sent_at", "attachments"] as const;
+// `seq` / `srv_ts` (sync_v2 'on' writes) go too: a rewind must also clear the
+// CAS guard, or the next (lower-seq) refill would be refused.
+const LAST_MESSAGE_FIELDS = ["id", "body", "type", "sender_id", "sent_at", "attachments", "seq", "srv_ts"] as const;
 
 /**
  * Drop ONLY the last-message fields, leaving the disappearing setting intact.
@@ -115,6 +162,12 @@ const clear_chat_meta_message = async (chat_id: string): Promise<void> => {
  * one case where the pointer must legitimately move BACKWARD: repointing after
  * the newest message was deleted.
  *
+ * SYNC_V2 §3.3.4: the Postgres half only writes while the chat is NOT
+ * numbered (seq_head IS NULL, in the same WHERE — no extra round trip). On a
+ * numbered chat the clock owns the pointer: messages_bi moves last_seq /
+ * last_msg_id in the allocating UPDATE and the delete triggers rewind it, by
+ * seq. A sent_at-ordered write from here would fight them.
+ *
  * The Redis half stays last-writer-wins (unchanged behaviour — making it
  * monotonic would need a read-modify-write or a Lua script on the send path).
  * The two can therefore disagree for an offline-queued message that lands with
@@ -124,7 +177,11 @@ const clear_chat_meta_message = async (chat_id: string): Promise<void> => {
 const set_last_message = async (
   chat_id: string,
   msg: ChatMetaFields,
-  opts?: { allow_rewind?: boolean; },
+  // numbered: the caller KNOWS the chat is numbered — its INSERT returned a
+  // seq, so messages_bi already moved the pointer in that same statement.
+  // The PG half is then skipped outright: one round trip less on every send
+  // (the guarded UPDATE below would match no row anyway).
+  opts?: { allow_rewind?: boolean; numbered?: boolean; },
 ): Promise<void> => {
   // sent_at travels as an ISO string in the hash but must be a Date for the
   // timestamptz column; fall back to now() rather than writing a NULL pointer.
@@ -133,14 +190,15 @@ const set_last_message = async (
 
   await Promise.all([
     update_chat_meta(chat_id, { ...msg, sent_at: sent_at.toISOString() }),
-    db
+    opts?.numbered ? Promise.resolve() : db
       .update(chat_model)
       .set({ last_msg_id: msg.id, last_msg_at: sent_at })
       .where(
         opts?.allow_rewind
-          ? eq(chat_model.id, chat_id)
+          ? and(eq(chat_model.id, chat_id), isNull(chat_model.seq_head))
           : and(
             eq(chat_model.id, chat_id),
+            isNull(chat_model.seq_head),
             or(isNull(chat_model.last_msg_at), lte(chat_model.last_msg_at, sent_at)),
           ),
       )
@@ -178,18 +236,30 @@ const batch_set_last_message = async (
 
   const redis_half = (async () => {
     try {
-      const pipe = redis.pipeline();
-      for (const { chat_id, msg } of normalized) {
-        pipe.hset(chat_meta_key(chat_id), {
-          id: msg.id,
-          body: msg.body ?? "",
-          type: msg.type,
-          sender_id: msg.sender_id,
-          sent_at: msg.sent_at,
-          attachments: msg.attachments != null ? JSON.stringify(msg.attachments) : "",
-        });
-      }
-      await pipe.exec();
+      // sync_v2 'on': entries with a seq go through the seq-CAS (one
+      // pipeline); the rest keep the plain HSET pipeline. Both in parallel.
+      const cas_entries = normalized.filter(({ msg }) => use_cas(msg));
+      const plain = cas_entries.length === normalized.length
+        ? []
+        : normalized.filter(({ msg }) => !use_cas(msg));
+      const plain_half = (async () => {
+        if (plain.length === 0) return;
+        const pipe = redis.pipeline();
+        for (const { chat_id, msg } of plain) {
+          pipe.hset(chat_meta_key(chat_id), meta_hash_fields(msg));
+        }
+        await pipe.exec();
+      })();
+      const cas_half = (async () => {
+        if (cas_entries.length === 0) return;
+        const res = await cas().cas_many(cas_entries.map(({ chat_id, msg }) => {
+          const fields = meta_hash_fields(msg);
+          if (msg.srv_ts) fields.srv_ts = msg.srv_ts;
+          return { key: chat_meta_key(chat_id), seq: msg.seq as number, fields };
+        }));
+        res.forEach((r, i) => note_cas(r, cas_entries[i]!.chat_id));
+      })();
+      await Promise.all([plain_half, cas_half]);
     } catch (err) {
       console.error(`[CACHE] batch_set_last_message redis half failed (${normalized.length} chats):`, err);
     }
@@ -207,6 +277,7 @@ const batch_set_last_message = async (
             last_msg_at = v.sent_at
         FROM (VALUES ${sql.join(rows, sql`, `)}) AS v(chat_id, msg_id, sent_at)
         WHERE c.id = v.chat_id
+          AND c.seq_head IS NULL  -- numbered chats: the clock owns the pointer (§3.3.4)
           AND (c.last_msg_at IS NULL OR c.last_msg_at <= v.sent_at)
       `);
     } catch (err) {
