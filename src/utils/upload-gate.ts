@@ -5,8 +5,9 @@ import { count } from "@/utils/counters";
 // =============================================================================
 // The legacy upload routes buffer the whole multipart body in this process
 // (Bun's formData), then copy it again for the S3 PutObject (s3.service.ts
-// file.arrayBuffer()). A handful of 100–500 MB uploads at once can push the
-// worker past its cgroup MemoryMax, and an OOM kill drops all ~2.6k sockets
+// file.arrayBuffer()). A handful of near-cap uploads (95 MiB each, see
+// config/upload-limits.ts) at once can push the worker past its cgroup
+// MemoryMax, and an OOM kill drops all ~2.6k sockets
 // — far worse than asking one uploader to retry. So, per worker: at most
 // MAX_LARGE_UPLOADS requests whose body is larger than LARGE_UPLOAD_BYTES may
 // be in flight; the next one gets 503 + Retry-After before its body is read.
