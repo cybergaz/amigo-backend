@@ -1,5 +1,6 @@
 import { redis } from "@/config/redis";
 import { ActiveCall } from "@/services/livekit.service";
+import { create_call_reservations, user_call_key } from "./call-reserve";
 
 /**
  * Backstop TTL for every call cache key.
@@ -17,7 +18,7 @@ function getCallKey(call_id: string): string {
 }
 
 function getUserCallKey(user_id: string): string {
-  return `calls:user:${user_id}`;
+  return user_call_key(user_id);
 }
 
 /**
@@ -49,6 +50,10 @@ function serializeActiveCall(call: ActiveCall): Record<string, string> {
   return row;
 }
 
+// Atomic busy reservation (SYNC_V2 §13.7 G1, call-reserve.ts). initiate_call
+// reserves both parties with it instead of GET-then-SET.
+const call_reservations = create_call_reservations(redis, CALL_CACHE_TTL_SECONDS);
+
 async function setUserCallCache(call_id: string, user_id: string) {
   try {
     await redis.set(getUserCallKey(user_id), call_id, "EX", CALL_CACHE_TTL_SECONDS);
@@ -70,6 +75,7 @@ async function setActiveCallsCache(activeCall: ActiveCall) {
 }
 
 export {
+  call_reservations,
   setUserCallCache,
   setActiveCallsCache,
   serializeActiveCall,

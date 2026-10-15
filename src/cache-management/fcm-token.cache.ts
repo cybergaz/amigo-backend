@@ -1,9 +1,12 @@
 import "dotenv/config";
 import LRUCache from "@/utils/cache.utils";
-import { redis, get_new_redis_client } from "@/config/redis";
+import { redis } from "@/config/redis";
+import { bus } from "@/cluster/bus";
+import { legacy } from "@/cluster/keys";
 import db from "@/config/db";
 import { user_model } from "@/models/user.model";
 import { and, eq, ne } from "drizzle-orm";
+import { EpochGuard } from "./cache-epoch";
 
 // ============================================================================
 // Three-tier FCM Token Cache
@@ -19,6 +22,14 @@ const REDIS_TTL_SECONDS = 30 * 24 * 60 * 60;  // 1 month
 // --- Tier 1: LRU in-memory cache ---
 // user_id → fcm_token (hot cache, 10min TTL)
 const fcm_token_lru = new LRUCache<string, string>(5000, LRU_TTL_MS);
+// SYNC_V2 §13.7 E3: a token read that overlapped a store / remove / steal
+// must not refill the LRU with the superseded token — that is the
+// previous-owner push leak again, for a whole TTL (cache-epoch.ts).
+const fcm_epoch = new EpochGuard();
+const drop_fcm_lru = (user_id: string) => {
+  fcm_token_lru.delete(user_id);
+  fcm_epoch.bump(user_id);
+};
 
 // --- Helper: Redis key for a user's FCM token ---
 const redis_fcm_key = (user_id: string) => `fcm:user:${user_id}:token`;
@@ -36,33 +47,25 @@ const redis_fcm_key = (user_id: string) => `fcm:user:${user_id}:token`;
 // (which is already authoritative by the time we publish).
 //
 // ioredis cannot mix subscribe-mode with normal commands on one connection, so
-// the subscriber gets its own client — same pattern as user-peer.cache.ts.
+// invalidations arrive on the worker's one subscriber (cluster/bus.ts).
 // ============================================================================
 
-const INVALIDATE_CHANNEL = "fcm:invalidate";
+const INVALIDATE_CHANNEL = legacy.fcm_invalidate_channel;
 // payload format: user_id
 
-let _sub_started = false;
-const start_invalidation_subscriber = (): void => {
-  if (_sub_started) return;
-  _sub_started = true;
-  try {
-    const sub = get_new_redis_client();
-    sub.subscribe(INVALIDATE_CHANNEL, (err) => {
-      if (err) console.error("[FCM-CACHE] invalidation subscribe failed:", err);
-    });
-    sub.on("message", (channel, message) => {
-      if (channel !== INVALIDATE_CHANNEL) return;
-      fcm_token_lru.delete(message);
-    });
-  } catch (err) {
-    // A broken pub/sub must never break token storage — the LRU just stays
-    // process-local (pre-existing behaviour) until the next restart.
-    console.error("[FCM-CACHE] invalidation subscriber setup failed:", err);
-  }
-};
+// The shared bus subscriber (cluster/bus.ts, RC-2) replaces this module's own
+// subscriber connection. A broken pub/sub still never breaks token storage:
+// the LRU just stays process-local until the bus reconnects.
+bus.on(INVALIDATE_CHANNEL, (message) => {
+  drop_fcm_lru(message);
+});
 
-start_invalidation_subscriber();
+// Invalidations published while the subscriber was away are lost: drop every
+// cached token (the next push re-reads Redis, one GET per user).
+bus.on_resync(() => {
+  fcm_token_lru.clear();
+  fcm_epoch.bump_all();
+});
 
 const publish_fcm_invalidation = async (user_id: string): Promise<void> => {
   try {
@@ -116,6 +119,9 @@ async function store_fcm_token(
   }
 
   // --- Tier 1: LRU ---
+  // bump first: a read that started before this write must not overwrite
+  // the new token with the one it loaded earlier.
+  fcm_epoch.bump(user_id);
   fcm_token_lru.set(user_id, fcm_token, LRU_TTL_MS);
 
   // --- Tier 2 + 3: Redis & DB in parallel (fire-and-forget, errors logged) ---
@@ -162,6 +168,7 @@ async function fetch_fcm_token(user_id: string): Promise<string | null> {
   if (lru_token !== null) {
     return lru_token;
   }
+  const snap = fcm_epoch.snapshot();
 
   // --- Tier 2: Redis ---
   try {
@@ -169,8 +176,8 @@ async function fetch_fcm_token(user_id: string): Promise<string | null> {
     const redis_token = await redis.get(key);
 
     if (redis_token !== null) {
-      // Populate LRU cache for future reads
-      fcm_token_lru.set(user_id, redis_token, LRU_TTL_MS);
+      // Populate LRU cache for future reads (unless invalidated meanwhile)
+      if (fcm_epoch.may_set(user_id, snap)) fcm_token_lru.set(user_id, redis_token, LRU_TTL_MS);
       return redis_token;
     }
   } catch (err) {
@@ -188,7 +195,11 @@ async function fetch_fcm_token(user_id: string): Promise<string | null> {
     const db_token = db_user[0]?.fcm_token || null;
 
     if (db_token !== null) {
-      // Populate both LRU and Redis for future reads
+      // Populate both LRU and Redis for future reads. Both only if no
+      // invalidation overlapped this read: a store / remove that landed
+      // meanwhile already wrote Redis, and re-populating it from the older DB
+      // read would undo that.
+      if (!fcm_epoch.may_set(user_id, snap)) return db_token;
       fcm_token_lru.set(user_id, db_token, LRU_TTL_MS);
       
       const redis_populate_promise = (async () => {
@@ -218,7 +229,7 @@ async function fetch_fcm_token(user_id: string): Promise<string | null> {
 // ============================================================================
 async function remove_fcm_token(user_id: string): Promise<void> {
   // --- Tier 1: LRU ---
-  fcm_token_lru.delete(user_id);
+  drop_fcm_lru(user_id);
 
   // --- Tier 2 + 3: Redis & DB in parallel (fire-and-forget, errors logged) ---
   const redis_promise = (async () => {

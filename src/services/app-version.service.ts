@@ -1,4 +1,5 @@
 import { redis } from "@/config/redis";
+import { SETTINGS, publish_settings_invalidation } from "@/cluster/settings-invalidate";
 
 export type AppPlatform = "android" | "ios";
 
@@ -19,12 +20,18 @@ const DEFAULT_STORE_URL: Record<AppPlatform, string> = {
   ios: "https://apps.apple.com/app/id0",
 };
 
-// Tiny in-memory cache so the public endpoint doesn't hammer Redis.
-// Anything served from here is at most CACHE_TTL_MS stale, which is
-// fine — the gate is not safety-critical and the script that sets a
-// new version will see the next request hit Redis fresh.
+// Tiny in-memory cache so the public endpoint doesn't hammer Redis. The
+// version is set by a CLI script (another process), so before RC-3 every
+// worker served the old gate for up to CACHE_TTL_MS; set_app_version now
+// publishes settings:invalidate and every worker drops its copy (E6). The
+// TTL only bounds a lost message.
 const CACHE_TTL_MS = 60_000;
 const cache = new Map<AppPlatform, { value: AppVersionInfo; expires: number }>();
+
+export const invalidate_app_version_cache = (platform?: AppPlatform): void => {
+  if (platform) cache.delete(platform);
+  else cache.clear();
+};
 
 export const get_app_version = async (
   platform: AppPlatform,
@@ -88,6 +95,7 @@ export const set_app_version = async (
   await redis.hset(key, fields);
 
   cache.delete(input.platform);
+  await publish_settings_invalidation(SETTINGS.app_version(input.platform));
 
   return {
     platform: input.platform,

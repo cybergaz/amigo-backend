@@ -1,9 +1,13 @@
 import "dotenv/config"
 import LRUCache from '@/utils/cache.utils';
-import { get_new_redis_client, redis } from '@/config/redis';
+import { redis } from '@/config/redis';
+import { bus } from '@/cluster/bus';
+import { legacy } from '@/cluster/keys';
 import db from '@/config/db';
 import { chat_member_model } from '@/models/chat.model';
 import { and, count, eq, isNotNull, isNull } from 'drizzle-orm';
+import { EpochGuard } from './cache-epoch';
+import { count as counter } from '@/utils/counters';
 
 if (!process.env.REDIS_URL) {
   throw new Error("REDIS_URL is not defined in environment variables can't proceed");
@@ -11,11 +15,11 @@ if (!process.env.REDIS_URL) {
 
 // ────────────────────────────────────────────────────────────────────────────
 // 3-tier membership caches
-//   conv_user_cache (LRU, 1–5 min)  ─┐
+//   conv_user_cache (LRU, 30–60 s)  ─┐
 //   redis "conv:{id}:members" set    ├─ chat_id → user_ids
 //   chat_member_model (DB)          ─┘
 //
-//   user_conv_cache (LRU, 5 min)    ─┐
+//   user_conv_cache (LRU, 60 s)     ─┐
 //   redis "user_conv:{id}" set       ├─ user_id → chat_ids
 //   chat_member_model (DB)          ─┘
 // ────────────────────────────────────────────────────────────────────────────
@@ -23,8 +27,27 @@ if (!process.env.REDIS_URL) {
 const conv_user_cache = new LRUCache<string, Set<string>>(); // chat_id -> user_ids
 const user_conv_cache = new LRUCache<string, Set<string>>(); // user_id -> chat_ids
 
+// SYNC_V2 §13.7 E1: membership decides who gets a chat's messages, pending
+// entries and pushes, so a stale per-process copy is a privacy / delivery
+// bug, not a cosmetic one. Invalidations ride pub/sub (best effort; one lost
+// outside a bus reconnect is only bounded by the TTL), so the TTL is capped
+// at 60 s (was 1–5 min). At N=1 every write path also drops the local copy
+// directly; the cost is one Redis SMEMBERS per hot chat per ≤ 60 s.
+const conv_epoch = new EpochGuard();
+const user_conv_epoch = new EpochGuard();
+const drop_conv_lru = (chat_id: string) => {
+  conv_user_cache.delete(chat_id);
+  conv_epoch.bump(chat_id);
+};
+const drop_user_conv_lru = (user_id: string) => {
+  user_conv_cache.delete(user_id);
+  user_conv_epoch.bump(user_id);
+};
+
 const REDIS_TTL_SEC = 24 * 60 * 60;             // 24h
-const USER_CONV_LRU_TTL_MS = 5 * 60 * 1000;     // 5 min
+const CONV_LRU_TTL_MIN_MS = 30 * 1000;          // jittered 30–60 s so entries
+const CONV_LRU_TTL_MAX_MS = 60 * 1000;          // don't all expire together
+const USER_CONV_LRU_TTL_MS = 60 * 1000;         // 60 s
 
 const conv_members_key = (chat_id: string) => `conv:${chat_id}:members`;
 const user_conv_key = (user_id: string) => `user_conv:${user_id}`;
@@ -44,6 +67,17 @@ redis.call('EXPIRE', KEYS[1], ARGV[1])
 return 1
 `;
 
+// Cold-read hydrate: SADD + EXPIRE only while the key is still ABSENT, so a
+// read whose DB snapshot is older never merges its members into a set that
+// a newer hydrate (or a membership write) created meanwhile.
+// KEYS[1] = set key; ARGV[1] = ttl seconds; ARGV[2..] = members.
+const HYDRATE_IF_ABSENT_LUA = `
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+for i = 2, #ARGV do redis.call('SADD', KEYS[1], ARGV[i]) end
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return 1
+`;
+
 // ────────────────────────────────────────────────────────────────────────────
 // Pub/sub invalidation
 //
@@ -54,32 +88,34 @@ return 1
 //   "user:{id}" → user_id invalidation
 // ────────────────────────────────────────────────────────────────────────────
 
-const INVALIDATE_CHANNEL = "conv:invalidate";
+const INVALIDATE_CHANNEL = legacy.conv_invalidate_channel;
 
-const sub = get_new_redis_client(process.env.REDIS_URL);
-sub.subscribe(INVALIDATE_CHANNEL, (err, count) => {
-  if (err) {
-    console.error("Failed to subscribe: ", err);
-  } else {
-    console.log(`Subscribed successfully to "${INVALIDATE_CHANNEL}", This client is currently subscribed to ${count} channels.`);
-  }
-});
-
-sub.on("message", (channel, message) => {
-  if (channel !== INVALIDATE_CHANNEL) return;
+// Delivered by the worker's shared bus subscriber (cluster/bus.ts, RC-2) —
+// this module used to open its own subscriber connection.
+bus.on(INVALIDATE_CHANNEL, (message) => {
   const idx = message.indexOf(":");
   if (idx < 0) {
     // Legacy bare-id payload — assume chat_id
-    conv_user_cache.delete(message);
+    drop_conv_lru(message);
     return;
   }
   const kind = message.slice(0, idx);
   const id = message.slice(idx + 1);
   if (kind === "conv") {
-    conv_user_cache.delete(id);
+    drop_conv_lru(id);
   } else if (kind === "user") {
-    user_conv_cache.delete(id);
+    drop_user_conv_lru(id);
   }
+});
+
+// E1: the subscriber came back from a disconnect — invalidations published
+// meanwhile are lost (pub/sub has no replay), so nothing held is trusted,
+// including reads that are in flight right now.
+bus.on_resync(() => {
+  conv_user_cache.clear();
+  user_conv_cache.clear();
+  conv_epoch.bump_all();
+  user_conv_epoch.bump_all();
 });
 
 const publish_conv_invalidation = async (chat_id: string): Promise<void> => {
@@ -108,6 +144,7 @@ const publish_user_conv_invalidation = async (user_id: string): Promise<void> =>
 // indexed COUNT per sample. Log only — the next expiry/invalidation heals it.
 const MEMBERS_DRIFT_SAMPLE_RATE = 0.01;
 let members_drift_count = 0;
+const count_hydrate_skipped = () => counter("MEMBERS", "hydrate_skipped_epoch");
 
 const check_members_drift = async (conv_id: string, cached_size: number): Promise<void> => {
   try {
@@ -137,6 +174,7 @@ const check_members_drift = async (conv_id: string, cached_size: number): Promis
 const get_conversation_members = async (conv_id: string): Promise<Set<string>> => {
   const cached = conv_user_cache.get(conv_id);
   if (cached !== null) return cached;
+  const snap = conv_epoch.snapshot();
 
   try {
     const redis_key = conv_members_key(conv_id);
@@ -170,18 +208,29 @@ const get_conversation_members = async (conv_id: string): Promise<Set<string>> =
           .filter((id): id is string => id !== null)
       );
 
-      // Hydrate Redis (single round-trip via pipeline)
+      // Hydrate Redis (one round trip) — unless this chat's membership was
+      // invalidated while the DB read was out (E1 epoch, as fcm-token.cache
+      // does): the read may predate a removal whose SREM found no key to
+      // remove from, and its set would then fan out to the removed member
+      // for the key's 24 h. Every write path bumps the epoch in-process (all
+      // of them at N=1); a sibling's arrives over the bus, so at N>1 a
+      // removal racing a cold read can still slip through until the next
+      // invalidation or expiry (tracked for RC-4).
       if (members.size > 0) {
-        const pipe = redis.pipeline();
-        pipe.sadd(redis_key, ...Array.from(members));
-        pipe.expire(redis_key, REDIS_TTL_SEC);
-        await pipe.exec();
+        if (conv_epoch.may_set(conv_id, snap)) {
+          await redis.eval(HYDRATE_IF_ABSENT_LUA, 1, redis_key, REDIS_TTL_SEC, ...Array.from(members));
+        } else {
+          count_hydrate_skipped();
+        }
       }
     }
 
-    // Random LRU TTL between 1–5 min so caches don't all expire together
-    const randomTTL = Math.floor(Math.random() * (300000 - 60000 + 1)) + 60000;
-    conv_user_cache.set(conv_id, members, randomTTL);
+    // Jittered TTL so caches don't all expire together. Skipped when the
+    // chat was invalidated while this read was out (E1 epoch guard).
+    if (conv_epoch.may_set(conv_id, snap)) {
+      const ttl = CONV_LRU_TTL_MIN_MS + Math.floor(Math.random() * (CONV_LRU_TTL_MAX_MS - CONV_LRU_TTL_MIN_MS + 1));
+      conv_user_cache.set(conv_id, members, ttl);
+    }
 
     return members;
   } catch (error) {
@@ -193,6 +242,7 @@ const get_conversation_members = async (conv_id: string): Promise<Set<string>> =
 const get_user_conversations = async (user_id: string): Promise<Set<string>> => {
   const cached = user_conv_cache.get(user_id);
   if (cached !== null) return cached;
+  const snap = user_conv_epoch.snapshot();
 
   try {
     const redis_key = user_conv_key(user_id);
@@ -221,15 +271,19 @@ const get_user_conversations = async (user_id: string): Promise<Set<string>> => 
           .filter((id): id is string => id !== null)
       );
 
+      // Same epoch guard as the member set above.
       if (conv_set.size > 0) {
-        const pipe = redis.pipeline();
-        pipe.sadd(redis_key, ...Array.from(conv_set));
-        pipe.expire(redis_key, REDIS_TTL_SEC);
-        await pipe.exec();
+        if (user_conv_epoch.may_set(user_id, snap)) {
+          await redis.eval(HYDRATE_IF_ABSENT_LUA, 1, redis_key, REDIS_TTL_SEC, ...Array.from(conv_set));
+        } else {
+          count_hydrate_skipped();
+        }
       }
     }
 
-    user_conv_cache.set(user_id, conv_set, USER_CONV_LRU_TTL_MS);
+    if (user_conv_epoch.may_set(user_id, snap)) {
+      user_conv_cache.set(user_id, conv_set, USER_CONV_LRU_TTL_MS);
+    }
     return conv_set;
   } catch (error) {
     console.error(`[CACHE] Error fetching user conversations for user_id ${user_id}:`, error);
@@ -268,8 +322,8 @@ const add_member = async (user_id: string, chat_id: string): Promise<void> => {
     pipe.eval(SADD_IF_EXISTS_LUA, 1, user_conv_key(user_id), REDIS_TTL_SEC, chat_id);
     await pipe.exec();
 
-    conv_user_cache.delete(chat_id);
-    user_conv_cache.delete(user_id);
+    drop_conv_lru(chat_id);
+    drop_user_conv_lru(user_id);
     await publish_conv_invalidation(chat_id);
     await publish_user_conv_invalidation(user_id);
   } catch (err) {
@@ -287,8 +341,8 @@ const add_members = async (user_ids: string[], chat_id: string): Promise<void> =
     }
     await pipe.exec();
 
-    conv_user_cache.delete(chat_id);
-    for (const uid of user_ids) user_conv_cache.delete(uid);
+    drop_conv_lru(chat_id);
+    for (const uid of user_ids) drop_user_conv_lru(uid);
     await publish_conv_invalidation(chat_id);
     for (const uid of user_ids) await publish_user_conv_invalidation(uid);
   } catch (err) {
@@ -320,8 +374,8 @@ const add_members_bulk = async (
     }
     await pipe.exec();
 
-    for (const { chat_id } of work) conv_user_cache.delete(chat_id);
-    for (const uid of touched_users) user_conv_cache.delete(uid);
+    for (const { chat_id } of work) drop_conv_lru(chat_id);
+    for (const uid of touched_users) drop_user_conv_lru(uid);
 
     const pub = redis.pipeline();
     for (const { chat_id } of work) pub.publish(INVALIDATE_CHANNEL, `conv:${chat_id}`);
@@ -339,8 +393,8 @@ const remove_member = async (user_id: string, chat_id: string): Promise<void> =>
     pipe.srem(user_conv_key(user_id), chat_id);
     await pipe.exec();
 
-    conv_user_cache.delete(chat_id);
-    user_conv_cache.delete(user_id);
+    drop_conv_lru(chat_id);
+    drop_user_conv_lru(user_id);
     await publish_conv_invalidation(chat_id);
     await publish_user_conv_invalidation(user_id);
   } catch (err) {
@@ -351,7 +405,7 @@ const remove_member = async (user_id: string, chat_id: string): Promise<void> =>
 const invalidate_conversation = async (chat_id: string): Promise<void> => {
   try {
     await redis.del(conv_members_key(chat_id));
-    conv_user_cache.delete(chat_id);
+    drop_conv_lru(chat_id);
     await publish_conv_invalidation(chat_id);
   } catch (err) {
     console.error(`[CACHE] invalidate_conversation failed (${chat_id}):`, err);
@@ -361,7 +415,7 @@ const invalidate_conversation = async (chat_id: string): Promise<void> => {
 const invalidate_user_conversations = async (user_id: string): Promise<void> => {
   try {
     await redis.del(user_conv_key(user_id));
-    user_conv_cache.delete(user_id);
+    drop_user_conv_lru(user_id);
     await publish_user_conv_invalidation(user_id);
   } catch (err) {
     console.error(`[CACHE] invalidate_user_conversations failed (${user_id}):`, err);

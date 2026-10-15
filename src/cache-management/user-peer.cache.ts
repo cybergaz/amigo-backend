@@ -1,9 +1,12 @@
-import { redis, get_new_redis_client } from "@/config/redis";
+import { redis } from "@/config/redis";
+import { bus } from "@/cluster/bus";
+import { legacy } from "@/cluster/keys";
 import db from "@/config/db";
 import { chat_member_model } from "@/models/chat.model";
 import { and, eq, isNull, inArray } from "drizzle-orm";
 import LRUCache from "@/utils/cache.utils";
 import { get_conversation_members } from "./conv.cache";
+import { EpochGuard } from "./cache-epoch";
 
 // ────────────────────────────────────────────────────────────────────────────
 // 3-tier peer cache (mirrors conv.cache layout):
@@ -21,6 +24,14 @@ const LRU_TTL_MS = 10 * 60 * 1000;     // 10 min
 const user_peers_key = (user_id: string) => `user_peers:${user_id}`;
 
 const user_peers_cache = new LRUCache<string, Set<string>>();
+// SYNC_V2 §13.7 E2: a peer-set read that overlapped an invalidation must not
+// refill the LRU with the pre-change set (cache-epoch.ts); a bus resync drops
+// everything (on_resync below).
+const peers_epoch = new EpochGuard();
+const drop_peers_lru = (user_id: string) => {
+  user_peers_cache.delete(user_id);
+  peers_epoch.bump(user_id);
+};
 
 const load_peers_from_db = async (user_id: string): Promise<string[]> => {
   const own_chats = await db
@@ -59,6 +70,7 @@ const get_user_peers = async (user_id: string): Promise<Set<string>> => {
   // Tier 1: LRU
   const lru_hit = user_peers_cache.get(user_id);
   if (lru_hit !== null) return lru_hit;
+  const snap = peers_epoch.snapshot();
 
   try {
     // Tier 2: Redis
@@ -79,7 +91,7 @@ const get_user_peers = async (user_id: string): Promise<Set<string>> => {
       }
     }
 
-    user_peers_cache.set(user_id, peers_set, LRU_TTL_MS);
+    if (peers_epoch.may_set(user_id, snap)) user_peers_cache.set(user_id, peers_set, LRU_TTL_MS);
     return peers_set;
   } catch (err) {
     console.error(`[CACHE] get_user_peers failed (${user_id}):`, err);
@@ -120,8 +132,8 @@ const add_peer = async (user_id: string, peer_id: string): Promise<void> => {
     pipe.expire(user_peers_key(peer_id), REDIS_TTL_SEC);
     await pipe.exec();
 
-    user_peers_cache.delete(user_id);
-    user_peers_cache.delete(peer_id);
+    drop_peers_lru(user_id);
+    drop_peers_lru(peer_id);
     await publish_peer_invalidation(user_id);
     await publish_peer_invalidation(peer_id);
   } catch (err) {
@@ -143,8 +155,8 @@ const add_peers = async (user_id: string, peer_ids: string[]): Promise<void> => 
     }
     await pipe.exec();
 
-    user_peers_cache.delete(user_id);
-    for (const p of valid) user_peers_cache.delete(p);
+    drop_peers_lru(user_id);
+    for (const p of valid) drop_peers_lru(p);
     await publish_peer_invalidation(user_id);
     for (const p of valid) await publish_peer_invalidation(p);
   } catch (err) {
@@ -162,8 +174,8 @@ const remove_peer = async (user_id: string, peer_id: string): Promise<void> => {
     pipe.srem(user_peers_key(peer_id), user_id);
     await pipe.exec();
 
-    user_peers_cache.delete(user_id);
-    user_peers_cache.delete(peer_id);
+    drop_peers_lru(user_id);
+    drop_peers_lru(peer_id);
     await publish_peer_invalidation(user_id);
     await publish_peer_invalidation(peer_id);
   } catch (err) {
@@ -171,16 +183,18 @@ const remove_peer = async (user_id: string, peer_id: string): Promise<void> => {
   }
 };
 
-const INVALIDATE_CHANNEL = "user_peer:invalidate";
+const INVALIDATE_CHANNEL = legacy.user_peer_invalidate_channel;
 // payload format: user_id
 
-const _local_sub = get_new_redis_client();
-_local_sub.subscribe(INVALIDATE_CHANNEL, (err) => {
-  if (err) console.error("[CACHE] user_peer invalidation subscribe failed:", err);
+// Shared bus subscriber (cluster/bus.ts, RC-2), not a private connection.
+bus.on(INVALIDATE_CHANNEL, (message) => {
+  drop_peers_lru(message);
 });
-_local_sub.on("message", (channel, message) => {
-  if (channel !== INVALIDATE_CHANNEL) return;
-  user_peers_cache.delete(message);
+
+// Invalidations published while the subscriber was away are lost.
+bus.on_resync(() => {
+  user_peers_cache.clear();
+  peers_epoch.bump_all();
 });
 
 const publish_peer_invalidation = async (user_id: string): Promise<void> => {
@@ -194,7 +208,7 @@ const publish_peer_invalidation = async (user_id: string): Promise<void> => {
 const invalidate_peers = async (user_id: string): Promise<void> => {
   try {
     await redis.del(user_peers_key(user_id));
-    user_peers_cache.delete(user_id);
+    drop_peers_lru(user_id);
     await publish_peer_invalidation(user_id);
   } catch (err) {
     console.error(`[CACHE] invalidate_peers failed (${user_id}):`, err);
@@ -230,23 +244,15 @@ type PeerInvalidationHandlers = {
   on_peer_invalidated?: (user_id: string) => void | Promise<void>;
 };
 
+// Extra listener for peer invalidations (no caller today). Rides the shared
+// bus instead of opening one more subscriber connection per call.
 const subscribe_peer_invalidations = (
   handlers: PeerInvalidationHandlers,
 ): (() => Promise<void>) => {
-  const sub = get_new_redis_client();
-  sub.subscribe(INVALIDATE_CHANNEL, (err) => {
-    if (err) console.error("[CACHE] peer invalidation subscribe failed:", err);
-  });
-  sub.on("message", (channel, message) => {
-    if (channel !== INVALIDATE_CHANNEL) return;
+  const off = bus.on(INVALIDATE_CHANNEL, (message) => {
     handlers.on_peer_invalidated?.(message);
   });
-  return async () => {
-    try {
-      await sub.unsubscribe(INVALIDATE_CHANNEL);
-    } catch { }
-    sub.disconnect();
-  };
+  return async () => off();
 };
 
 export {

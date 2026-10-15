@@ -11,12 +11,12 @@ import { user_model } from "@/models/user.model";
 import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 import { call_model, livekit_call_model } from "@/models/call.model";
 import {
+  call_reservations,
   setActiveCallsCache,
-  setUserCallCache,
   getCallKey,
-  getUserCallKey,
   CALL_CACHE_TTL_SECONDS,
 } from "@/cache-management/calls.cache";
+import { randomUUIDv7 } from "bun";
 import { CALL_TIMEOUT_MS } from "@/constants/calls.constants";
 // import { _missedCallNotifier } from "./call.service";
 import { ResultType } from "@/types/core.types";
@@ -151,14 +151,17 @@ export class LivekitService {
         };
       }
 
-      const isCallerInCall = await redis.get(getUserCallKey(caller_id));
-      const isCalleeInCall = await redis.get(getUserCallKey(callee_id));
+      // G1 (§13.7, §13.5): reserve both parties atomically BEFORE anything
+      // else. The minted id is the reservation token and becomes the row id,
+      // so every compensation below can compare-delete exactly its own keys.
+      const call_id = randomUUIDv7();
+      const reservation = await call_reservations.reserve(caller_id, callee_id, call_id);
 
       // Split, because the caller's app has to say something different for
       // each: one is "you're already on a call", the other is "they are". The
       // old combined message could only be shown verbatim, so the app said
       // nothing at all and the call just vanished.
-      if (isCallerInCall) {
+      if (reservation === "self_busy") {
         return {
           success: false,
           code: 400,
@@ -167,7 +170,8 @@ export class LivekitService {
         };
       }
 
-      if (isCalleeInCall) {
+      if (reservation === "callee_busy") {
+        count("CALL", "callee_busy");
         return {
           success: false,
           code: 400,
@@ -176,101 +180,116 @@ export class LivekitService {
         };
       }
 
-      // check if callee exists and has call access enabled
-      const [callee] = await db
-        .select({ call_access: user_model.call_access, name: user_model.name })
-        .from(user_model)
-        .where(eq(user_model.id, callee_id))
-        .limit(1);
+      // From here on both users are reserved for call_id; every exit that is
+      // not a placed call gives the reservation back.
+      let row_inserted = false;
+      try {
+        // check if callee exists and has call access enabled
+        const [callee] = await db
+          .select({ call_access: user_model.call_access, name: user_model.name })
+          .from(user_model)
+          .where(eq(user_model.id, callee_id))
+          .limit(1);
 
-      if (!callee) {
-        return {
-          success: false,
-          code: 404,
-          message: "Callee not found",
-          error: { reason: "callee_not_found" },
-        };
-      }
+        if (!callee) {
+          await call_reservations.release_all([caller_id, callee_id], call_id);
+          return {
+            success: false,
+            code: 404,
+            message: "Callee not found",
+            error: { reason: "callee_not_found" },
+          };
+        }
 
-      if (!callee.call_access) {
-        return {
-          success: false,
-          code: 401,
-          message: "Callee does not have call access enabled",
-          error: { reason: "no_call_access" },
-        };
-      }
+        if (!callee.call_access) {
+          await call_reservations.release_all([caller_id, callee_id], call_id);
+          return {
+            success: false,
+            code: 401,
+            message: "Callee does not have call access enabled",
+            error: { reason: "no_call_access" },
+          };
+        }
 
-      // create new call in db:
-      const [new_call] = await db
-        .insert(livekit_call_model)
-        .values({
+        // create new call in db:
+        const [new_call] = await db
+          .insert(livekit_call_model)
+          .values({
+            id: call_id,
+            caller_id,
+            callee_id,
+            status: "initiated",
+            started_at: new Date(),
+          })
+          .returning();
+
+        if (!new_call) {
+          await call_reservations.release_all([caller_id, callee_id], call_id);
+          return {
+            success: false,
+            code: 500,
+            message: "Failed to create new call",
+          };
+        }
+        row_inserted = true;
+
+        // set active call in redis cache
+        const active_call: ActiveCall = {
+          call_id: new_call.id,
           caller_id,
           callee_id,
-          status: "initiated",
-          started_at: new Date(),
-        })
-        .returning();
-
-      if (!new_call) {
-        return {
-          success: false,
-          code: 500,
-          message: "Failed to create new call",
-        };
-      }
-
-      // set active call in redis cache
-      const active_call: ActiveCall = {
-        call_id: new_call.id,
-        caller_id,
-        callee_id,
-        started_at: new_call.started_at,
-        status: new_call.status as CallStatusType,
-        call_type,
-      };
-
-      // Awaited: these throw on failure, and un-awaited they became unhandled
-      // rejections AND let the ack race the cache — a `call:accept` arriving
-      // before the write landed would 404 on a call that plainly exists.
-      await Promise.all([
-        setActiveCallsCache(active_call),
-        setUserCallCache(new_call.id, caller_id),
-        setUserCallCache(new_call.id, callee_id),
-      ]);
-
-      // Ring cap for an unanswered call. Without this a callee who never
-      // answers (app killed, no network) leaves the DB row 'initiated' and
-      // both users pinned "in a call" until the cache TTL expires hours later.
-      try {
-        await schedule_ring_deadline(new_call.id);
-      } catch (err: any) {
-        // Nothing could ever time this call out, so fail it now and release
-        // both users (same compensation as a failed room creation). The
-        // caller gets call:error from handle_call_init; the callee was not
-        // rung yet.
-        count("CALL", "ring_zadd_failed");
-        console.error(
-          `[CALL] ring deadline ZADD failed for ${new_call.id}, failing the call: ${err?.message ?? err}`,
-        );
-        await this.abandon_unscheduled_call(new_call.id);
-        return {
-          success: false,
-          code: 500,
-          message: "Error initiating call",
-        };
-      }
-
-      return {
-        success: true,
-        code: 200,
-        message: "Call initiated successfully",
-        data: {
-          call_id: new_call.id,
-          callee_name: callee.name,
+          started_at: new_call.started_at,
+          status: new_call.status as CallStatusType,
           call_type,
-        },
-      };
+        };
+
+        // Awaited: it throws on failure, and un-awaited it became an unhandled
+        // rejection AND let the ack race the cache — a `call:accept` arriving
+        // before the write landed would 404 on a call that plainly exists.
+        // (The per-user busy keys were already written by the reservation.)
+        await setActiveCallsCache(active_call);
+
+        // Ring cap for an unanswered call. Without this a callee who never
+        // answers (app killed, no network) leaves the DB row 'initiated' and
+        // both users pinned "in a call" until the cache TTL expires hours later.
+        try {
+          await schedule_ring_deadline(new_call.id);
+        } catch (err: any) {
+          // Nothing could ever time this call out, so fail it now and release
+          // both users (same compensation as a failed room creation). The
+          // caller gets call:error from handle_call_init; the callee was not
+          // rung yet.
+          count("CALL", "ring_zadd_failed");
+          console.error(
+            `[CALL] ring deadline ZADD failed for ${new_call.id}, failing the call: ${err?.message ?? err}`,
+          );
+          await this.abandon_unscheduled_call(new_call.id);
+          return {
+            success: false,
+            code: 500,
+            message: "Error initiating call",
+          };
+        }
+
+        return {
+          success: true,
+          code: 200,
+          message: "Call initiated successfully",
+          data: {
+            call_id: new_call.id,
+            callee_name: callee.name,
+            call_type,
+          },
+        };
+      } catch (error) {
+        // The reservation (and the row, if it got that far) must not outlive
+        // a failed initiate: before G1 a throw here left both users "busy"
+        // for the 4 h key TTL.
+        count("CALL", "initiate_compensated");
+        if (row_inserted) await this.abandon_unscheduled_call(call_id);
+        else await call_reservations.release_all([caller_id, callee_id], call_id);
+        throw error;
+      }
     } catch (error) {
       console.error("[CALL] Error initiating call:", error);
       return {
@@ -647,16 +666,13 @@ export class LivekitService {
         callee_id = callee_id || row?.callee_id;
       }
 
+      await redis.del(...keys_to_delete);
+
       // Only release a user if they are still pointed at THIS call — a later
       // call of theirs must not be cancelled by a late cleanup of an old one.
-      for (const user_id of [caller_id, callee_id]) {
-        if (!user_id) continue;
-        const user_key = getUserCallKey(user_id);
-        const current = await redis.get(user_key);
-        if (current === call_id) keys_to_delete.push(user_key);
-      }
-
-      await redis.del(...keys_to_delete);
+      // Compare-and-delete in one script (G1): the old GET-then-DEL could
+      // delete a NEW reservation taken between the two commands.
+      await call_reservations.release_all([caller_id, callee_id], call_id);
 
       // console.log(
       //   `[CALL] Cleared cache for call ID: ${call_id} (${keys_to_delete.length} keys)`,

@@ -45,13 +45,23 @@ const main = async () => {
     `📣 Broadcasting update notification for ${platform_arg} v${info.latest_version}…`,
   );
   const stats = await broadcast_version_update(info, { title, body });
-  console.log(
-    `✅ recipients=${stats.recipients} sent=${stats.sent} ` +
-    `failed=${stats.failed} waves=${stats.waves}`,
-  );
+  const counts =
+    `recipients=${stats.recipients} sent=${stats.sent} ` +
+    `failed=${stats.failed} waves=${stats.waves}${stats.resumed ? " (resumed)" : ""}`;
+  // A busy lease (another run, or the lease of a run killed with Ctrl-C,
+  // held until its TTL) or a lost lease is NOT done: say so and exit
+  // non-zero. The same command re-run later resumes from the cursor.
+  const incomplete = stats.skipped === "busy" || !!stats.aborted;
+  if (stats.skipped === "busy") {
+    console.error(`❌ Not sent: another broadcast holds the lease (or a killed run's lease has not expired yet, ≤ 2 min). Re-run this command; it resumes from the cursor.`);
+  } else if (stats.aborted) {
+    console.error(`❌ Incomplete (${stats.aborted}): ${counts}. Re-run this command; it resumes from the cursor.`);
+  } else {
+    console.log(`✅ ${counts}`);
+  }
 
   await redis.quit();
-  process.exit(0);
+  process.exit(incomplete ? 2 : 0);
 };
 
 main().catch((err) => {

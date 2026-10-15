@@ -14,6 +14,7 @@ import {
 import { k } from "./keys";
 import { deadline, rfast } from "./redis-fast";
 import { drain_sleep, event_loop_lag_ms, is_draining, state } from "./lifecycle";
+import { presence_authoritative } from "./mode";
 
 // =============================================================================
 // Worker beat + boot guard (SYNC_V2 §13.3 beat.ts, §13.9.2 step 4)
@@ -59,6 +60,11 @@ type WorkerBeat = {
   // Listening and passed the boot guard. A worker that is still booting (or
   // refused by its guard) beats with ready:false; it is nobody's sibling.
   ready: boolean;
+  // Slow drain in progress (ready:false): still holds open sockets and its
+  // inbox subscriber for up to ~45 s, so the ROUTER keeps it routable — but
+  // it takes no new users (boot guard, has_live_sibling, dashboards ignore
+  // it). Optional: beats from builds before this field read as false.
+  draining?: boolean;
 };
 
 type BeatStats = () => { ws: number; poll: number };
@@ -68,6 +74,10 @@ let beat_timer: ReturnType<typeof setInterval> | null = null;
 let beat_in_flight: Promise<void> | null = null;
 let beat_count = 0;
 let last_beat_error_log_at = 0;
+// When our own beat last reached Redis (0 = never). The reaper refuses to
+// judge siblings dead while ours is stale: the same Redis trouble that let
+// their keys expire may be what we are seeing.
+let last_beat_ok_at = 0;
 
 const build_beat = (): WorkerBeat => {
   const stats = stats_provider();
@@ -85,6 +95,7 @@ const build_beat = (): WorkerBeat => {
     poll: stats.poll,
     lag_ms: event_loop_lag_ms(),
     ready: state.ready && !state.draining,
+    draining: state.draining,
   };
 };
 
@@ -97,12 +108,18 @@ const write_beat = async (): Promise<void> => {
   if (++beat_count % 12 === 0) {
     pipe.zremrangebyscore(k.workers(), "-inf", beat.ts - WORKERS_INDEX_PRUNE_MS);
   }
-  await deadline(pipe.exec(), 1_000, "worker beat");
+  const res = await deadline(pipe.exec(), 1_000, "worker beat");
+  if (res && !res[0]?.[0]) last_beat_ok_at = Date.now();
 };
+
+// Our own beat key was written within `max_age_ms`.
+const own_beat_fresh = (max_age_ms: number = 2 * BEAT_INTERVAL_MS): boolean =>
+  last_beat_ok_at > 0 && Date.now() - last_beat_ok_at <= max_age_ms;
 
 const beat_once = () => {
   if (beat_in_flight) return; // never stack beats on a slow Redis
   beat_in_flight = write_beat()
+    .then(() => (presence_authoritative() ? refresh_view() : undefined))
     .catch((err) => {
       count("CLUSTER", "beat_failed");
       const now = Date.now();
@@ -129,6 +146,20 @@ const beat_now = () => {
   if (beat_timer) beat_once();
 };
 
+// Drain t0: publish ready:false + draining:true NOW (not at the next tick),
+// so a booting worker / has_live_sibling stop counting us at once, while the
+// beat keeps going so siblings' routers still deliver to the sockets we hold
+// until they are closed. The key is deleted only at the very end
+// (stop_beat_and_delete, after the inbox subscriber is gone).
+const beat_draining = async (): Promise<void> => {
+  if (beat_in_flight) await beat_in_flight;
+  try {
+    await write_beat();
+  } catch (err: any) {
+    console.error(`[CLUSTER] draining beat failed (next tick retries): ${err?.message ?? err}`);
+  }
+};
+
 // Stop beating and remove our key, so siblings / a booting worker stop
 // counting us at once instead of after the 15 s TTL.
 const stop_beat_and_delete = async (): Promise<void> => {
@@ -152,8 +183,12 @@ const stop_beat_and_delete = async (): Promise<void> => {
 // same DB, ready flag set. Counting only ready workers means two workers that
 // boot at the same moment cannot refuse each other forever, and a refused
 // stray is never mistaken for a sibling that can take our users.
+// `include_draining` (the router's view only) also returns workers in a slow
+// drain: they still deliver to the sockets they hold.
 // Throws on Redis failure (callers decide what failure means).
-const list_live_siblings = async (): Promise<WorkerBeat[]> => {
+const list_live_siblings = async (
+  { include_draining = false }: { include_draining?: boolean } = {},
+): Promise<WorkerBeat[]> => {
   const now = Date.now();
   const wids = (await deadline(
     rfast.zrangebyscore(k.workers(), now - WORKERS_INDEX_WINDOW_MS, "+inf"),
@@ -172,10 +207,61 @@ const list_live_siblings = async (): Promise<WorkerBeat[]> => {
     if (!raw) continue; // TTL expired → dead (or drained: key deleted)
     try {
       const b = JSON.parse(raw) as WorkerBeat;
-      if (b.db === DB_FINGERPRINT && b.ready === true) out.push(b);
+      if (b.db === DB_FINGERPRINT && (b.ready === true || (include_draining && b.draining === true))) out.push(b);
     } catch { }
   }
   return out;
+};
+
+// -----------------------------------------------------------------------------
+// Cluster view (RC-2): the live siblings as of the last beat, refreshed
+// every 5 s in routing mode `on`. Two readers on hot paths:
+//   - is_sole_worker(): no live sibling → every user of this deployment is
+//     on THIS worker, so the router classifies non-local recipients from
+//     the local maps with no Redis round trip (N=1 keeps today's latency);
+//   - worker_known_alive(): spares is_user_online a second round trip.
+// A stale view (Redis trouble) answers "not sole" / "unknown", which sends
+// callers to the registry under its deadline — never a wrong "sole".
+// A sibling that starts is seen within ≤ 5 s; until then its users count as
+// offline here (FCM + pending store: degraded, not lost).
+// -----------------------------------------------------------------------------
+const VIEW_FRESH_MS = 12_000;
+const view = { live: new Map<string, WorkerBeat>(), at: 0 };
+
+// Draining siblings count: they still hold sockets, so treating them as gone
+// would make this worker "sole" (or call them wedged) and FCM / drop every
+// frame to their users for the whole drain.
+const refresh_view = async (): Promise<void> => {
+  try {
+    const siblings = await list_live_siblings({ include_draining: true });
+    view.live = new Map(siblings.map((b) => [b.wid, b]));
+    view.at = Date.now();
+  } catch {
+    // keep the old view; it goes stale after VIEW_FRESH_MS
+  }
+};
+
+const view_fresh = (now = Date.now()) => view.at > 0 && now - view.at < VIEW_FRESH_MS;
+
+const is_sole_worker = (now = Date.now()): boolean => view_fresh(now) && view.live.size === 0;
+
+// true / false from a fresh view, undefined when the view cannot say.
+const worker_known_alive = (wid: string, now = Date.now()): boolean | undefined => {
+  if (wid === WORKER_ID) return true;
+  if (!view_fresh(now)) return undefined;
+  return view.live.has(wid) ? true : undefined;
+};
+
+// Every live worker of this deployment including this one, for the admin
+// dashboard (A10/A11). Falls back to this worker alone if Redis fails.
+const list_live_workers = async (): Promise<{ workers: WorkerBeat[]; complete: boolean }> => {
+  const self = build_beat();
+  try {
+    const others = await list_live_siblings();
+    return { workers: [self, ...others], complete: true };
+  } catch {
+    return { workers: [self], complete: false };
+  }
 };
 
 // Drain helper: is anyone else live to take our users? Errors → "no", so the
@@ -250,9 +336,14 @@ const run_boot_guard = async (): Promise<void> => {
 export {
   start_beat,
   beat_now,
+  is_sole_worker,
+  worker_known_alive,
+  list_live_workers,
+  beat_draining,
   stop_beat_and_delete,
   list_live_siblings,
   has_live_sibling,
   run_boot_guard,
+  own_beat_fresh,
 };
 export type { WorkerBeat };

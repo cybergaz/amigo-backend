@@ -89,6 +89,7 @@ const main = async () => {
   }
 
   const flags = parse_flags(rest);
+  let notify_incomplete = false;
 
   const result = await set_app_version({
     platform: platform_arg as AppPlatform,
@@ -109,10 +110,21 @@ const main = async () => {
     console.log("📣 Broadcasting update notification to all users…");
     try {
       const stats = await broadcast_version_update(result);
-      console.log(
-        `📣 Notification broadcast: recipients=${stats.recipients} ` +
-        `sent=${stats.sent} failed=${stats.failed} waves=${stats.waves}`,
-      );
+      const counts =
+        `recipients=${stats.recipients} sent=${stats.sent} failed=${stats.failed} ` +
+        `waves=${stats.waves}${stats.resumed ? " (resumed)" : ""}`;
+      // The version IS set either way; an unfinished broadcast is reported
+      // (exit 2) so the operator re-runs `version:notify <platform>`, which
+      // resumes from the cursor.
+      if (stats.skipped === "busy") {
+        notify_incomplete = true;
+        console.error("❌ Notification NOT sent: another broadcast holds the lease (or a killed run's lease has not expired yet, ≤ 2 min). Run `version:notify` later.");
+      } else if (stats.aborted) {
+        notify_incomplete = true;
+        console.error(`❌ Notification incomplete (${stats.aborted}): ${counts}. Run \`version:notify\` to resume.`);
+      } else {
+        console.log(`📣 Notification broadcast: ${counts}`);
+      }
     } catch (err) {
       // The version is already set; a notification failure shouldn't fail the
       // whole command. Surface it and continue to a clean exit.
@@ -121,7 +133,7 @@ const main = async () => {
   }
 
   await redis.quit();
-  process.exit(0);
+  process.exit(notify_incomplete ? 2 : 0);
 };
 
 main().catch((err) => {
