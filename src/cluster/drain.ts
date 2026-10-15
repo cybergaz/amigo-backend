@@ -6,8 +6,9 @@ import {
   state,
   tracked_count,
 } from "./lifecycle";
-import { has_live_sibling, stop_beat_and_delete } from "./beat";
+import { beat_draining, has_live_sibling, stop_beat_and_delete } from "./beat";
 import { rfast } from "./redis-fast";
+import { bus } from "./bus";
 import { WORKER_ID } from "./identity";
 import {
   close_sockets_for_restart,
@@ -16,7 +17,9 @@ import {
   stop_socket_timers,
 } from "@/sockets/socket.server";
 import { flush_all as flush_all_fcm_batches } from "@/services/fcm-batch.service";
+import { flush_fcm_health } from "@/services/fcm-health";
 import { drop_pending_db_timers } from "@/cache-management/polling.cache";
+import { drain_poll_waiters } from "@/cache-management/sync-nudge";
 import { close_db } from "@/config/db";
 import { redis } from "@/config/redis";
 import { flush_counters } from "@/utils/counters";
@@ -25,8 +28,9 @@ import { flush_counters } from "@/utils/counters";
 // Graceful drain (SYNC_V2 §13.9.3)
 // =============================================================================
 // Slow drain (first SIGTERM/SIGINT), budget ≈ 63 s of the 80 s hard exit:
-//   t0      readyz 503, stop listening, DEL our beat, stop timers, write
-//           the pending last_seen batch
+//   t0      readyz 503, stop listening, answer parked poll v2 requests
+//           ({drain:true}), beat draining:true (routable, not a sibling),
+//           stop timers, write the pending last_seen batch
 //   0–3 s   let in-flight HTTP requests finish
 //   3–48 s  close WS in 45 batches (~2% each, 1/s) with 1012 + socket:restart
 //           — or 10 batches over 5 s when no live sibling exists (tmux /
@@ -34,7 +38,8 @@ import { flush_counters } from "@/utils/counters";
 //           delays the reconnect to the next process)
 //   ≤12 s   await tracked work (frame handlers, detached fan-outs)
 //   ≤3 s    flush FCM batches, drop DB timers
-//   end     close remaining connections, quit Redis, end PG pool
+//   end     close remaining connections, quit the bus, DEL our beat, quit
+//           Redis, end PG pool
 // A second signal switches every remaining phase to its fast budget (~10 s).
 
 type DrainResources = {
@@ -106,9 +111,16 @@ const run_drain = async (): Promise<void> => {
   stop_listening(ws_server, "ws");
   state.http_listening = false;
   state.ws_listening = false;
-  // Started before our own key is deleted; it never counts us anyway.
+  // Poll v2 (R3, §13.17.6): every parked long-poll answers {drain:true} +
+  // Connection: close NOW, so its client re-polls a sibling at once instead
+  // of holding this worker's pendingRequests for up to 25 s (the HTTP phase
+  // below waits ≤ 3 s, then the connection would be cut mid-wait).
+  const poll_answered = drain_poll_waiters();
+  // has_live_sibling only counts READY workers, so it never counts us.
   const sibling_p = has_live_sibling();
-  await stop_beat_and_delete();
+  // Not a DEL: siblings' routers must keep delivering to the sockets we still
+  // hold for up to ~45 s (P12). The key goes at the end, after the bus.
+  await beat_draining();
   await bounded(
     Promise.allSettled([stop_socket_timers(), ...resources.stop_workers.map((stop) => stop())]),
     budget(5_000, 1_000),
@@ -116,7 +128,7 @@ const run_drain = async (): Promise<void> => {
   // Before any socket is closed: the batch only writes users still in
   // socket_connections, and drained sockets skip the close-path last_seen.
   await bounded(final_last_seen_flush(), budget(3_000, 1_000));
-  phase("stopped_listening", { wid: WORKER_ID, mode: state.drain_mode });
+  phase("stopped_listening", { wid: WORKER_ID, mode: state.drain_mode, poll_answered });
 
   // ---- 0–3 s: in-flight HTTP ---------------------------------------------
   if (http_server) {
@@ -157,6 +169,9 @@ const run_drain = async (): Promise<void> => {
 
   // ---- flushes -----------------------------------------------------------
   const fcm_flushed = await bounded(flush_all_fcm_batches(), budget(3_000, 2_000));
+  // The pushes just flushed were counted into the §14.13 health accumulator,
+  // whose own timer stopped at t0.
+  await bounded(flush_fcm_health(), 1_000);
   const dropped_db_timers = drop_pending_db_timers();
   phase("flushed", { fcm_batches: fcm_flushed ?? "timeout", dropped_db_timers });
 
@@ -173,7 +188,16 @@ const run_drain = async (): Promise<void> => {
     }
   }
   flush_counters();
-  await bounded(Promise.allSettled([redis.quit(), rfast.quit()]).then(() => undefined), 1_000);
+  // The bus subscriber goes first: from here on no socket is left to deliver
+  // an inbox frame or invalidation to. Then the beat key (siblings now see
+  // us dead: their publishes are counted as such and our keys released),
+  // then the other connections (the DEL needs rfast).
+  await bounded(bus.quit().then(() => undefined), 1_000);
+  await bounded(stop_beat_and_delete(), 1_500);
+  await bounded(
+    Promise.allSettled([redis.quit(), rfast.quit()]).then(() => undefined),
+    1_000,
+  );
   await close_db(is_fast_drain() ? 1 : 3);
   phase("closed", {
     total_ms: Date.now() - t0,

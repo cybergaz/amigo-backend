@@ -14,8 +14,12 @@ import {
   ConnectionStatusPayload,
   PollingConnection,
   UserConnection,
+  WebSocketData,
   WSMessage,
 } from "@/types/socket.types";
+import { sync_v2_flags } from "@/services/app-settings.service";
+import { v2_on } from "@/services/sync/flags-core";
+import { SERIAL_VITAL_TYPES, chain_vital } from "./vital-chain";
 import {
   touch_users_last_seen,
   update_user_details,
@@ -38,10 +42,36 @@ import {
   resolve_keepalive,
 } from "./keepalive";
 import { is_draining, track } from "@/cluster/lifecycle";
+import { is_bg_flag, note_announced_status } from "./presence-flags";
+import { note_ws_connect_proto } from "@/services/sync/proto-lease";
+import { ws_ready_proto } from "@/services/sync/read-core";
+import {
+  close_replaced,
+  opening,
+  polling_connections,
+  socket_connections,
+} from "./connections";
+import { WORKER_ID } from "@/cluster/identity";
+import { presence_authoritative, presence_writes } from "@/cluster/mode";
+import * as presence from "@/cluster/presence";
+import {
+  PRESENCE_REFRESH_MS,
+  REFRESH_BG_REPAIR,
+  REFRESH_GHOST,
+  REFRESH_SELFHEAL,
+} from "@/cluster/presence-core";
+import type { ClaimResult } from "@/cluster/presence-store";
+import { lease_seen_ms } from "@/cluster/router-core";
+import { register_reap_offline_notifier } from "@/cluster/reaper";
+import {
+  is_present,
+  may_close_replaced,
+  online_peers,
+  send_evict,
+} from "@/cluster/router";
 
-// Connection maps for different transport types
-const socket_connections = new Map<string, UserConnection>(); // user_id -> UserConnection (WebSocket)
-const polling_connections = new Map<string, PollingConnection>(); // user_id -> PollingConnection
+// The connection maps live in ./connections (the router reads them too);
+// re-exported below so existing imports of socket.server keep working.
 
 // Give the Stream busy-registry a socket-liveness probe so it can lazily
 // clear leaked "user is on a call" entries (see StreamCallService.isUserBusy).
@@ -70,14 +100,45 @@ const WS_MAX_PAYLOAD_BYTES = 256 * 1024;
 // Per-socket send buffer before ws.send starts dropping (returns 0). 1 MiB is
 // minutes of chat traffic; a socket that far behind is congested (§14.5).
 const WS_BACKPRESSURE_LIMIT_BYTES = 1_048_576;
-// Sync protocol this server speaks, announced in socket:ready. 1 = legacy
-// (pending-queue replay). Sync v2 raises it for clients that connect with
-// ?proto=2.
-const SERVER_SYNC_PROTO = 1;
+// socket:ready `proto`: 1 = legacy (pending-queue replay); 2 for a client
+// that connected with ?proto=2 while the Sync v2 gate is open for it
+// (read-core ws_ready_proto). Every other connect gets 1, as before.
 // last_seen for newly-opened sockets is written in batches (see
 // flush_last_seen_on_open) instead of inline in `open`.
 const LAST_SEEN_FLUSH_INTERVAL_MS = 30_000;
 const LAST_SEEN_FLUSH_CHUNK = 1000;
+
+// §13.6.5 step 4: a newer socket of the same user closes the previous one
+// with 4009 (fixes the orphaned-handshake race: a handshake the app already
+// gave up on completing late used to take over the user's map entry, and
+// the live socket stopped receiving anything until the heartbeat noticed).
+// Kill switch WS_CLOSE_REPLACED=0 restores "leave the old socket open".
+// Damped per user (router-core ReplaceDamper) so two clients of one account
+// cannot knock each other off in a loop.
+const CLOSE_REPLACED = (process.env.WS_CLOSE_REPLACED ?? "1").trim() !== "0";
+
+// §13.6.5 step 9: open admission. More than this many opens between JWT
+// verify and registration on this worker → close 1013 (new apps back off
+// 5–15 s, old apps retry with their normal backoff). Spreads a reconnect
+// herd instead of letting it queue on Redis/RDS. 0 = off. Default on only
+// with CLUSTER_ROUTING=on (each open then also awaits a presence claim), so
+// `local` keeps today's behaviour.
+const OPEN_MAX_INFLIGHT = Math.max(
+  0,
+  parseInt(process.env.WS_OPEN_MAX_INFLIGHT ?? (presence_authoritative() ? "64" : "0")) || 0,
+);
+let opens_in_flight = 0;
+
+// `on` mode only: v1 poll leases nobody polled for this long are dropped
+// from the local map. In local mode a stale lease is evicted by the next
+// fan-out that classifies it (classify_local); with the registry routing,
+// that path rarely runs, so without this the map would keep one entry per
+// user that ever polled this worker.
+const STALE_LEASE_MAX_AGE_MS = 10 * 60_000;
+const STALE_LEASE_PRUNE_EVERY_TICKS = 12; // ≈ 60 s
+
+// Presence refresh cadence in keepalive ticks (15 s / 5 s = every 3rd tick).
+const PRESENCE_REFRESH_EVERY_TICKS = Math.max(1, Math.round(PRESENCE_REFRESH_MS / KEEPALIVE_TICK_MS));
 
 let heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 let statsInterval: ReturnType<typeof setInterval> | null = null;
@@ -147,9 +208,17 @@ const web_socket_server = new Elysia({
   .ws("/chat", {
     // schema validations
     body: WSMessageSchema,
-    // `proto` (Sync v2 capability, §4.3) is accepted now so a newer app that
-    // already sends it can connect; this release does not act on it.
-    query: t.Object({ token: t.String(), proto: t.Optional(t.String()) }),
+    // `proto` (Sync v2 capability, §4.3/§3.13): with
+    // app_settings.sync_v2_proto_lease on, ?proto=2 sets the proto:{uid}
+    // lease and a connect without it clears it (sync/proto-lease.ts). Off
+    // (default): ignored, exactly as before.
+    // `bg` = "1" while the app is not resumed (SYNC_V2 R0.1, presence-flags.ts).
+    // Undeclared params are stripped, never rejected, so old clients are fine.
+    query: t.Object({
+      token: t.String(),
+      proto: t.Optional(t.String()),
+      bg: t.Optional(t.String()),
+    }),
 
     error: ({ error }) => {
       const err = error as any;
@@ -181,6 +250,8 @@ const web_socket_server = new Elysia({
 
     open: async (ws) => {
       const opened_at = Date.now();
+      let admitted = false;
+      let opening_cid: string | undefined;
       try {
         // Extract and validate JWT token
         const url = new URL(ws.data.request.url);
@@ -223,11 +294,21 @@ const web_socket_server = new Elysia({
           return;
         }
 
+        // §13.6.5 step 9 (checked here, at step 1): too many opens in flight.
+        if (OPEN_MAX_INFLIGHT > 0 && opens_in_flight >= OPEN_MAX_INFLIGHT) {
+          count("CLUSTER", "open_admission_1013");
+          ws.close(1013, "Try again later");
+          return;
+        }
+        opens_in_flight++;
+        admitted = true;
+
         // §13.6.5 step 1: from here until step 6 the socket exists but is NOT
         // registered — any frame the client sends meanwhile is buffered by the
         // `message` callback, never processed. `user_id` stays unset until the
         // device check below passes, so nothing can act as this user early.
-        set_ws_data(ws, { cid: new_cid(), registered: false });
+        const cid = new_cid();
+        set_ws_data(ws, { cid, registered: false });
 
         // Single-device enforcement (mobile device tokens only). A device token
         // carries device_id + token_version; if they no longer match the current
@@ -262,7 +343,11 @@ const web_socket_server = new Elysia({
           }
         }
 
-        // §13.6.5 step 3. Store user_id in WebSocket data using type-safe helper.
+        // §13.6.5 step 3. From here until the presence claim landed the
+        // router must not treat a ws key naming this cid as a leftover.
+        opening.add(cid);
+        opening_cid = cid;
+        // Store user_id in WebSocket data using type-safe helper.
         const user_id = auth_result.data.id;
         set_ws_data(ws, { user_id });
 
@@ -303,14 +388,28 @@ const web_socket_server = new Elysia({
           "unknown";
 
         // §13.6.5 step 4. Add to active socket connections with new tracking
-        // fields. A fresh connection always starts foreground
-        // (is_background:false, 20 s keepalive); a reconnect therefore clears
-        // any prior background flag / announced mode automatically.
+        // fields. A fresh connection starts foreground (is_background:false,
+        // 20 s keepalive), so a reconnect clears any prior background flag /
+        // announced mode — UNLESS the URL carries bg=1 (SYNC_V2 R0.1): a
+        // socket opened during a background wake (FCM woke the frozen app)
+        // used to start foreground and got no FCM; Android cut its network
+        // ~5-10 s later, so messages sent into that ghost socket waited in
+        // the pending queue until some later wake.
+        // Old clients never send bg → unchanged. Keepalive stays fg until the
+        // client announces a mode, as before.
+        // The status hint follows the socket either way: a foreground open
+        // must clear an earlier 'background', or the long-poll lease this
+        // client falls back to on a flaky link starts 'background' and an
+        // old (4.2.2) app shows a notification for every message in the
+        // chat the user is reading.
+        const opened_bg = is_bg_flag(url.searchParams.get("bg"));
+        note_announced_status(user_id, opened_bg ? "background" : "online");
         const now_ms = Date.now();
         const connection: UserConnection = {
           ws,
+          cid,
           missed_pings: 0,
-          is_background: false,
+          is_background: opened_bg,
           last_inbound_at: now_ms,
           last_keepalive_at: now_ms,
           keepalive_ms: KEEPALIVE_FG_MS,
@@ -320,7 +419,21 @@ const web_socket_server = new Elysia({
           // connected_at: new Date(),
           // client_ip
         };
+        const previous = socket_connections.get(user_id);
+        // Whether peers were ever told about that previous socket (it got
+        // past registration) — decides the online edge below.
+        const previous_announced_cid =
+          previous && get_ws_data(previous.ws, "registered") === true ? previous.cid : undefined;
         socket_connections.set(user_id, connection);
+        // A different socket of this user was registered here: it is either
+        // a half-open leftover or an orphaned handshake. Close it with 4009
+        // (no offline broadcast — the user is right here).
+        if (previous && previous.ws.raw !== ws.raw) {
+          count("CLUSTER", "replaced_local");
+          if (CLOSE_REPLACED && may_close_replaced(user_id)) {
+            close_replaced(user_id, previous, cid);
+          }
+        }
 
         // removing from polling connections if exists (in case user switched transport without closing previous connection properly)
         if (polling_connections.has(user_id)) {
@@ -330,14 +443,45 @@ const web_socket_server = new Elysia({
           );
         }
 
+        // §13.6.5 step 5: claim the presence key (also ends a poll lease).
+        // `on`: awaited — the result decides the online edge and whether a
+        // socket on another worker must be evicted. `shadow`: written, not
+        // awaited (no decision depends on it). `local`: nothing.
+        let claim_result: ClaimResult | null = null; // null = not claimed / failed
+        if (presence_authoritative()) {
+          try {
+            claim_result = await presence.claim(user_id, cid, opened_bg);
+          } catch (err: any) {
+            count("CLUSTER", "presence_claim_failed");
+            connection.presence_unclaimed = true;
+          }
+          if (claim_result?.old_ws && claim_result.old_ws.wid !== WORKER_ID) {
+            send_evict(user_id, claim_result.old_ws, cid);
+          }
+          // Closed (or replaced) while the claim was in flight: the close
+          // callback already removed the entry; do not register.
+          if (get_ws_data(ws, "closed") === true) return;
+        } else {
+          presence.claim_soon(user_id, cid, opened_bg);
+        }
+        opening.delete(cid);
+        opening_cid = undefined;
+
         // last_seen ≥ connect time, written off the open path in one batched
         // UPDATE (flush_last_seen_on_open).
         pending_last_seen_on_open.add(user_id);
+
+        // Sync v2 capability lease (§3.13). No-op (no Redis call) while
+        // sync_v2_proto_lease is off; fire-and-forget when on.
+        const query_proto = url.searchParams.get("proto");
+        note_ws_connect_proto(user_id, query_proto);
 
         // §13.6.5 step 6: registered → process the frames that arrived early
         // (in arrival order), then tell the client the socket is fully live.
         // Old apps ignore socket:ready (unknown type → dropped by their parser).
         set_ws_data(ws, { registered: true });
+        opens_in_flight--;
+        admitted = false;
         count("WS", "opens");
         observe_ms("WS", "open_ms", Date.now() - opened_at);
         drain_early_frames(ws);
@@ -345,7 +489,8 @@ const web_socket_server = new Elysia({
           ws,
           {
             type: "socket:ready",
-            proto: SERVER_SYNC_PROTO,
+            // The flags snapshot is in memory: no extra round trip.
+            proto: ws_ready_proto(user_id, query_proto, sync_v2_flags()),
             server_time: new Date().toISOString(),
             cid: get_ws_data(ws, "cid"),
           },
@@ -356,44 +501,72 @@ const web_socket_server = new Elysia({
         // notify all connected users about this user being online
         const connected_users = await get_user_peers(user_id);
 
+        // §13.6.5 step 7 (`on` only): announce "online" on the EDGE — when
+        // the claim found no previous socket of this user. A user whose old
+        // socket was still registered (half-open, replaced, on another
+        // worker) was never announced offline, so peers already show them
+        // online. Exceptions that still announce:
+        //   - a previous POLL lease (deliberate deviation from §13.6.5): a
+        //     poll-only session may never have been announced, and a
+        //     redundant "online" costs one frame per peer while a missing one
+        //     leaves the user shown offline;
+        //   - an old key naming THIS worker but not a socket that got past
+        //     registration here (an orphan that never announced, or a
+        //     leftover whose release was lost);
+        //   - a failed claim (today's behaviour).
+        const old_ws = presence_authoritative() ? claim_result?.old_ws : null;
+        const announce_online =
+          !old_ws ||
+          (old_ws.wid === WORKER_ID && old_ws.cid !== previous_announced_cid);
+        if (!announce_online) count("CLUSTER", "online_edge_suppressed");
+
+        // Same value handle_connection_status would broadcast for the
+        // background frame (peers render both as "online").
         const message_payload: ConnectionStatusPayload = {
           sender_id: user_id,
-          status: "online",
+          status: opened_bg ? "background" : "online",
         };
 
         // >>>>>-- broadcasting -->>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-        await broadcast_message({
-          to: "users",
-          user_ids: Array.from(connected_users),
-          message: {
-            type: "connection:status",
-            payload: message_payload,
-            ws_timestamp: new Date(),
-          },
-        });
+        if (announce_online) {
+          await broadcast_message({
+            to: "users",
+            user_ids: Array.from(connected_users),
+            message: {
+              type: "connection:status",
+              payload: message_payload,
+              ws_timestamp: new Date(),
+            },
+          });
+        }
 
         // Presence snapshot: send current online status of B's peers back to B
         // so B's UI reflects who's already online. Without this, B only ever
         // learns about peers when they toggle state (connect/disconnect) —
         // peers already online before B connected would appear offline forever.
+        // `on` (§13.6.5 step 8, A5): peers with a socket on ANY worker or a
+        // fresh poll lease. Otherwise: this worker's sockets, as before.
         const snapshot_at = new Date();
-        for (const peer_id of connected_users) {
-          const peer_conn = socket_connections.get(peer_id);
-          if (peer_conn && peer_conn.ws.readyState === 1) {
-            ws_send(
-              ws,
-              {
-                type: "connection:status",
-                payload: {
-                  sender_id: peer_id,
-                  status: "online",
-                } as ConnectionStatusPayload,
-                ws_timestamp: snapshot_at,
-              },
-              connection,
-              user_id,
-            );
-          }
+        const snapshot_peers = presence_authoritative()
+          ? await online_peers(Array.from(connected_users))
+          : Array.from(connected_users).filter((peer_id) => {
+            const peer_conn = socket_connections.get(peer_id);
+            return !!peer_conn && peer_conn.ws.readyState === 1;
+          });
+        for (const peer_id of snapshot_peers) {
+          ws_send(
+            ws,
+            {
+              type: "connection:status",
+              payload: {
+                sender_id: peer_id,
+                status: "online",
+              } as ConnectionStatusPayload,
+              ws_timestamp: snapshot_at,
+            },
+            connection,
+            user_id,
+          );
         }
 
         // logConnectionSuccess('ws', user_id, client_ip, { user_name });
@@ -406,6 +579,12 @@ const web_socket_server = new Elysia({
         // await sync_missed_messages(user_id);
       } catch (error) {
         set_ws_data(ws, { early_frames: undefined });
+        // A socket that already took the map entry must not stay in it.
+        const failed_uid = get_ws_data(ws, "user_id") as string | undefined;
+        if (failed_uid && socket_connections.get(failed_uid)?.ws.raw === ws.raw) {
+          socket_connections.delete(failed_uid);
+          presence.release_soon(failed_uid, get_ws_data(ws, "cid") as string | undefined);
+        }
         const request = ws.data.request;
         const client_ip =
           request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
@@ -413,6 +592,9 @@ const web_socket_server = new Elysia({
           "unknown";
         logConnectionError("ws_open", undefined, client_ip, error);
         ws.close(4000, "Connection error");
+      } finally {
+        if (admitted) opens_in_flight--;
+        if (opening_cid) opening.delete(opening_cid);
       }
     },
 
@@ -459,10 +641,23 @@ const web_socket_server = new Elysia({
       set_ws_data(ws, { closed: true, early_frames: undefined });
       count("WS", `close_code_${code ?? "none"}`);
 
+      // Replaced by a newer socket of this user (4009, §13.6.5): the user is
+      // not leaving. The map entry and the presence key already belong to
+      // the new socket — no offline, no last_seen, no release.
+      if (get_ws_data(ws, "replaced") === true) return;
+
       // Never registered (auth rejected, closed mid-open, connectivity check):
-      // it was never in socket_connections and never announced online, so
-      // there is nothing to evict and no offline/last_seen to write.
-      if (get_ws_data(ws, "registered") !== true) return;
+      // never announced online, so no offline/last_seen to write. A socket
+      // closed while its presence claim was in flight is already in the map
+      // (step 4 precedes the claim), so take it out again.
+      if (get_ws_data(ws, "registered") !== true) {
+        const mid_open_uid = get_ws_data(ws, "user_id") as string | undefined;
+        if (mid_open_uid && socket_connections.get(mid_open_uid)?.ws.raw === ws.raw) {
+          socket_connections.delete(mid_open_uid);
+          presence.release_soon(mid_open_uid, get_ws_data(ws, "cid") as string | undefined);
+        }
+        return;
+      }
 
       const user_id = get_ws_data(ws, "user_id") as string;
       if (user_id) {
@@ -480,6 +675,9 @@ const web_socket_server = new Elysia({
           return;
         }
         socket_connections.delete(user_id);
+        // Compare-delete this socket's presence key (no-op in local mode; a
+        // newer socket's key — any worker — is never touched).
+        presence.release_soon(user_id, get_ws_data(ws, "cid") as string | undefined);
 
         // Closed by the drain with 1012 (SYNC_V2 §13.7 A6): the user is not
         // leaving, they are moving to the sibling / the next process within
@@ -505,6 +703,12 @@ const web_socket_server = new Elysia({
             console.log(
               `[CONNECTION-DISCONNECT] User ${user_id} reconnected within ${OFFLINE_STATUS_BROADCAST_DELAY_MS}, skipping offline broadcast`,
             );
+            return;
+          }
+          // A6 (`on`): reconnected to ANOTHER worker, or polling — present
+          // anywhere means not offline. Unknown (Redis down) → as before.
+          if (presence_authoritative() && (await is_present(user_id)) === true) {
+            count("CLUSTER", "debounce_skip_present");
             return;
           }
 
@@ -637,7 +841,7 @@ async function process_frame(ws: ElysiaWS, message: WSMessage): Promise<void> {
     }
   }
 
-  await socket_message_handler(
+  const handle = () => socket_message_handler(
     {
       user_id,
       user_name: get_ws_data(ws, "user_name") as string,
@@ -645,6 +849,15 @@ async function process_frame(ws: ElysiaWS, message: WSMessage): Promise<void> {
     },
     message,
   );
+
+  // SYNC_V2 §3.3.5 (sync_v2 'on'): a socket's vital frames commit and ack in
+  // arrival order; their fan-outs run detached (sockets/vital-chain.ts).
+  // Off / shadow: every frame runs concurrently, as before.
+  if (v2_on(sync_v2_flags()) && SERIAL_VITAL_TYPES.has(message.type)) {
+    await chain_vital(ws.data as WebSocketData, handle);
+    return;
+  }
+  await handle();
 }
 
 // =============================================================================
@@ -672,6 +885,9 @@ async function evict_stale_connection(user_id: string, connection: UserConnectio
   if (socket_connections.get(user_id) === connection) {
     socket_connections.delete(user_id);
   }
+  // A7: compare-delete this socket's key; offline below only if nothing
+  // else of this user remains anywhere.
+  presence.release_soon(user_id, connection.cid);
 
   try {
     const connected_users = await get_user_peers(user_id);
@@ -681,6 +897,10 @@ async function evict_stale_connection(user_id: string, connection: UserConnectio
       console.log(
         `[WS-HEARTBEAT] User ${user_id} reconnected, skipping offline broadcast`,
       );
+      return;
+    }
+    if (presence_authoritative() && (await is_present(user_id)) === true) {
+      count("CLUSTER", "evict_skip_present");
       return;
     }
     const message_payload: ConnectionStatusPayload = {
@@ -710,13 +930,53 @@ async function evict_stale_connection(user_id: string, connection: UserConnectio
   );
 }
 
+// RC-3 reaper (cluster/reaper.ts, §13.6.6): users of a DEAD worker whose
+// presence is gone everywhere. Their own close debounce died with that
+// worker, so this is the offline announcement + last_seen it would have
+// made. Bounded concurrency: a dead worker can leave ~2.6k users at once.
+const REAP_ANNOUNCE_CONCURRENCY = 16;
+const REAP_LAST_SEEN_CHUNK = 500;
+async function announce_reaped_offline(uids: string[]) {
+  // Reconnected here since the reaper's lookup: not offline.
+  const gone = uids.filter((uid) => !socket_connections.has(uid));
+  for (let i = 0; i < gone.length; i += REAP_ANNOUNCE_CONCURRENCY) {
+    await Promise.all(
+      gone.slice(i, i + REAP_ANNOUNCE_CONCURRENCY).map(async (user_id) => {
+        try {
+          const peers = await get_user_peers(user_id);
+          const message_payload: ConnectionStatusPayload = { sender_id: user_id, status: "offline" };
+          await broadcast_message({
+            to: "users",
+            user_ids: Array.from(peers),
+            message: { type: "connection:status", payload: message_payload, ws_timestamp: new Date() },
+            exclude_user_ids: [user_id],
+          });
+        } catch (e) {
+          console.error(`[CLUSTER] reaped offline announce failed for ${user_id}:`, e);
+        }
+      }),
+    );
+  }
+  for (let i = 0; i < gone.length; i += REAP_LAST_SEEN_CHUNK) {
+    try {
+      await touch_users_last_seen(gone.slice(i, i + REAP_LAST_SEEN_CHUNK));
+    } catch (e) {
+      console.error(`[CLUSTER] reaped last_seen write failed:`, e);
+    }
+  }
+}
+register_reap_offline_notifier(announce_reaped_offline);
+
 function startHeartbeat() {
   if (heartbeatInterval) {
     clearInterval(heartbeatInterval);
   }
 
+  let tick_no = 0;
   heartbeatInterval = setInterval(() => {
     const now = Date.now();
+    if (++tick_no % PRESENCE_REFRESH_EVERY_TICKS === 0) refresh_presence();
+    if (tick_no % STALE_LEASE_PRUNE_EVERY_TICKS === 0) prune_stale_poll_leases(now);
 
     socket_connections.forEach((connection, user_id) => {
       if (connection.ws.readyState !== 1) {
@@ -780,6 +1040,82 @@ function startHeartbeat() {
   console.log(
     `[WS-HEARTBEAT] Started keepalive tick (${KEEPALIVE_TICK_MS}ms, default interval ${KEEPALIVE_FG_MS}ms)`,
   );
+}
+
+// §13.7 A7: one pipelined PRESENCE_REFRESH per 15 s for every registered
+// socket (TTL 45 s). The reply also repairs the registry: a key that vanished
+// is re-created (self-heal), a lost bg flip is rewritten, and a key that now
+// names another socket means this one was replaced elsewhere and its evict
+// message was lost → close it with 4009 (`on` only; shadow just counts).
+let presence_refresh_running = false;
+async function refresh_presence() {
+  if (!presence_writes() || presence_refresh_running) return;
+  const entries: { uid: string; cid: string; bg: boolean; }[] = [];
+  const conns: UserConnection[] = [];
+  const unclaimed: [string, UserConnection][] = [];
+  for (const [uid, conn] of socket_connections) {
+    if (!conn.cid || conn.ws.readyState !== 1) continue;
+    if (get_ws_data(conn.ws, "draining") === true) continue;
+    if (conn.presence_unclaimed) {
+      unclaimed.push([uid, conn]);
+      continue;
+    }
+    entries.push({ uid, cid: conn.cid, bg: conn.is_background === true });
+    conns.push(conn);
+  }
+  if (entries.length === 0 && unclaimed.length === 0) return;
+  presence_refresh_running = true;
+  try {
+    // Sockets whose open-time claim failed: claim now (newest socket wins,
+    // exactly as the open would have), rather than REFRESH, which would see
+    // the user's previous socket in the key and call THIS one the ghost.
+    // Rare (a Redis blip during opens), so one awaited claim each is fine.
+    for (const [uid, conn] of unclaimed) {
+      if (socket_connections.get(uid) !== conn) continue;
+      try {
+        const r = await presence.claim(uid, conn.cid!, conn.is_background === true);
+        conn.presence_unclaimed = false;
+        count("CLUSTER", "presence_reclaimed");
+        if (r.old_ws && r.old_ws.wid !== WORKER_ID && r.old_ws.cid !== conn.cid) send_evict(uid, r.old_ws, conn.cid!);
+      } catch {
+        count("CLUSTER", "presence_claim_failed");
+      }
+    }
+    if (entries.length === 0) return;
+    const replies = await presence.refresh_many(entries);
+    replies.forEach((reply, i) => {
+      if (reply === REFRESH_SELFHEAL) count("CLUSTER", "presence_selfheal");
+      else if (reply === REFRESH_BG_REPAIR) count("CLUSTER", "presence_bg_repair");
+      else if (reply === REFRESH_GHOST) {
+        count("CLUSTER", "presence_ghost");
+        const { uid } = entries[i];
+        const conn = conns[i];
+        if (
+          presence_authoritative() &&
+          CLOSE_REPLACED &&
+          socket_connections.get(uid) === conn &&
+          may_close_replaced(uid)
+        ) {
+          count("CLUSTER", "evicted_ghosts_refresh");
+          close_replaced(uid, conn, undefined);
+        }
+      } else if (reply < 0) count("CLUSTER", "presence_refresh_item_failed");
+    });
+  } catch (err: any) {
+    count("CLUSTER", "presence_refresh_failed");
+  } finally {
+    presence_refresh_running = false;
+  }
+}
+
+function prune_stale_poll_leases(now: number) {
+  if (!presence_authoritative()) return;
+  for (const [uid, lease] of polling_connections) {
+    const seen = lease_seen_ms(lease);
+    if (seen === undefined || now - seen > STALE_LEASE_MAX_AGE_MS) {
+      polling_connections.delete(uid);
+    }
+  }
 }
 
 // Stop the heartbeat mechanism
@@ -1011,9 +1347,21 @@ function open_socket_count(): number {
 }
 
 export default web_socket_server;
+// Fresh v1 poll leases on this worker (beat / stats). The map also keeps
+// stale entries until a fan-out or a new poll touches them.
+function fresh_poll_lease_count(now = Date.now()): number {
+  let n = 0;
+  for (const lease of polling_connections.values()) {
+    const seen = lease_seen_ms(lease);
+    if (seen !== undefined && now - seen < 10_000) n++;
+  }
+  return n;
+}
+
 export {
   socket_connections,
   polling_connections,
+  fresh_poll_lease_count,
   startHeartbeat,
   stopHeartbeat,
   handlePongResponse,
