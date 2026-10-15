@@ -187,9 +187,13 @@ const dm_delete_status = async (conversation_id: string, user_id: string, status
       };
     }
 
+    // Hiding tombstones every message for this user in message_info (below),
+    // so has_hidden goes up in the same statement (SYNC_V2 §3.6: derived
+    // unread probes message_info only when it is set). Never cleared: a
+    // revived DM keeps its hidden history hidden.
     const [conversation] = await db
       .update(chat_member_model)
-      .set({ removed_at: status ? new Date() : null })
+      .set(status ? { removed_at: new Date(), has_hidden: true } : { removed_at: null })
       .where(
         and(
           eq(chat_member_model.chat_id, conversation_id),

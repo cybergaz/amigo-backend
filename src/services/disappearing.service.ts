@@ -9,6 +9,7 @@ import { queue_message_fcm } from "@/services/fcm-batch.service";
 import { get_conversation_members } from "@/cache-management/conv.cache";
 import { get_muted_user_ids } from "@/cache-management/chat-mute.cache";
 import { is_broadcast_chat } from "@/cache-management/chat-type.cache";
+import { sync_v2_flags } from "@/services/app-settings.service";
 import {
   set_disappearing_after_sec,
   set_last_message,
@@ -107,6 +108,10 @@ const set_chat_disappearing = async (
     : `${actor_name} set disappearing messages to ${human_duration(duration_sec)}`;
 
   const sys_msg_id = randomUUIDv7();
+  // SYNC_V2 §3.10 (sync_v2_system_rows on): the row carries `meta`, which
+  // makes messages_ai_sys bump settings_seq, and the wire frame says it is a
+  // system row with an actor. Off: exactly the row and frame of before.
+  const system_rows = sync_v2_flags().system_rows;
   const [stored] = await db.insert(message_model).values({
     id: sys_msg_id,
     chat_id,
@@ -117,6 +122,9 @@ const set_chat_disappearing = async (
     // System message itself follows the chat's new setting — if disappearing
     // is on, this notice also disappears, matching WhatsApp's behaviour.
     expires_at: duration_sec != null ? new Date(now.getTime() + duration_sec * 1000) : null,
+    ...(system_rows
+      ? { meta: { action: "disappearing", members: [], actor_id, disappearing_after_sec: duration_sec } }
+      : {}),
   }).returning();
 
   // Update chat last_msg pointers + chat_meta so the chat list reflects the
@@ -129,7 +137,7 @@ const set_chat_disappearing = async (
     sender_id: actor_id,                       // system has no sender
     sent_at: (stored.sent_at ?? now).toISOString(),
     attachments: null,
-  });
+  }, { numbered: stored.seq != null });
 
   // Broadcast the system message as a normal message:new so clients render it
   // inline in the conversation. We don't go through handle_message_new because
@@ -143,6 +151,9 @@ const set_chat_disappearing = async (
     attachments: null,
     sent_at: stored.sent_at ?? now,
     expires_at: stored.expires_at ?? null,
+    // Old apps decode sender_id as a non-null String, so the wire keeps the
+    // actor; the additive flag tells new clients the stored sender is NULL.
+    ...(system_rows ? { system_actor: true } : {}),
   };
   const new_msg_ws: WSMessage = {
     type: "message:new",

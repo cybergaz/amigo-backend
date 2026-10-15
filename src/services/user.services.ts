@@ -19,7 +19,7 @@ import { eq, and, inArray, isNull, ne, sql, or, ilike } from "drizzle-orm";
 import { store_fcm_token } from "@/cache-management/fcm-token.cache";
 import { invalidate_user_names, set_cached_user_name } from "@/cache-management/user-name.cache";
 import { remove_member, get_conversation_members, get_user_conversations, invalidate_user_conversations } from "@/cache-management/conv.cache";
-import { polling_connections, socket_connections } from "@/sockets/socket.server";
+import { cluster_stats } from "@/cluster/stats";
 import { broadcast_message } from "@/sockets/socket.handlers";
 import type { UserUpdatePayload } from "@/types/socket.types";
 
@@ -801,7 +801,9 @@ const get_dashboard_stats = async () => {
       message: "Dashboard statistics fetched successfully",
       data: {
         totalUsers: Number(totalUsersResult[0].count),
-        onlineUsers: socket_connections.size + polling_connections.size,
+        // Every live worker's sockets + fresh poll leases, from the worker
+        // beats (SYNC_V2 §13.7 A10) — not only this worker's maps.
+        onlineUsers: (await cluster_stats()).online,
         subAdmins: Number(subAdminsResult[0].count),
         callAccess: Number(callAccessResult[0].count),
       },
@@ -1105,11 +1107,22 @@ const delete_user_permanently = async (user_id: string) => {
       console.error("Error removing user from redis conversations:", error);
     }
 
-    // Delete the user permanently from database
-    const deletedUser = await db
-      .delete(user_model)
-      .where(eq(user_model.id, user_id))
-      .returning();
+    // Delete the user permanently from database. First (same transaction)
+    // hide their memberships: the FK turns chat_members.user_id into NULL,
+    // and a NULL-user row that still looked active (removed_at NULL) would
+    // be counted by every legacy "active member" gate (SYNC_V2 §3.2 note on
+    // the account-deletion ghost row). The receipt-mins trigger excludes it
+    // either way.
+    const deletedUser = await db.transaction(async (tx) => {
+      await tx
+        .update(chat_member_model)
+        .set({ removed_at: new Date() })
+        .where(and(eq(chat_member_model.user_id, user_id), isNull(chat_member_model.removed_at)));
+      return tx
+        .delete(user_model)
+        .where(eq(user_model.id, user_id))
+        .returning();
+    });
 
     if (deletedUser.length === 0) {
       return {

@@ -47,4 +47,24 @@ const resolve_stored_sent_at = (
     : client;
 };
 
-export { UPLOADED_MEDIA_TYPES, resolve_stored_sent_at };
+/**
+ * expires_at for a new message in a chat with disappearing messages on
+ * (null duration = off → null).
+ *
+ * server_time (SYNC_V2 §3.10, app_settings.sync_v2_server_expiry or
+ * sync_v2 = 'on'): the server's arrival time + duration. Legacy: the stored
+ * sent_at + duration — and the stored sent_at keeps an offline-composed
+ * message's old client stamp, so a message written offline for longer than
+ * the duration arrived already expired and was swept before anyone saw it.
+ */
+const resolve_expires_at = (
+  duration_sec: number | null | undefined,
+  stored_sent_at: Date,
+  server_time: boolean,
+  now: Date = new Date(),
+): Date | null =>
+  duration_sec == null
+    ? null
+    : new Date((server_time ? now : stored_sent_at).getTime() + duration_sec * 1000);
+
+export { UPLOADED_MEDIA_TYPES, resolve_stored_sent_at, resolve_expires_at };

@@ -10,6 +10,7 @@ import { and, asc, desc, eq, isNull, ne, sql } from "drizzle-orm";
 import { add_new_member, promote_to_admin } from "./chat-group.service";
 import { add_member, invalidate_conversation } from "@/cache-management/conv.cache";
 import { broadcast_conversation_action } from "./chat.services";
+import { not_scrubbed_tombstone } from "./sync/scrubbed";
 import { MembersType } from "@/types/socket.types";
 
 
@@ -241,7 +242,9 @@ const get_conversation_history_admin = async (
         user_model,
         eq(user_model.id, message_model.sender_id)
       )
-      .where(eq(message_model.chat_id, conversation_id))
+      // Admin-removed (scrubbed) rows stay out, as when they were really
+      // deleted; user-deleted rows still show (sync/scrubbed.ts).
+      .where(and(eq(message_model.chat_id, conversation_id), not_scrubbed_tombstone()))
       .orderBy(desc(message_model.created_at))
       .limit(limit)
       .offset(offset);
@@ -249,7 +252,7 @@ const get_conversation_history_admin = async (
     const totalCountResult = await db
       .select({ count: sql<number>`count(*)` })
       .from(message_model)
-      .where(eq(message_model.chat_id, conversation_id));
+      .where(and(eq(message_model.chat_id, conversation_id), not_scrubbed_tombstone()));
 
     const totalCount = totalCountResult[0]?.count || 0;
     const totalPages = Math.ceil(totalCount / limit);

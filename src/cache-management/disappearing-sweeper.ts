@@ -1,58 +1,83 @@
-import db from "@/config/db";
-import { sql } from "drizzle-orm";
+import { pg_client } from "@/config/db";
 import { broadcast_deletion } from "@/services/chat.services";
+import { run_pg_singleton_sql } from "@/cluster/jobs";
+import { is_draining } from "@/cluster/lifecycle";
+import { count } from "@/utils/counters";
+import { group_by_chat_sorted, select_expired_candidates } from "@/services/sync/write-queries";
+import { soft_delete_one_chat } from "@/services/sync/bulk-delete";
 
 // ────────────────────────────────────────────────────────────────────────────
-// Disappearing-messages sweeper.
+// Disappearing-messages sweeper (SYNC_V2_PROTOCOL.md §3.3.1, §13.7 F9).
 //
-// Periodically:
-//   1. Atomically claim up to N expired rows by setting deleted_at — done in a
-//      single CTE with FOR UPDATE SKIP LOCKED so multiple app instances can
-//      run this worker without coordinating.
-//   2. For each affected chat, hand off to broadcast_deletion (the SAME helper
-//      that powers user-initiated message:delete). This means recipients see
-//      no wire-level difference between "user deleted" and "expiry deleted":
-//        - WS broadcast to live members
-//        - FCM/missed-ws enqueue for offline + polling members
-//        - chats.last_msg_id / pinned_msg_id repoint if affected
+// Every SWEEP_INTERVAL_MS, while there is a backlog:
+//   1. Select up to SWEEP_BATCH_SIZE expired, not-yet-deleted rows, oldest
+//      expiry first — WITHOUT locking (idx on expires_at; O(expiring now)).
+//   2. Group them by chat, chats in id order.
+//   3. Per chat, ONE short transaction under the 'disappearing_sweep'
+//      singleton lock (cluster-wide single runner, transaction-scoped so it
+//      works through a pooler and dies with a wedged worker):
+//        amigo.bulk_alloc on → one clock block for the chat → UPDATE … SET
+//        deleted_at, mod_seq = block → RETURNING.
+//      Expiry is re-checked under the row lock, and RETURNING decides who
+//      broadcasts: a row someone else deleted first is not announced twice.
+//   4. Hand the returned ids to broadcast_deletion (the SAME helper as a
+//      user delete): WS + FCM/pending + the legacy pointer/pin repair on
+//      unnumbered chats (numbered chats were repaired by the triggers).
+//
+// Why per chat and not one multi-chat UPDATE (the old claim): the delete now
+// allocates clock values, which holds each chat's row lock until commit. One
+// statement over 500 rows of many chats held all their locks at once, in row
+// order — blocking every send to those chats for the whole batch and able to
+// deadlock with inserts. Per chat, a send waits at most one short statement.
 //
 // Why polling, not Redis EXPIRE / pg_cron / per-message timers:
-//   - The DB partial index makes the claim O(expiring-this-tick), not
-//     O(all-pending). At rest the worker is essentially free.
 //   - Single source of truth (messages table). Redis is a cache, not a
 //     scheduler.
-//   - Same shape as start_message_flush_worker / start_receipt_flush_worker,
-//     so boot/shutdown/error semantics match the rest of the codebase.
+//   - Same shape as the other flush workers, so boot/shutdown/error
+//     semantics match the rest of the codebase.
 // ────────────────────────────────────────────────────────────────────────────
 
 const SWEEP_INTERVAL_MS = 30_000;
 const SWEEP_BATCH_SIZE = 500;
+const JOB = "disappearing_sweep";
 
-type ClaimedRow = { id: string; chat_id: string };
+type SweepOutcome = { deleted: number; held_elsewhere: boolean };
 
-// Atomic batch claim. Returns rows that THIS instance is responsible for.
-// SKIP LOCKED makes the worker horizontally safe — concurrent invocations
-// pick disjoint slices, so we never double-broadcast a delete.
-const claim_expired_batch = async (limit: number): Promise<ClaimedRow[]> => {
-  const result = await db.execute(sql`
-    WITH expired AS (
-      SELECT id FROM messages
-       WHERE deleted_at IS NULL
-         AND expires_at IS NOT NULL
-         AND expires_at <= NOW()
-       ORDER BY expires_at
-       LIMIT ${limit}
-       FOR UPDATE SKIP LOCKED
-    )
-    UPDATE messages
-       SET deleted_at = NOW()
-     WHERE id IN (SELECT id FROM expired)
-    RETURNING id, chat_id
-  `);
-  // node-postgres returns { rows }, bun-pg via drizzle returns the array
-  // directly in some adapters. Handle both shapes defensively.
-  const rows = (result as any).rows ?? (result as any) ?? [];
-  return Array.isArray(rows) ? (rows as ClaimedRow[]) : [];
+// One pass over at most SWEEP_BATCH_SIZE candidates. Exported for tests /
+// scripts. Never throws for one chat's failure (logged, the next tick retries).
+const sweep_once = async (): Promise<SweepOutcome & { candidates: number }> => {
+  const candidates = await select_expired_candidates(pg_client, SWEEP_BATCH_SIZE);
+  let deleted = 0;
+  for (const [chat_id, ids] of group_by_chat_sorted(candidates)) {
+    if (stopped || is_draining()) break;
+    let rows: { id: string }[] | undefined;
+    try {
+      const res = await run_pg_singleton_sql(JOB, (tx) =>
+        soft_delete_one_chat(chat_id, ids, { expired_only: true, exec: tx }),
+      );
+      if (res === undefined) {
+        // Another worker is sweeping right now; it will get to this chat.
+        return { deleted, held_elsewhere: true, candidates: candidates.length };
+      }
+      rows = res.rows;
+    } catch (err) {
+      // run_pg_singleton_sql already logged + counted it. The rows stay
+      // undeleted and are picked up by the next tick.
+      continue;
+    }
+    if (!rows || rows.length === 0) continue;
+    deleted += rows.length;
+    try {
+      // actor_id = null → sweeper-initiated; broadcast to ALL members.
+      await broadcast_deletion(chat_id, rows.map((r) => r.id), null);
+    } catch (err) {
+      // The rows stay deleted. Recipients that missed the live broadcast
+      // pick it up from the pending queue or their next sync.
+      console.error(`[SWEEPER] broadcast_deletion failed (chat ${chat_id}):`, err);
+    }
+  }
+  if (deleted > 0) count("SWEEPER", "deleted", deleted);
+  return { deleted, held_elsewhere: false, candidates: candidates.length };
 };
 
 let timer: ReturnType<typeof setTimeout> | null = null;
@@ -73,44 +98,17 @@ const tick = async () => {
   }
   running = true;
   try {
-    while (!stopped) {
-      let claimed: ClaimedRow[] = [];
+    while (!stopped && !is_draining()) {
+      let outcome: Awaited<ReturnType<typeof sweep_once>>;
       try {
-        claimed = await claim_expired_batch(SWEEP_BATCH_SIZE);
+        outcome = await sweep_once();
       } catch (err) {
-        console.error("[SWEEPER] claim_expired_batch failed:", err);
+        console.error("[SWEEPER] candidate select failed:", err);
         break; // Bail this tick — next one will retry.
       }
-      if (claimed.length === 0) break;
-
-      // Group by chat so each conversation gets one broadcast with all of
-      // its expired ids — minimizes WS frame count and FCM fan-outs.
-      const by_chat = new Map<string, string[]>();
-      for (const row of claimed) {
-        let arr = by_chat.get(row.chat_id);
-        if (!arr) {
-          arr = [];
-          by_chat.set(row.chat_id, arr);
-        }
-        arr.push(row.id);
-      }
-
-      for (const [chat_id, ids] of by_chat) {
-        try {
-          // actor_id = null → sweeper-initiated; broadcast to ALL members.
-          await broadcast_deletion(chat_id, ids, null);
-        } catch (err) {
-          // Already-claimed row stays deleted at the DB level. Recipients
-          // that didn't get the live broadcast will pick it up from
-          // missed_ws_messages or from a fresh fetch on next sync.
-          console.error(`[SWEEPER] broadcast_deletion failed (chat ${chat_id}):`, err);
-        }
-      }
-
-      // Drain mode: if we got a full batch, immediately go again. Prevents
-      // a 30s gap between batches when a setting change has caused a large
-      // backlog of expired rows.
-      if (claimed.length < SWEEP_BATCH_SIZE) break;
+      // Drain mode: a full batch → go again at once (a setting change can
+      // leave a large backlog), unless another worker holds the job.
+      if (outcome.held_elsewhere || outcome.candidates < SWEEP_BATCH_SIZE) break;
     }
   } finally {
     running = false;
@@ -134,4 +132,4 @@ const start_disappearing_sweeper = (): (() => Promise<void>) => {
   };
 };
 
-export { start_disappearing_sweeper, claim_expired_batch };
+export { start_disappearing_sweeper, sweep_once };
