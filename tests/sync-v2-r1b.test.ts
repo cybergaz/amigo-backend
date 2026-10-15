@@ -130,7 +130,7 @@ describe("receipt windows → legacy effects plan (§3.7 step 2)", () => {
       ws_timestamp: at,
     });
   });
-  test("delivered window: status:ack only for rows ABOVE the new read_seq, per sender, with seqs", () => {
+  test("delivered window: per-sender status:ack with seqs; rows read in the same window ack 'delivered'+'read'", () => {
     const plan = plan_receipt_effects(U, [{ chat_id: CH, rp: 10, rn: 12, dp: 10, dn: 15 }], res({
       senders: new Map([[CH, [S1]]]),
       last_read: new Map([[CH, "m12"]]),
@@ -145,7 +145,14 @@ describe("receipt windows → legacy effects plan (§3.7 step 2)", () => {
     const acks = plan.frames.filter((f) => f.message.type === "message:status:ack");
     expect(acks.map((f) => f.to[0]).sort()).toEqual([S1, S2].sort());
     const s1 = acks.find((f) => f.to[0] === S1)!.message.payload as any;
-    expect(s1.acks).toEqual([{ chat_id: CH, msg_ids: ["m13"], status: ["delivered"], seqs: [13] }]);
+    // m11/m12 were delivered AND read in this window: an old sender has no
+    // message_info row for them, so the join alone left them grey.
+    expect(s1.acks).toEqual([
+      { chat_id: CH, msg_ids: ["m13"], status: ["delivered"], seqs: [13] },
+      { chat_id: CH, msg_ids: ["m11", "m12"], status: ["delivered", "read"], seqs: [11, 12] },
+    ]);
+    const s2 = acks.find((f) => f.to[0] === S2)!.message.payload as any;
+    expect(s2.acks).toEqual([{ chat_id: CH, msg_ids: ["m15"], status: ["delivered"], seqs: [15] }]);
     expect(s1).toMatchObject({ recipient_id: U, reader_id: U, delivered_seq: 15, read_seq: 12 });
     // drains: the reader's message:new for every row; each sender's sent:ack,
     // and a broadcast copy's parent sent:ack too
@@ -169,14 +176,21 @@ describe("receipt windows → legacy effects plan (§3.7 step 2)", () => {
     expect(plan.frames).toHaveLength(0);
     expect(plan.drains.size).toBe(0);
   });
-  test("legacy join (reader_drain: false): read effects, but the reader's unreceived copies stay pending", () => {
+  test("legacy join (reader_drain: false): read effects + delivered/read acks to the sender, but the reader's unreceived copies stay pending", () => {
     const plan = plan_receipt_effects(U, [{ chat_id: CH, rp: 0, rn: 3, dp: 0, dn: 3 }], res({
       senders: new Map([[CH, [S1]]]),
       last_read: new Map([[CH, "m3"]]),
       delivered: new Map([[CH, [1, 2, 3].map((n) => ({ id: `m${n}`, seq: n, sender_id: S1, broadcast_msg_id: null }))]]),
     }), new Date(0), { reader_drain: false });
     expect(plan.drains.has(U)).toBe(false);
-    expect(plan.frames.map((f) => f.message.type)).toEqual(["conversation:join"]);
+    expect(plan.frames.map((f) => f.message.type)).toEqual(["conversation:join", "message:status:ack"]);
+    // The 4.2.2 blue-tick case: delivered and read arrive together, so the
+    // sender gets the per-message ack that creates its message_info rows.
+    const ack = plan.frames[1]!;
+    expect(ack.to).toEqual([S1]);
+    expect((ack.message.payload as any).acks).toEqual([
+      { chat_id: CH, msg_ids: ["m1", "m2", "m3"], status: ["delivered", "read"], seqs: [1, 2, 3] },
+    ]);
   });
   test("no last visible row → no join frame; windows past their caps are counted", () => {
     const plan = plan_receipt_effects(U, [

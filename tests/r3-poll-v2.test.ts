@@ -295,6 +295,22 @@ describe("inline delta attestation", () => {
     expect([t!.rows, t!.through_seq, t!.has_more, t!.tail_needed]).toEqual([[], 0, true, true]);
     expect([edge!.rows.length, edge!.through_seq, edge!.has_more, edge!.tail_needed]).toEqual([1, TAIL_GAP, false, false]);
   });
+  test("FCM: a single message is stubbed only when the push really exceeds FCM's 4096-byte data limit", async () => {
+    const f = await Bun.file(`${import.meta.dir}/../src/services/fcm-batch.service.ts`).text();
+    const m = f.match(/const MAX_SINGLE_WS_MESSAGE_BYTES = (\d+);/);
+    expect(m).not.toBeNull();
+    const single = Number(m![1]);
+    expect(f).toContain("if (ws_messages_byte_size([ws_message]) > MAX_SINGLE_WS_MESSAGE_BYTES) {");
+    // A 3.6 KB text (what 4.2.2 can send under its 3.5 KB split) is NOT stubbed:
+    // 4.2.2 can't parse the stub (no sent_at) and would show no notification.
+    const text = JSON.stringify([{ type: "message:new", payload: { id: crypto.randomUUID(), conv_id: CHAT, sender_id: U, msg_type: "text", body: "x".repeat(3500), sent_at: new Date().toISOString(), replied_to: null }, ws_timestamp: new Date().toISOString() }]);
+    expect(Buffer.byteLength(text)).toBeGreaterThan(3700);
+    expect(Buffer.byteLength(text)).toBeLessThanOrEqual(single);
+    // …and the whole data map (type, to_user_id, ws_messages, silent) still fits 4096.
+    const data = { type: "ws-message", to_user_id: U, ws_messages: text, silent: "1" };
+    const data_bytes = Object.entries(data).reduce((n, [k, v]) => n + Buffer.byteLength(k) + Buffer.byteLength(v), 0);
+    expect(data_bytes + (single - Buffer.byteLength(text))).toBeLessThanOrEqual(4096);
+  });
   test("FCM: an 'on' message:delete push drops mods / pin (derivable), like meta (source contract)", async () => {
     const f = await Bun.file(`${import.meta.dir}/../src/services/fcm-batch.service.ts`).text();
     expect(f).toContain("const strip_delete = ws_message.type === 'message:delete' && ('mods' in p || 'pin' in p);");

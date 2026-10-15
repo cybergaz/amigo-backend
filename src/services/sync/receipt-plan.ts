@@ -2,7 +2,7 @@
 // Receipt effects plan (SYNC_V2_PROTOCOL.md §3.7 step 2) — PURE
 // =============================================================================
 // What to emit for one user's committed receipt windows: the frames
-// (conversation:join, message:status:ack 'delivered'), the Redis
+// (conversation:join, message:status:ack 'delivered' / 'delivered'+'read'), the Redis
 // reset_unread chats and the pending drains. No db / redis / socket imports,
 // so the rules are unit-tested directly; receipt-effects.ts runs the plan.
 // =============================================================================
@@ -87,7 +87,13 @@ export const plan_receipt_effects = (
     if (w.dn > w.dp && (delivered_relay || reader_drain)) {
       if (w.dn - w.dp > RECEIPT_WINDOW_CAP) plan.capped++;
       const rows = res.delivered.get(w.chat_id) ?? [];
-      const per_sender = new Map<string, { ids: string[]; seqs: number[] }>();
+      // Per sender: rows only delivered now (d) and rows delivered AND read
+      // in this same window (dr). The dr rows need a per-message
+      // ['delivered','read'] ack: an old app's sender has no message_info row
+      // for them yet (no earlier delivered ack created one), and its
+      // conversation:join handler only UPDATEs existing rows — with the join
+      // alone their ticks stayed grey.
+      const per_sender = new Map<string, { d: { ids: string[]; seqs: number[] }; dr: { ids: string[]; seqs: number[] } }>();
       for (const r of rows) {
         if (reader_drain) drain(user_id, Snowflake.correlationId(user_id, "message:new", r.id));
         if (!delivered_relay || !r.sender_id || lc(r.sender_id) === me) continue;
@@ -95,17 +101,20 @@ export const plan_receipt_effects = (
         if (r.broadcast_msg_id) {
           drain(r.sender_id, Snowflake.correlationId(r.sender_id, "message:sent:ack", r.broadcast_msg_id));
         }
-        if (r.seq <= w.rn) continue; // just read: the conversation:join covers it
-        const g = per_sender.get(r.sender_id) ?? { ids: [], seqs: [] };
-        g.ids.push(r.id);
-        g.seqs.push(r.seq);
+        const g = per_sender.get(r.sender_id) ?? { d: { ids: [], seqs: [] }, dr: { ids: [], seqs: [] } };
+        const bucket = r.seq <= w.rn ? g.dr : g.d;
+        bucket.ids.push(r.id);
+        bucket.seqs.push(r.seq);
         per_sender.set(r.sender_id, g);
       }
       for (const [sender, g] of per_sender) {
+        const acks: MessageStatusAckPayload["acks"] = [];
+        if (g.d.ids.length > 0) acks.push({ chat_id: w.chat_id, msg_ids: g.d.ids, status: ["delivered"], seqs: g.d.seqs });
+        if (g.dr.ids.length > 0) acks.push({ chat_id: w.chat_id, msg_ids: g.dr.ids, status: ["delivered", "read"], seqs: g.dr.seqs });
         const payload: MessageStatusAckPayload = {
           recipient_id: user_id,
           at,
-          acks: [{ chat_id: w.chat_id, msg_ids: g.ids, status: ["delivered"], seqs: g.seqs }],
+          acks,
           reader_id: user_id,
           delivered_seq: w.dn,
           read_seq: w.rn,

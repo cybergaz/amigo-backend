@@ -7,7 +7,14 @@ import { strip_inline_thumbs } from '@/utils/attachment-thumbs';
 const MAX_MESSAGES = 4;
 const WINDOW_MS = 4000;
 // Reserve ~300 bytes for FCM envelope overhead (token, type, android config, etc.)
+// Used to decide when a BATCH flushes (several messages share one push).
 const MAX_WS_MESSAGES_BYTES = 3700;
+// When ONE message is too big for a push and becomes the `partial` stub.
+// FCM's limit is 4096 bytes of data keys + values; besides ws_messages the
+// data map carries only type ('ws-message'), to_user_id (36) and silent
+// ('1'), ~80 bytes. 3700 here stubbed 3.3–3.6 KB texts that fit; 4.2.2 can't
+// parse the stub (no sent_at) and showed no notification for them.
+const MAX_SINGLE_WS_MESSAGE_BYTES = 3950;
 
 type ResultCallback = (ok: boolean) => void;
 
@@ -50,7 +57,7 @@ let oversize_stubbed_total = 0;
 
 /**
  * Single-oversize stub (SYNC_V2 R0). A message:new that ALONE exceeds
- * MAX_WS_MESSAGES_BYTES used to be sent anyway (the size check only splits
+ * MAX_SINGLE_WS_MESSAGE_BYTES used to be sent anyway (the size check only splits
  * when the batch already holds something), so FCM rejected the whole push
  * (4KB data limit) and the recipient got nothing. It is replaced by a minimal
  * stub: ids + chat id + type + the first 200 chars of body (notification
@@ -176,7 +183,7 @@ export async function queue_message_fcm(
   // batched: an old client's parser aborts the rest of a ws_messages array at
   // the stub, so it must not share a push with real messages). Whatever is
   // already batched is flushed first so per-user order is kept.
-  if (ws_messages_byte_size([ws_message]) > MAX_WS_MESSAGES_BYTES) {
+  if (ws_messages_byte_size([ws_message]) > MAX_SINGLE_WS_MESSAGE_BYTES) {
     const stub = make_oversize_stub(ws_message);
     if (stub) {
       oversize_stubbed_total++;

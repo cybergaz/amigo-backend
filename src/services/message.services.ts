@@ -110,12 +110,16 @@ const get_user_info = async (user_id: string) => {
 // given and the fan-out / history then shipped that row's body + attachments
 // as the reply preview — so a member could quote (and so read) a message
 // deleted for everyone, an expired disappearing one, or one from a chat they
-// are not in, just by knowing its id. Keep the reference only when it is a
-// live, unexpired message of THIS chat (the same rule as /message/reply);
-// otherwise it becomes a plain message (replied_to null — wire format
-// unchanged). One PK lookup, only for replies. Throws on a DB error: the
-// caller fails the frame transiently (the client retries) rather than
-// storing an unchecked reference.
+// are not in, just by knowing its id. Drop the reference (replied_to null —
+// wire format unchanged, sent as a plain message) when the id names a row
+// that is NOT a live, unexpired message of THIS chat. An id with no row yet
+// is KEPT: the quoted message is usually still in flight (offline "send A,
+// reply to A" replays both at once and frames are not ordered), and every
+// read path (fan-out preview, history, sync) re-checks chat + deleted when it
+// resolves the preview, so an unknown id can never leak another chat's row.
+// One PK lookup, only for replies. Throws on a DB error: the caller fails
+// the frame transiently (the client retries) rather than storing an
+// unchecked reference.
 const resolve_reply_target = async (
   replied_to: string | null | undefined,
   conv_id: string,
@@ -126,18 +130,21 @@ const resolve_reply_target = async (
     return null;
   }
   const [orig] = await db
-    .select({ id: message_model.id })
+    .select({
+      id: message_model.id,
+      live: sql<boolean>`${message_model.chat_id} = ${conv_id}::uuid
+        AND ${message_model.deleted_at} IS NULL
+        AND (${message_model.expires_at} IS NULL OR ${message_model.expires_at} > now())`,
+    })
     .from(message_model)
-    .where(
-      and(
-        eq(message_model.id, replied_to),
-        eq(message_model.chat_id, conv_id),
-        isNull(message_model.deleted_at),
-        or(isNull(message_model.expires_at), gt(message_model.expires_at, sql`now()`)),
-      ),
-    )
+    .where(eq(message_model.id, replied_to))
     .limit(1);
-  if (orig) return orig.id;
+  if (!orig) {
+    // Not stored yet (in flight): keep it; previews are resolved per chat.
+    count("AUTH", "reply_target_pending");
+    return replied_to;
+  }
+  if (orig.live) return orig.id;
   count("AUTH", "reply_target_dropped");
   console.warn(`[message:new] replied_to ${replied_to} is not a live message of ${conv_id}; sent as a plain message`);
   return null;

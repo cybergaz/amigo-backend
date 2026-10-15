@@ -159,7 +159,9 @@ const UNREAD_RECOUNT_CAP = 1000;
 // The old behaviour was an unconditional reset to 0, so a delayed or replayed
 // join/mark_read (outbox replay after reconnect) zeroed the badge for messages
 // that arrived AFTER the watermark. Now: recount the messages from others that
-// are newer than the watermark and store that. Unknown watermark (e.g. the
+// are newer than the watermark and store that. System rows (sender_id NULL)
+// never count: apps send the newest NON-system id as their read watermark, so
+// counting system rows after it brought the badge back on a read chat. Unknown watermark (e.g. the
 // reader's own not-yet-stored message) keeps the old reset-to-0 behaviour.
 const reset_unread_upto = async (
   user_id: string,
@@ -174,6 +176,7 @@ const reset_unread_upto = async (
                  WHERE ${message_model.chat_id} = ${conv_id}
                    AND ${message_model.deleted_at} IS NULL
                    AND ${message_model.sender_id} IS DISTINCT FROM ${user_id}::uuid
+                   AND ${message_model.type} <> 'system'
                    AND ${message_model.sent_at} > (SELECT ${message_model.sent_at} FROM ${message_model} WHERE ${message_model.id} = ${last_read_msg_id} LIMIT 1)
                  LIMIT ${UNREAD_RECOUNT_CAP}
              ) newer) AS n`);
