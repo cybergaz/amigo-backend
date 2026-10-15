@@ -23,6 +23,8 @@ Files (all under `deploy/` in the repo):
 | `bin/wait-ready.sh`, `bin/watchdog.sh`, `bin/deploy.sh`, `bin/amigo-run.sh` | `/opt/amigo/bin/` |
 | `nginx/amigo-upstreams.conf` | `/etc/nginx/conf.d/` |
 | `nginx/amigo-ws.conf` | `/etc/nginx/snippets/` |
+| `nginx/amigo-errors.conf` | `/etc/nginx/snippets/` (included at server level in step 3) |
+| `journald/amigo.conf` | `/etc/systemd/journald.conf.d/` |
 | `nginx/api-locations.example.conf` | reference only: edit your server block by hand |
 | `prod.env.example` | reference only: build `/etc/amigo/prod.env` from it |
 
@@ -45,7 +47,22 @@ git source for `deploy.sh`.
    - the exact `proxy_pass` lines of `location = /chat`, `/chat/`,
      `/chat/sse`, `/chat/poll` and `/`, including any URI part after the port;
    - `client_max_body_size` and anything else in `location /`;
+   - every `error_page` line and any `location = /50x.html`. Prod sends
+     502/503/504 to a `/50x.html` that does not exist, so every restart
+     answers **404** to all clients; step 3 replaces this;
    - that `worker_shutdown_timeout` is **not** set (keep it unset).
+8. **Upload body cap.** Every upload is a POST to `/api/media/*`, which
+   today goes through `location /`. Run
+   `sudo nginx -T | grep -nE 'server_name|location|client_max_body_size'`
+   and find the value in force for that location (a location's own value
+   wins over the server block's, which wins over `http {}`; none at all means
+   nginx's default of **1m**). It must be **≥ 96m**: Bun accepts 96 MiB and
+   the app sends files up to 95 MiB (Cloudflare's free plan caps bodies at
+   100 MB). If it is lower, uploads between that value and 95 MiB fail with
+   nginx's 413 page. Step 3 sets it; step 5 checks it again.
+9. **Journal space.** `df -h /var/log` and `sudo journalctl --disk-usage`.
+   `deploy/journald/amigo.conf` explains how to size `SystemMaxUse` for 7+
+   days of logs; there must be room for it plus `SystemKeepFree`.
 4. **NODE_ENV.** Find the prod bun pid with `ss -ltnp 'sport = :5000'`, then
    `sudo cat /proc/<pid>/environ | tr '\0' '\n' | sort`. Note whether
    `NODE_ENV` is set. Add it to the unit only if it is (auth cookie config).
@@ -84,8 +101,15 @@ sudo systemctl daemon-reload                                   # enables nothing
 # nginx: upstreams + WS snippet. Defined but unused until step 3, so they
 # change nothing. Validate only; no reload needed yet.
 sudo install -m 0644 deploy/nginx/amigo-upstreams.conf /etc/nginx/conf.d/
-sudo install -m 0644 deploy/nginx/amigo-ws.conf /etc/nginx/snippets/
+sudo install -m 0644 deploy/nginx/amigo-ws.conf deploy/nginx/amigo-errors.conf /etc/nginx/snippets/
 sudo nginx -t
+
+# journald: keep 7+ days of logs (size it first, see the file). Restarting
+# journald now is harmless: prod still logs to tmux, not to the journal.
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo install -m 0644 deploy/journald/amigo.conf /etc/systemd/journald.conf.d/
+sudo systemctl restart systemd-journald
+systemd-analyze cat-config systemd/journald.conf | tail -8
 ```
 
 **Environment file.** Build `/etc/amigo/prod.env` by following
@@ -163,10 +187,18 @@ Change the locations as shown in `deploy/nginx/api-locations.example.conf`:
   their URI forms;
 - delete `location /chat/poll` and `location /chat/sse`, since no backend
   route serves either;
-- add the localhost-only `location = /api/readyz`.
+- add the localhost-only `location = /api/readyz`;
+- delete the `error_page 500 502 503 504 /50x.html` line (and
+  `location = /50x.html`, if any) and add `include snippets/amigo-errors.conf;`
+  once at server level: while no slot answers, clients get
+  `503 {"error":"unavailable"}` with `Retry-After: 5` instead of a 404;
+- set `client_max_body_size 96m;` in `location /` (Part A, item 8).
 
 ```sh
-sudo nginx -t && sudo systemctl reload nginx
+sudo nginx -t && sudo nginx -T 2>/dev/null | grep -nE 'error_page|amigo_unavailable|client_max_body_size'
+# expect: one "error_page 502 503 504 = @amigo_unavailable;", no /50x.html,
+# and client_max_body_size 96m (or more) in the location serving /api/media
+sudo systemctl reload nginx
 ```
 
 New connections now go to slot 1. Existing WS connections to tmux stay on
@@ -190,6 +222,7 @@ ss -ltnp | grep -E ':(5000|5002|5101|5201)\b'   # only 5101 and 5201 (amigo)
 journalctl -u amigo@1 --since -5min | grep -E 'wid=|\[WS\] counters'
 curl -s https://api.amigochats.com/api/healthz   # rev = ${SHA:0:12}
 curl -s -o /dev/null -w '%{http_code}\n' https://api.amigochats.com/api/readyz   # 403 (localhost only)
+sudo nginx -T 2>/dev/null | grep -nE '50x|client_max_body_size'   # no 50x; 96m (or more) for /api/media
 ```
 
 Open the app on a phone: chats load, a message sends and gets its tick, and a
@@ -272,6 +305,8 @@ re-install from the release dir. Units take effect on a slot's next start.
 R=/opt/amigo/releases/<sha>
 sudo install -m 0755 $R/deploy/bin/*.sh /opt/amigo/bin/
 sudo install -m 0644 $R/deploy/systemd/amigo* /etc/systemd/system/ && sudo systemctl daemon-reload
+sudo install -m 0644 $R/deploy/nginx/amigo-ws.conf $R/deploy/nginx/amigo-errors.conf /etc/nginx/snippets/ \
+  && sudo nginx -t && sudo systemctl reload nginx     # only if they changed; batch reloads
 ```
 
 **Log lines worth knowing** (each counter line is printed every 10 min):
@@ -282,6 +317,17 @@ sudo install -m 0644 $R/deploy/systemd/amigo* /etc/systemd/system/ && sudo syste
 - `[JOBS] missed_cleanup ran <ms> rows=<n>` (about once a day)
 - `[CALL] counters {…}` (ring_timeout_tick / _backstop)
 - `[UPLOAD] counters {…}` (large uploads admitted / refused with 503)
+- `[FANOUT] kind=new msg=… chat=… rcpt=… on= bg= poll= off= fcm= sent= failed=`,
+  one line per delivered message (`kind=fwd` forwards, `kind=blist`
+  broadcast lists; `pending=` = FCM results that never came). Trace a
+  "missing message" report with `journalctl -u 'amigo@*' | grep <message id>`
+- `[POLL] counters {…}`: `resend_unacked` (poll v1 re-sent a message:new that
+  was never acked: a response was lost), `held_unacked`, `dropped_deleted`,
+  `expired_unacked` (dropped 7 days after its first return, never acked;
+  also logged per user as `[POLL] expired_unacked`)
+- Debug detail is off by default. `AMIGO_DEBUG=PENDING,FANOUT` in
+  `/etc/amigo/prod.env` plus a gentle restart adds pending-queue store / read /
+  remove lines and the per-recipient FANOUT ids. Turn it off again afterwards.
 - `[CLUSTER] refused_second_instance` (a stray second slot was blocked)
 
 **Rules.**

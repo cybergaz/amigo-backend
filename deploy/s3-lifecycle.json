@@ -1,0 +1,16 @@
+{
+  "Rules": [
+    {
+      "ID": "amigo-abort-incomplete-multipart-7d",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    },
+    {
+      "ID": "amigo-expire-upload-staging-2d",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "staging/" },
+      "Expiration": { "Days": 2 }
+    }
+  ]
+}
