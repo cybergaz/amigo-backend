@@ -11,7 +11,12 @@ import { batch_set_last_message, increment_unread } from "@/cache-management/cha
 import { get_message_statuses_bulk } from "@/cache-management/message.cache";
 import { prime_chat_type } from "@/cache-management/chat-type.cache";
 import { queue_message_fcm } from "@/services/fcm-batch.service";
-import { resolve_stored_sent_at } from "@/utils/message-time.utils";
+import { start_fanout_log } from "@/utils/fanout-log";
+import { resolve_expires_at, resolve_stored_sent_at } from "@/utils/message-time.utils";
+import { soft_delete_grouped } from "@/services/sync/bulk-delete";
+import { sync_v2_flags } from "@/services/app-settings.service";
+import { server_expiry_active, v2_on } from "@/services/sync/flags-core";
+import { ack_seq_fields } from "@/services/sync/frame-fields";
 import {
   BROADCAST_COPIES_MAX_IDS,
   BROADCAST_FANOUT_CONCURRENCY,
@@ -69,6 +74,13 @@ type BroadcastCopyDTO = {
   msg_id: string;
   delivered_at: string | null;
   read_at: string | null;
+  // SYNC_V2 §3.8 (additive, sync_v2 'on' only): the copy's seq in its DM and
+  // the recipient's watermarks there. The list bubble is blue iff every
+  // copy's recipient_read_seq >= copy_seq (double-grey likewise, delivered).
+  dm_chat_id?: string;
+  copy_seq?: number | null;
+  recipient_read_seq?: number | null;
+  recipient_delivered_seq?: number | null;
 };
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
@@ -369,6 +381,12 @@ const get_broadcast_copies = async (
     if (ids.length === 0) return { success: true, code: 200, message: "No copies", data: [] };
 
     const bmc = broadcast_message_copy_model;
+    // §3.8: the copy's seq and the recipient's DM watermarks ride the SAME
+    // statement (two primary-key / unique-index probes per copy), selected
+    // always and shipped only in 'on'.
+    const copy_msg = alias(message_model, "copy_msg");
+    const rcpt = alias(chat_member_model, "rcpt");
+    const v2 = v2_on(sync_v2_flags());
     const rows = await db
       .select({
         broadcast_msg_id: bmc.broadcast_msg_id,
@@ -377,6 +395,9 @@ const get_broadcast_copies = async (
         msg_id: bmc.message_id,
         delivered_at: message_info_model.delivered_at,
         read_at: message_info_model.read_at,
+        copy_seq: copy_msg.seq,
+        recipient_read_seq: rcpt.read_seq,
+        recipient_delivered_seq: rcpt.delivered_seq,
       })
       .from(bmc)
       .innerJoin(message_model, eq(message_model.id, bmc.broadcast_msg_id))
@@ -395,6 +416,18 @@ const get_broadcast_copies = async (
           eq(message_info_model.user_id, bmc.recipient_id),
         ),
       )
+      .leftJoin(copy_msg, eq(copy_msg.id, bmc.message_id))
+      // The recipient's live row in the DM (uniq_chat_members_active). A
+      // hidden DM (removed_at set) still advances its watermarks, but has no
+      // live row: the fields are then null and the client keeps its ticks.
+      .leftJoin(
+        rcpt,
+        and(
+          eq(rcpt.chat_id, bmc.chat_id),
+          eq(rcpt.user_id, bmc.recipient_id),
+          isNull(rcpt.removed_at),
+        ),
+      )
       .where(inArray(bmc.broadcast_msg_id, ids));
 
     const redis_statuses = await get_message_statuses_bulk(
@@ -411,6 +444,14 @@ const get_broadcast_copies = async (
         msg_id: r.msg_id,
         delivered_at: iso(r.delivered_at) ?? cached?.delivered_at ?? null,
         read_at: iso(r.read_at) ?? cached?.read_at ?? null,
+        ...(v2
+          ? {
+            dm_chat_id: r.conv_id,
+            copy_seq: r.copy_seq ?? null,
+            recipient_read_seq: r.recipient_read_seq ?? null,
+            recipient_delivered_seq: r.recipient_delivered_seq ?? null,
+          }
+          : {}),
       };
     });
 
@@ -446,6 +487,11 @@ type CopyDelivery = {
   // DM membership changed in this send (created or revived) → the Redis
   // member sets must be (re)hydrated so later normal DM sends fan out.
   membership_changed: boolean;
+  // The copy's clock values (RETURNING of the copy insert; null on a chat
+  // not numbered yet). Shipped on the copy's message:new in sync_v2 'on'.
+  seq?: number | null;
+  mod_seq?: number | null;
+  created_at?: Date | null;
 };
 
 type BroadcastTxResult =
@@ -612,6 +658,10 @@ const run_broadcast_transaction = async (args: {
 }): Promise<BroadcastTxResult> =>
   db.transaction(async (tx) => {
     const { payload, sender_id, list_id, sent_at } = args;
+    // Disappearing deadlines count from server arrival when enabled (§3.10);
+    // one instant for the sender copy and every DM copy.
+    const arrival = new Date();
+    const server_expiry = server_expiry_active(sync_v2_flags());
 
     // Bounded waits (see tx_timeouts_sql): a stalled lock holder turns into a
     // retryable 500 ack instead of piling pooled connections up behind it.
@@ -663,10 +713,7 @@ const run_broadcast_transaction = async (args: {
         body: payload.body,
         attachments: payload.attachments,
         sent_at,
-        expires_at:
-          args.list_disappearing_after_sec != null
-            ? new Date(sent_at.getTime() + args.list_disappearing_after_sec * 1000)
-            : null,
+        expires_at: resolve_expires_at(args.list_disappearing_after_sec, sent_at, server_expiry, arrival),
       })
       .onConflictDoNothing({ target: message_model.id })
       .returning();
@@ -769,10 +816,7 @@ const run_broadcast_transaction = async (args: {
         dm_id: dm.dm_id,
         copy_id: derive_broadcast_copy_id(payload.id, rid, sent_ms),
         // Each copy follows ITS DM's disappearing setting, not the list's.
-        expires_at:
-          dm.disappearing_after_sec != null
-            ? new Date(sent_ms + dm.disappearing_after_sec * 1000)
-            : null,
+        expires_at: resolve_expires_at(dm.disappearing_after_sec, sent_at, server_expiry, arrival),
         announce_conversation: is_new || revived_pairs.has(`${dm_key}:${rid}`),
         membership_changed: is_new || revived_chats.has(dm_key),
       };
@@ -780,10 +824,23 @@ const run_broadcast_transaction = async (args: {
 
     // The copies: ordinary DM messages from the sender. No replied_to — the
     // replied-to message lives in the broadcast chat, which recipients can't see.
-    await tx
+    //
+    // Insert order = DM id order (SYNC_V2 §3.3.2). Each copy's messages_bi
+    // allocates in its DM and holds that chat's clock lock until COMMIT, and a
+    // multi-row INSERT takes them in VALUES order. Sorted, two broadcasts
+    // sharing DMs (and the per-DM bulk deletes) acquire them in one global
+    // order and cannot deadlock. This insert stays the LAST multi-chat write
+    // before the copy index + commit, so those locks are held as briefly as
+    // possible. `deliveries` keeps recipient order for the ack / fan-out.
+    const by_dm = [...deliveries].sort((a, b) => {
+      const x = a.dm_id.toLowerCase();
+      const y = b.dm_id.toLowerCase();
+      return x < y ? -1 : x > y ? 1 : 0;
+    });
+    const inserted_copies = await tx
       .insert(message_model)
       .values(
-        deliveries.map((d) => ({
+        by_dm.map((d) => ({
           id: d.copy_id,
           chat_id: d.dm_id,
           sender_id,
@@ -796,7 +853,19 @@ const run_broadcast_transaction = async (args: {
           created_at: sql`clock_timestamp()`,
         })),
       )
-      .onConflictDoNothing({ target: message_model.id });
+      .onConflictDoNothing({ target: message_model.id })
+      // Same round trip: each copy's seq (messages_bi) for the frames + the
+      // chat_meta seq-CAS (SYNC_V2 §3.5 / §4.1).
+      .returning({ id: message_model.id, seq: message_model.seq, mod_seq: message_model.mod_seq, created_at: message_model.created_at });
+    const copy_clock = new Map(inserted_copies.map((r) => [r.id, r]));
+    for (const d of deliveries) {
+      const c = copy_clock.get(d.copy_id);
+      if (c) {
+        d.seq = c.seq ?? null;
+        d.mod_seq = c.mod_seq ?? null;
+        d.created_at = c.created_at ?? null;
+      }
+    }
 
     await tx
       .insert(broadcast_message_copy_model)
@@ -915,6 +984,7 @@ const fan_out_broadcast = async (ctx: {
   // broadcast frame carried — the list id, a reply target — must never reach
   // a recipient. Re-homed into each DM with the copy id and the stored
   // sent_at / expires_at.
+  const v2 = v2_on(sync_v2_flags());
   const copy_payload = (d: CopyDelivery): ChatMessagePayload => ({
     id: d.copy_id,
     conv_id: d.dm_id,
@@ -925,6 +995,10 @@ const fan_out_broadcast = async (ctx: {
     replied_to_message: null,
     sent_at,
     expires_at: d.expires_at,
+    // §4.1 additive ('on' only)
+    ...(v2 && d.seq != null
+      ? { seq: d.seq, mod_seq: d.mod_seq ?? d.seq, srv_ts: d.created_at ? new Date(d.created_at).toISOString() : null }
+      : {}),
   });
 
   // 3. Last-message pointers: every DM + the list itself, one Redis pipeline
@@ -941,9 +1015,10 @@ const fan_out_broadcast = async (ctx: {
     sent_at: sent_at_iso,
     attachments: payload.attachments ?? null,
   };
+  // seq: the chat_meta seq-CAS in sync_v2 'on' (§3.5); ignored otherwise.
   await batch_set_last_message([
-    { chat_id: list_id, msg: { id: ctx.sender_copy.id, ...base_meta } },
-    ...deliveries.map((d) => ({ chat_id: d.dm_id, msg: { id: d.copy_id, ...base_meta } })),
+    { chat_id: list_id, msg: { id: ctx.sender_copy.id, ...base_meta, seq: ctx.sender_copy.seq ?? null } },
+    ...deliveries.map((d) => ({ chat_id: d.dm_id, msg: { id: d.copy_id, ...base_meta, seq: d.seq ?? null } })),
   ]);
 
   const in_bucket = (p: Presence | undefined, rid: string) => ({
@@ -1006,6 +1081,18 @@ const fan_out_broadcast = async (ctx: {
     const b = in_bucket(presence.get(d.recipient_id), d.recipient_id);
     return b.offline || b.background;
   });
+  // ONE [FANOUT] line for the whole broadcast (each copy is its own DM
+  // message, but a line per copy would be a line per recipient). msg is the
+  // sender's list copy; the buckets aggregate every recipient's presence.
+  const agg = { online: [] as string[], offline: [] as string[], polling: [] as string[], background: [] as string[] };
+  for (const d of deliveries) {
+    const b = in_bucket(presence.get(d.recipient_id), d.recipient_id);
+    if (b.online) agg.online.push(d.recipient_id);
+    if (b.offline) agg.offline.push(d.recipient_id);
+    if (b.polling) agg.polling.push(d.recipient_id);
+    if (b.background) agg.background.push(d.recipient_id);
+  }
+  const fanout = start_fanout_log("blist", ctx.sender_copy.id, list_id, agg);
   if (fcm_targets.length > 0) {
     const muted = new Set<string>();
     try {
@@ -1028,21 +1115,27 @@ const fan_out_broadcast = async (ctx: {
       console.error("[BROADCAST] mute lookup failed:", err);
     }
     for (const d of fcm_targets) {
+      const on_result = fanout.fcm_queued();
       queue_message_fcm(
         d.recipient_id,
         { type: "message:new", payload: copy_payload(d), ws_timestamp: new Date() },
-        { silent: muted.has(`${d.dm_id.toLowerCase()}:${d.recipient_id}`) },
-      ).catch((err) => console.error("[BROADCAST] FCM queue failed:", err));
+        { silent: muted.has(`${d.dm_id.toLowerCase()}:${d.recipient_id}`), on_result },
+      ).catch((err) => {
+        on_result(false);
+        console.error("[BROADCAST] FCM queue failed:", err);
+      });
     }
   }
+  fanout.done_queueing();
 };
 
-const send_sent_ack = async (user_id: string, ack: MessageSentAckPayload): Promise<void> => {
+const send_sent_ack = async (user_id: string, ack: MessageSentAckPayload): Promise<MessageSentAckPayload> => {
   await broadcast_message({
     to: "users",
     user_ids: [user_id],
     message: { type: "message:sent:ack", payload: ack, ws_timestamp: new Date() },
   });
+  return ack;
 };
 
 /**
@@ -1053,15 +1146,18 @@ const send_sent_ack = async (user_id: string, ack: MessageSentAckPayload): Promi
 const handle_broadcast_message_new = async (
   payload: ChatMessagePayload,
   auth_user_id: string | undefined,
-): Promise<ResultType> => {
-  const reject = async (code: number, message: string): Promise<ResultType> => {
-    await send_sent_ack(auth_user_id || payload.sender_id, {
+): Promise<ResultType<{ sent_ack: MessageSentAckPayload }>> => {
+  // data.sent_ack: the ack the sender got, for POST /chat/poll/send-message's
+  // `sent_ack` (SYNC_V2 §4.1).
+  type R = ResultType<{ sent_ack: MessageSentAckPayload }>;
+  const reject = async (code: number, message: string): Promise<R> => {
+    const sent_ack = await send_sent_ack(auth_user_id || payload.sender_id, {
       msg_id: payload.id,
       conv_id: payload.conv_id,
       is_sent: false,
       error_code: code,
     });
-    return { success: false, code, message };
+    return { success: false, code, message, data: { sent_ack } };
   };
 
   // Idempotent re-ack of an already-stored broadcast message, from the
@@ -1069,18 +1165,18 @@ const handle_broadcast_message_new = async (
   const ack_duplicate = async (
     sender_id: string,
     stored: { sent_at: Date | null; copies: BroadcastCopyRef[] },
-  ): Promise<ResultType> => {
+  ): Promise<R> => {
     console.warn(
       `[BROADCAST] idempotent duplicate ignored: msg_id=${payload.id} list=${payload.conv_id} sender=${sender_id}`,
     );
-    await send_sent_ack(sender_id, {
+    const sent_ack = await send_sent_ack(sender_id, {
       msg_id: payload.id,
       conv_id: payload.conv_id,
       is_sent: true,
       sent_at: stored.sent_at ?? undefined,
       broadcast_copies: stored.copies,
     });
-    return { success: true, code: 200, message: "Duplicate broadcast message ignored (idempotent)" };
+    return { success: true, code: 200, message: "Duplicate broadcast message ignored (idempotent)", data: { sent_ack } };
   };
 
   try {
@@ -1195,8 +1291,9 @@ const handle_broadcast_message_new = async (
     // Ack right after commit, BEFORE the fan-out (same reason as the normal
     // path: the single tick means "the server has it"), carrying every copy so
     // the app can mirror them into its local DMs.
+    let sent_ack: MessageSentAckPayload;
     try {
-      await send_sent_ack(sender_id, {
+      sent_ack = await send_sent_ack(sender_id, {
         msg_id: payload.id,
         conv_id: payload.conv_id,
         is_sent: true,
@@ -1206,6 +1303,8 @@ const handle_broadcast_message_new = async (
           conv_id: d.dm_id,
           msg_id: d.copy_id,
         })),
+        // §4.1 additive ('on' only): the list copy's seq / srv_ts.
+        ...(v2_on(sync_v2_flags()) ? ack_seq_fields(committed.result.sender_copy) : {}),
       });
     } finally {
       open_ack_gate();
@@ -1223,6 +1322,7 @@ const handle_broadcast_message_new = async (
       success: true,
       code: 200,
       message: `Broadcast message stored; fan-out to ${deliveries.length} recipient(s) queued`,
+      data: { sent_ack },
     };
   } catch (error) {
     console.error("[BROADCAST] handle_broadcast_message_new failed:", error);
@@ -1236,6 +1336,8 @@ const handle_broadcast_message_new = async (
 // ids themselves never become parameters (subquery below), so this only bounds
 // a pathological client-supplied delete batch, far under the 65,535 limit.
 const COPY_CASCADE_CHUNK = 1000;
+// Per-DM delete statements in flight at once (each holds one chat lock).
+const COPY_DELETE_CONCURRENCY = 4;
 
 /**
  * Soft-delete every still-live copy of the given (deleted) broadcast messages.
@@ -1259,9 +1361,10 @@ const soft_delete_broadcast_copies = async (
 ): Promise<{ id: string; chat_id: string }[]> => {
   const out: { id: string; chat_id: string }[] = [];
   for (const ids of chunk(Array.from(new Set(broadcast_msg_ids)), COPY_CASCADE_CHUNK)) {
-    const rows = await db
-      .update(message_model)
-      .set({ deleted_at: new Date() })
+    // 1. Which copies are still live (read only, no locks).
+    const live = await db
+      .select({ id: message_model.id, chat_id: message_model.chat_id })
+      .from(message_model)
       .where(
         and(
           inArray(
@@ -1274,9 +1377,25 @@ const soft_delete_broadcast_copies = async (
           isNull(message_model.deleted_at),
           !is_admin_or_staff ? eq(message_model.sender_id, user_id) : undefined,
         ),
-      )
-      .returning({ id: message_model.id, chat_id: message_model.chat_id });
-    out.push(...rows);
+      );
+    if (live.length === 0) continue;
+    // 2. Delete them one DM at a time, DMs in id order (SYNC_V2 §3.3.1): one
+    //    statement used to hold up to 250 DMs' clock locks at once, in row
+    //    order — a deadlock against a concurrent broadcast send (which locks
+    //    the same DMs, sorted) and a long stall for every sender in them.
+    //    Each per-DM statement holds exactly one chat lock, so a few may run
+    //    side by side safely. The sender filter is re-applied under the row
+    //    lock; RETURNING still decides who fans out.
+    const deleted = await soft_delete_grouped(live, {
+      sender_id: is_admin_or_staff ? null : user_id,
+      concurrency: COPY_DELETE_CONCURRENCY,
+    });
+    if (deleted.failed_chats > 0) {
+      // Healed by a replay of the same delete (heal_broadcast_ids in
+      // soft_delete_message) — the copies stay live until then.
+      console.error(`[BROADCAST] copy cascade: ${deleted.failed_chats} DM(s) failed`);
+    }
+    out.push(...deleted.rows.map((r) => ({ id: r.id, chat_id: r.chat_id })));
   }
   return out;
 };

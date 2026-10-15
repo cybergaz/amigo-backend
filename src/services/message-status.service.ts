@@ -1,4 +1,5 @@
 import db from "@/config/db";
+import { note_fcm_delivered_receipt } from "@/services/fcm-health";
 import {
   message_model,
   message_info_model,
@@ -12,6 +13,10 @@ import Snowflake from "@/utils/snowflake.utils";
 import { ResultType } from "@/types/core.types";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { MessageStatusAckPayload } from "@/types/socket.types";
+import { note_delivered } from "@/services/sync/watermark.service";
+import { sync_v2_flags } from "@/services/app-settings.service";
+import { v2_on } from "@/services/sync/flags-core";
+import { ack_seq_fields } from "@/services/sync/frame-fields";
 
 // The chat_id / message_id / user_id columns are Postgres `uuid`. Passing an
 // empty string or any non-UUID text straight into a WHERE clause makes
@@ -270,11 +275,30 @@ const mark_message_delivered = async (
   // is_active_in_conv: boolean = false,
 ) => {
   try {
+    // Drain the recipient's pending-queue copy FIRST, before the lookup can
+    // 404: the ack proves receipt whether or not the message still exists.
+    // Since R0.1 poll reads no longer delete message:new, so an entry for a
+    // message deleted after it was delivered would otherwise linger until
+    // its 7-day expiry. Possible because entries use deterministic
+    // correlation keys (`{user}:message:new:{id}`); pre-deploy random-keyed
+    // entries miss harmlessly.
+    remove_pending_messages_batch(recipient_id, [
+      Snowflake.correlationId(recipient_id, "message:new", message_id),
+    ]).catch(err => console.error("[STATUS] pending drain failed:", err));
+
+    // SYNC_V2 §3.7 dual-write (shadow/on): delivered = seq(id), coalesced
+    // per worker per (user, chat) for ~1 s. Like the drain above it does not
+    // depend on the lookup below: a message deleted since still names a
+    // position the recipient has received up to.
+    note_delivered(recipient_id, conversation_id, [message_id]);
+
     const [message] = await db
       .select({
         id: message_model.id,
         sender_id: message_model.sender_id,
         chat_id: message_model.chat_id,
+        // §14.13 FCM health (same row, no extra round trip).
+        created_at: message_model.created_at,
       })
       .from(message_model)
       .where(
@@ -285,6 +309,13 @@ const mark_message_delivered = async (
         )
       )
       .limit(1);
+
+    // This endpoint is the FCM-path receipt (both app builds call it only
+    // from their FCM handlers): "fast" when it lands ≤ 2 min after the
+    // message reached the server. No-op unless net telemetry is on.
+    if (message && message.sender_id !== recipient_id) {
+      note_fcm_delivered_receipt(recipient_id, message.created_at);
+    }
 
     if (!message) {
       return {
@@ -329,6 +360,11 @@ const mark_message_delivered = async (
     // status-ack broadcast. Without this guard, broadcast_message would queue
     // a missed_ws_messages row with user_id = "" and Postgres rejects the
     // empty string as an invalid uuid.
+    //
+    // SYNC_V2 §3.7: kept in 'on' too. This ack names ONE id; the delivered
+    // window it advances (note_delivered → apply_receipts) may span rows the
+    // device never received, so the window effects add no delivered frame
+    // for legacy inputs (legacy_delivered) and this per-id relay stays.
     if (sender_id) {
       await broadcast_message({
         to: "users",
@@ -340,15 +376,6 @@ const mark_message_delivered = async (
         },
       });
     }
-
-    // Drain the recipient's pending-queue copy of this message. Possible now
-    // that entries use deterministic correlation keys
-    // (`{user}:message:new:{id}`) instead of random UUIDv7s — the old keys
-    // made this lookup impossible and forced poll/TTL-only cleanup.
-    // Pre-deploy random-keyed entries miss harmlessly.
-    remove_pending_messages_batch(recipient_id, [
-      Snowflake.correlationId(recipient_id, "message:new", message_id),
-    ]).catch(err => console.error("[STATUS] pending drain failed:", err));
 
     return {
       success: true,
@@ -392,12 +419,22 @@ const mark_messages_delivered_batch = async (
   };
 };
 
+// SYNC_V2 §4.1: items gain seq / srv_ts with sync_v2 'on' (the GC verify path
+// adopts a seq whose sent:ack was lost).
+type VerifiedItem = {
+  delivered_to: string[];
+  read_by: string[];
+  sent_at: Date | null;
+  seq?: number | null;
+  srv_ts?: string | null;
+};
+
 const verify_message_ids = async (
   message_ids: string[],
   conversation_id: string,
   sender_id: string
 ): Promise<ResultType<{
-  found: Record<string, { delivered_to: string[]; read_by: string[]; sent_at: Date | null; }>;
+  found: Record<string, VerifiedItem>;
   not_found: string[];
 }>> => {
   try {
@@ -431,7 +468,12 @@ const verify_message_ids = async (
     }
 
     const rows = await db
-      .select({ id: message_model.id, sent_at: message_model.sent_at })
+      .select({
+        id: message_model.id,
+        sent_at: message_model.sent_at,
+        seq: message_model.seq,
+        created_at: message_model.created_at,
+      })
       .from(message_model)
       .where(
         and(
@@ -448,9 +490,17 @@ const verify_message_ids = async (
     // sent_at = the canonical stored value (store_message may have rewritten
     // the client's claim — clock clamp, or server-arrival time for uploaded
     // media). A sender whose message:sent:ack was lost adopts it from here.
-    const found: Record<string, { delivered_to: string[]; read_by: string[]; sent_at: Date | null; }> = {};
+    const found: Record<string, VerifiedItem> = {};
+    const v2 = v2_on(sync_v2_flags());
     if (rows.length > 0) {
-      for (const r of rows) found[r.id] = { delivered_to: [], read_by: [], sent_at: r.sent_at };
+      for (const r of rows) {
+        found[r.id] = {
+          delivered_to: [],
+          read_by: [],
+          sent_at: r.sent_at,
+          ...(v2 ? ack_seq_fields(r) : {}),
+        };
+      }
 
       const statusRows = await db
         .select({

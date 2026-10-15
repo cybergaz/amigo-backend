@@ -1,12 +1,21 @@
 import admin from 'firebase-admin';
 import { EventEmitter } from 'events';
-import { isNotNull } from 'drizzle-orm';
+import { and, asc, gt, isNotNull } from 'drizzle-orm';
 import { ChatMessagePayload, WSMessage, } from '@/types/socket.types';
 import { ResultType } from '@/types/core.types';
 import { store_fcm_token, fetch_fcm_tokens, remove_fcm_token } from '@/cache-management/fcm-token.cache';
 import db from '@/config/db';
 import { user_model } from '@/models/user.model';
 import { count } from '@/utils/counters';
+import { redis_lease } from '@/cluster/lease';
+import { run_leased_waves, type WaveResult } from './fcm-broadcast-waves';
+import { count_message_new, note_fcm_sent } from './fcm-health';
+
+// D3: one broadcast-to-all at a time across every process (lease-core.ts).
+// The TTL only has to outlive one wave (≤ concurrency sends + delay); every
+// wave renews it.
+const FCM_BROADCAST_LEASE = 'fcm_broadcast';
+const FCM_BROADCAST_LEASE_TTL_MS = 120_000;
 
 // Initialize Firebase Admin SDK
 if (!admin.apps.length) {
@@ -36,6 +45,9 @@ interface FCMPayload {
   // muted-chat path. Implies fcm_mode='data-only' (chat-message FCMs already
   // are; this is only meaningful for them).
   silent?: boolean;
+  // Force android priority 'normal' for a data-only push (the ack fallback,
+  // services/fcm-ack-fallback.ts). Never applies to calls.
+  priority?: 'normal';
 }
 
 export class FCMService {
@@ -73,9 +85,9 @@ export class FCMService {
           // notify arrive late. Everything that notifies stays 'high', calls
           // included (their 30 s TTL is unchanged).
           const normal_priority =
-            payload.silent === true &&
             payload.fcm_mode === 'data-only' &&
-            payload.type !== 'call';
+            payload.type !== 'call' &&
+            (payload.silent === true || payload.priority === 'normal');
           if (normal_priority) count('FCM', 'priority_normal');
 
           try {
@@ -142,6 +154,9 @@ export class FCMService {
             };
 
             const msg_id = await admin.messaging().send(message);
+            // §14.13 FCM health: count the message:new this push carried
+            // (the denominator of fast/sent). No-op unless net telemetry is on.
+            if (payload.ws_messages) note_fcm_sent(user_id, count_message_new(payload.ws_messages));
             // console.log(`[FCM] ✅ Sent to user ${user_id}: ${msg_id}`);
             // console.log(`[FCM] with FCM token ${fcm_token}`);
             return true;
@@ -192,7 +207,10 @@ export class FCMService {
     data?: Record<string, string>;
     concurrency?: number;
     delay_ms?: number;
-  }): Promise<{ recipients: number; sent: number; failed: number; waves: number; }> {
+    // Resume key (default: a hash of the notification). An unfinished run with
+    // the same id is continued after its cursor instead of starting over.
+    run_id?: string;
+  }): Promise<WaveResult> {
     const concurrency = Math.min(Math.max(input.concurrency ?? 20, 1), 100);
     const delay_ms = input.delay_ms ?? 200;
 
@@ -204,27 +222,23 @@ export class FCMService {
       concurrency + 20,
     );
 
-    const rows = await db
-      .select({ id: user_model.id, fcm_token: user_model.fcm_token })
-      .from(user_model)
-      .where(isNotNull(user_model.fcm_token));
-
-    const recipients = rows.length;
-    if (recipients === 0) {
-      return { recipients: 0, sent: 0, failed: 0, waves: 0 };
-    }
-
-    let sent = 0;
-    let failed = 0;
-    let waves = 0;
-
-    for (let i = 0; i < rows.length; i += concurrency) {
-      const slice = rows.slice(i, i + concurrency);
-
-      const results = await Promise.allSettled(
-        slice.map(async (row) => {
+    // D3 (§13.7): one run at a time across processes, resumable after a
+    // kill, never re-pushing the users a crashed run already reached
+    // (fcm-broadcast-waves.ts). Same message, same waves, same pacing.
+    const run_id = input.run_id ?? `n${Bun.hash(JSON.stringify([input.title, input.body, input.data ?? {}])).toString(36)}`;
+    const result = await run_leased_waves(
+      {
+        acquire: () => redis_lease(FCM_BROADCAST_LEASE, FCM_BROADCAST_LEASE_TTL_MS),
+        fetch_page: (after, limit) =>
+          db
+            .select({ id: user_model.id, fcm_token: user_model.fcm_token })
+            .from(user_model)
+            .where(after ? and(isNotNull(user_model.fcm_token), gt(user_model.id, after)) : isNotNull(user_model.fcm_token))
+            .orderBy(asc(user_model.id))
+            .limit(limit) as Promise<{ id: string; fcm_token: string }[]>,
+        send: async (row) => {
           const message: admin.messaging.Message = {
-            token: row.fcm_token as string,
+            token: row.fcm_token,
             notification: { title: input.title, body: input.body },
             // Same recipient assertion as send_notification, so a token that has
             // since moved to another handset can be dropped app-side.
@@ -264,25 +278,17 @@ export class FCMService {
             }
             return false;
           }
-        }),
-      );
-
-      for (const r of results) {
-        if (r.status === 'fulfilled' && r.value === true) sent++;
-        else failed++;
-      }
-      waves += 1;
-
-      // Breathe between waves to keep load off FCM / our egress.
-      if (i + concurrency < rows.length && delay_ms > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delay_ms));
-      }
-    }
+        },
+      },
+      { run_id, concurrency, delay_ms },
+    );
 
     console.log(
-      `[FCM] broadcast complete: recipients=${recipients} sent=${sent} failed=${failed} waves=${waves}`,
+      `[FCM] broadcast ${result.skipped ? "skipped (busy)" : result.aborted ? `aborted (${result.aborted})` : "complete"}: ` +
+      `run=${run_id} recipients=${result.recipients} sent=${result.sent} failed=${result.failed} waves=${result.waves}` +
+      `${result.resumed ? " (resumed)" : ""}`,
     );
-    return { recipients, sent, failed, waves };
+    return result;
   }
 
   // Update user's FCM token (updates all 3 tiers)

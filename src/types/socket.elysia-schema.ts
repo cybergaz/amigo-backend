@@ -23,6 +23,9 @@ const ConvJoinPayloadSchema = t.Object({
   conv_id: t.String(),
   user_id: t.String(),
   last_read_msg_id: t.String(),
+  // SYNC_V2 §3.7 legacy table (optional, new clients): the exact read seq.
+  // Declared so schema normalisation can never strip it.
+  read_seq: t.Optional(t.Number()),
 });
 
 // ChatMessagePayload schema
@@ -39,6 +42,9 @@ const ChatMessagePayloadSchema = t.Object({
   // messages enabled. Inbound sends from clients omit this — the server
   // computes it from chats.disappearing_after_sec at insert time.
   expires_at: t.Optional(t.Union([FlexDate(), t.Null()])),
+  // SYNC_V2 §4.1 (optional, v2 senders): split-message diagnostics.
+  split_group: t.Optional(t.String()),
+  part_index: t.Optional(t.Number()),
   // sender_name: t.Optional(t.String()),
   // conv_type: t.Enum(Object.fromEntries(CHAT_TYPE_CONSTS.map(x => [x, x]))),
 });
@@ -159,6 +165,10 @@ const MessageForwardPayloadSchema = t.Object({
   forwarder_name: t.Optional(t.String()),
   forwarded_message_ids: t.Array(t.String()),
   target_conv_ids: t.Array(t.String()),
+  // SYNC_V2 §3.3.7 (optional, v2 clients): client-minted UUIDv7 ids per
+  // target chat, one per forwarded message in forwarded_message_ids order,
+  // so a replayed forward is idempotent.
+  ids: t.Optional(t.Record(t.String(), t.Array(t.String()))),
 });
 
 // ConversationActionPayload schema

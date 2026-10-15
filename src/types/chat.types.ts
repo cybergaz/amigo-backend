@@ -58,6 +58,10 @@ interface ForwardMessageRequest {
   message_ids: string[];
   source_conversation_id: string;
   target_conversation_ids: string[];
+  // SYNC_V2 §3.3.7 (optional; honoured with sync_v2 'on'): client-minted
+  // UUIDv7 ids per target chat, one per message_ids entry (same order). A
+  // replayed forward then inserts nothing and returns the original rows.
+  ids?: Record<string, string[]>;
 }
 
 interface DeleteMessageRequest {
