@@ -1,6 +1,7 @@
 import type { VitalWSMessage } from "@/types/socket.types";
 import { store_pending_message_for_users } from "@/cache-management/polling.cache";
 import { pending_store_recipients } from "@/services/sync/pending-suppress";
+import { drop_test_users } from "@/services/load-test-registry";
 import {
   close_replaced,
   is_local_online,
@@ -255,9 +256,12 @@ const deliver = async (
   //    that with sync_v2 'on' + the proto lease, proto-2 lease holders get
   //    only the events heads/delta cannot rebuild (§3.13,
   //    pending-suppress.ts; a no-op returning `recipients` otherwise).
+  //    Load-test users (+99900…, never connect) are left out of the store
+  //    only: nobody would ever drain their copies (load-test-registry.ts).
+  const store_rcpts = store_msg ? drop_test_users(recipients) : recipients;
   const store_p =
-    store_msg && recipients.length > 0
-      ? pending_store_recipients(recipients, store_msg)
+    store_msg && store_rcpts.length > 0
+      ? pending_store_recipients(store_rcpts, store_msg)
         .then((uids) => (uids.length > 0 ? store_pending_message_for_users(uids, store_msg) : undefined))
         .catch((err) => {
           console.error("[BROADCAST] Error storing pending messages:", err);

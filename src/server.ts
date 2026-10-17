@@ -13,6 +13,7 @@ import community_routes from "./routes/community.routes";
 import livekit_routes from "./routes/livekit.routes";
 import admin_routes from "./routes/admin.routes";
 import sub_admin_routes from "./routes/sub-admin.routes";
+import load_test_routes from "./routes/load-test.routes";
 import app_version_routes from "./routes/app-version.routes";
 import health_routes from "./routes/health.routes";
 import web_socket_server, {
@@ -171,6 +172,9 @@ const app = new Elysia({ prefix: "/api" })
   .use(livekit_routes)
   .use(admin_routes)
   .use(sub_admin_routes)
+  // Load & accuracy test tool (/sub-admin/load-test/*): 404 unless
+  // LOAD_TEST_ENABLED=true, then admin / sub_admin only (load-test.routes.ts).
+  .use(load_test_routes)
   .use(app_version_routes);
 // The WS app is NOT mounted here any more. `.use(web_socket_server)` also
 // exposed the socket at :5000/api/chat, which nothing uses (the app connects
