@@ -13,7 +13,9 @@
     "version:notify": "bun run scripts/notify-app-update.ts",
     "flush:migrate": "bun run scripts/flush-before-migration.ts",
     "backfill:lastmsg": "bun run scripts/backfill-last-msg.ts",
-    "db:admin:seed": "bun run scripts/seed-admin.ts"
+    "db:admin:seed": "bun run scripts/seed-admin.ts",
+    "dev:all-on": "bun run scripts/dev-flags.ts on",
+    "dev:all-off": "bun run scripts/dev-flags.ts off"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.891.0",

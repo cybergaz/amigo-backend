@@ -3,6 +3,7 @@ import { app_settings_model } from "@/models/app-settings.model";
 import { eq, sql as dsql } from "drizzle-orm";
 import {
   DEFAULT_SYNC_V2_FLAGS,
+  describe_live_features,
   dualwrite_active,
   parse_sync_v2_flags,
   type SyncV2Flags,
@@ -162,6 +163,13 @@ export const set_sync_v2_flag = async (key: string, value: unknown): Promise<voi
   await write_sync_v2_marker(key, value);
 };
 
+// [FEATURES] block: what this build is doing right now, in plain words.
+const features_signature = (f: SyncV2Flags): string =>
+  describe_live_features(f).join("\n");
+const log_live_features = (f: SyncV2Flags, when: string): void => {
+  console.log(`[FEATURES] what is live (${when}):\n${describe_live_features(f).map((l) => `[FEATURES]   ${l}`).join("\n")}`);
+};
+
 export const refresh_sync_v2_flags = async (): Promise<SyncV2Flags> => {
   if (sync_v2_inflight) return sync_v2_inflight;
   sync_v2_inflight = (async () => {
@@ -176,6 +184,11 @@ export const refresh_sync_v2_flags = async (): Promise<SyncV2Flags> => {
       if (prev.loaded && (prev.mode !== next.mode || prev.system_rows !== next.system_rows
         || prev.proto_lease !== next.proto_lease || prev.server_expiry !== next.server_expiry)) {
         console.log(`[SYNCV2] flags changed ${JSON.stringify({ mode: next.mode, system_rows: next.system_rows, proto_lease: next.proto_lease, server_expiry: next.server_expiry })}`);
+      }
+      // Any user-visible switch moved (incl. rollout and the extra features):
+      // say in plain words what is live now.
+      if (prev.loaded && features_signature(prev) !== features_signature(next)) {
+        log_live_features(next, "changed");
       }
       // The dual-write marker says "apply_receipts is live": 20261022
       // (watermarks) refuses to run before it, because a watermark computed
@@ -230,6 +243,7 @@ export const start_sync_v2_flags = async (meta: Record<string, unknown>): Promis
   await refresh_sync_v2_flags();
   const f = sync_v2_snapshot;
   console.log(`[SYNCV2] mode=${f.mode} system_rows=${f.system_rows} proto_lease=${f.proto_lease} server_expiry=${f.server_expiry} markers=${JSON.stringify(f.markers)}`);
+  log_live_features(f, "at boot");
   if (!sync_v2_timer) {
     sync_v2_timer = setInterval(() => void refresh_sync_v2_flags(), SYNC_V2_FLAGS_REFRESH_MS);
   }

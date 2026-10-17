@@ -209,3 +209,34 @@ export const PROTO_V2 = "2";
 /** What a WS connect's ?proto means for the proto:{uid} lease (§3.13). */
 export const lease_action_for_connect = (proto: string | null | undefined): "set" | "clear" =>
   (proto ?? "").trim() === PROTO_V2 ? "set" : "clear";
+
+// ── Plain-words feature summary (boot log + every flag change) ──────────────
+// What this build is actually doing right now, for a human reading the log:
+// "is the new sync live or am I testing the old path?". Pure, unit-tested.
+const on_off = (b: boolean): string => (b ? "ON " : "off");
+
+export const describe_live_features = (f: SyncV2Flags): string[] => {
+  const ready = derived_ready(f);
+  const sync =
+    f.mode === "off"
+      ? "OFF: every app uses the old sync"
+      : f.mode === "shadow"
+        ? "SHADOW: every app still uses the old sync; the new numbers are only computed in the background and compared ([UNREAD-SHADOW])"
+        : !ready
+          ? "ON but NOT READY (backfill / post-backfill indexes missing): apps stay on the old sync"
+          : f.rollout_pct === 0
+            ? "ON, rollout 0%: server unread/ticks come from the new numbers, but NO 5.0.1 app uses the new sync yet"
+            : `ON for ${f.rollout_pct}% of 5.0.1 apps: gap fill by message number, read = shown on screen, server unread/ticks${f.rollout_pct < 100 ? " (the rest stay on the old sync)" : ""}`;
+  const v2_only = (b: boolean) => (b && !v2_on(f) ? " (needs sync v2 ON to matter)" : "");
+  const row = (label: string, value: string) => `${label.padEnd(26)}${value}`;
+  return [
+    "Always live in this build: message-save fixes, safe polling (no lost messages), security fixes, connection handling, media download rules",
+    row("Sync v2:", sync),
+    row("Group event rows:", `${on_off(f.system_rows)}  sync_v2_system_rows`),
+    row("Fast poll channel:", `${on_off(f.proto_lease)}  sync_v2_proto_lease${v2_only(f.proto_lease)}`),
+    row("Extra push, frozen phones:", `${on_off(f.ack_fallback)}  sync_v2_ack_fallback`),
+    row("Network health reports:", `${on_off(net_beacon_active(f))}  sync_v2_net_telemetry${f.net_telemetry && !f.markers.net_beacons ? " (flag on, but ledger 20261023 not run)" : ""}`),
+    row("Resumable uploads:", `${on_off(chunked_upload_active(f))}  sync_v2_chunked_upload${f.chunked_upload && !f.markers.media_uploads ? " (flag on, but ledger 20261024 not run)" : ""}`),
+    row("Blurred previews:", `${on_off(f.inline_thumbs)}  sync_v2_inline_thumbs`),
+  ];
+};
