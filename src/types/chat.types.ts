@@ -9,7 +9,11 @@
 const CHAT_TYPE_CONSTS = ["dm", "group", "community_group", "broadcast"] as const;
 type ChatType = typeof CHAT_TYPE_CONSTS[number];
 
-const MESSAGE_TYPE_CONSTS = ["text", "image", "video", "audio", "document", "media", "reply", "forwarded", "system", "attachment", "reaction", "contact"] as const;
+// "sticker": an uploaded image (usually webp/png, transparent, maybe animated)
+// the app draws bubble-less. attachments look exactly like an image's
+// (category "images"), so a client that predates the type still shows it as
+// a photo.
+const MESSAGE_TYPE_CONSTS = ["text", "image", "video", "audio", "document", "media", "reply", "forwarded", "system", "attachment", "reaction", "contact", "sticker"] as const;
 type MessageType = typeof MESSAGE_TYPE_CONSTS[number];
 
 const MESSAGE_STATUS_CONSTS = ["sent", "delivered", "read"] as const;

@@ -139,7 +139,7 @@ describe("resolve_stored_sent_at", () => {
   });
 
   test("uploaded media always uses server arrival time", () => {
-    for (const t of ["image", "video", "audio", "document", "media", "attachment"]) {
+    for (const t of ["image", "video", "audio", "document", "media", "attachment", "sticker"]) {
       expect(resolve_stored_sent_at(t, "2026-10-08T11:00:00.000Z", now)).toBe(now);
     }
   });

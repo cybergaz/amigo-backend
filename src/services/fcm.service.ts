@@ -346,6 +346,8 @@ export class FCMService {
           return '📷 Photo';
         case 'video':
           return '🎥 Video';
+        case 'sticker':
+          return '💟 Sticker';
         case 'audio':
           return '🎵 Voice message';
         case 'attachment':

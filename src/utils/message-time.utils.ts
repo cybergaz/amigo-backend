@@ -15,6 +15,7 @@ const UPLOADED_MEDIA_TYPES: ReadonlySet<string> = new Set<MessageType>([
   "document",
   "media",
   "attachment",
+  "sticker",
 ]);
 
 /**
