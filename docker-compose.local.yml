@@ -1,0 +1,45 @@
+# Local throwaway Postgres + Redis for development/testing.
+# Driven by the justfile (`just up`, `just down`, `just db_initiate`, `just dev`).
+#
+# Ports are deliberately off the defaults (5432/6379 are often taken by a host
+# Postgres or another project's containers) and bound to 127.0.0.1 only.
+# Credentials are local-only dummies — never reuse them anywhere real.
+
+name: amigo-local
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: amigo
+      POSTGRES_PASSWORD: amigo
+      POSTGRES_DB: amigo_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U amigo -d amigo_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # noeviction matches the Redis Cloud databases the app runs against.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:56379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
+  redisdata:
