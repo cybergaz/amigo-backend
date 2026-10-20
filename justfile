@@ -1,15 +1,20 @@
-# Local dev stack: Postgres + Redis in Docker (docker-compose.local.yml).
+# Dev tasks, against either the local Docker stack or whatever .env points at.
 #
-# Every recipe here runs against the LOCAL containers. DB_URL / REDIS_URL are
-# exported below and win over .env (dotenv and Bun's .env loading never
-# override variables already in the environment), so .env keeps pointing at
-# the shared dev DB for everything you run outside `just`.
+#   just dev                 local Postgres + Redis containers (default)
+#   just target=env dev      DB_URL / REDIS_URL from .env (Neon, Redis Cloud, ...)
+#
+# target=local puts the container URLs in front of each command. dotenv and
+# Bun's .env loading never override variables already in the environment, so
+# they win over .env without touching it. target=env adds nothing, and .env
+# decides.
+
+target := "local"
 
 compose := "docker compose -f docker-compose.local.yml"
-
-export DB_URL := "postgres://amigo:amigo@127.0.0.1:55432/amigo_test"
-export REDIS_URL := "redis://127.0.0.1:56379"
-export APP_ENV := "dev"
+local_env := "DB_URL=postgres://amigo:amigo@127.0.0.1:55432/amigo_test REDIS_URL=redis://127.0.0.1:56379 APP_ENV=dev"
+run := if target == "local" { local_env } else if target == "env" { "" } else { error("target must be 'local' or 'env'") }
+# Start the containers first when they are the target; a no-op otherwise.
+ensure_up := if target == "local" { compose + " up -d --wait" } else { "true" }
 
 # list recipes
 default:
@@ -27,43 +32,45 @@ down:
 nuke:
     {{compose}} down -v
 
-# bun dev (watch mode) against the local containers
-dev: up
-    bun run dev
+# bun dev (watch mode)
+dev:
+    {{ensure_up}}
+    {{run}} bun run dev
 
-# create every table, then run all one-off ledger scripts (sync v2 triggers etc.)
-db_initiate: up
-    # Tables, enums and indexes straight from src/models. Safe here only because
-    # the DB is local and empty — never push a shared DB (see drizzle.config.ts).
-    bunx drizzle-kit push --force
-    # The sync v2 scripts wait for two markers a deployed server writes at boot
-    # (code_deployed, dualwrite). They guard against legacy code still running
-    # against live data; a fresh empty DB has neither, so write them up front.
-    {{compose}} exec -T postgres psql -U amigo -d amigo_test -v ON_ERROR_STOP=1 -q -c \
-      "INSERT INTO app_settings (key, value, updated_at) VALUES \
-         ('sync_v2_code_deployed', '{\"by\":\"just db_initiate\"}', now()), \
-         ('sync_v2_dualwrite',     '{\"by\":\"just db_initiate\"}', now()) \
-       ON CONFLICT (key) DO NOTHING"
+# build an EMPTY database: every table, then all one-off ledger scripts
+db_initiate:
+    {{ensure_up}}
+    # Refuses unless the target has no tables. push --force is only safe on an
+    # empty DB — never on a shared one (see drizzle.config.ts).
+    {{run}} bun run scripts/fresh-db.ts check
+    # Tables, enums and indexes straight from src/models.
+    {{run}} bunx drizzle-kit push --force
+    # Boot markers the sync v2 scripts wait for (see scripts/fresh-db.ts).
+    {{run}} bun run scripts/fresh-db.ts markers
     # Everything drizzle doesn't model (triggers, markers, backfills) lives in
     # the ledger scripts; on a fresh DB they all run, oldest first.
-    bun run scripts/migrate.ts up --yes
-    @echo "local DB ready: $DB_URL"
+    {{run}} bun run scripts/migrate.ts up --yes
 
-# wipe the local DB and build it again from scratch
-db_reset: nuke db_initiate
+# wipe the local containers' data and build the DB again from scratch
+db_reset: nuke
+    just target=local db_initiate
 
-# ledger status for the local DB
+# ledger status
 db_status:
-    bun run scripts/migrate.ts status
+    {{run}} bun run scripts/migrate.ts status
 
-# create the admin-panel super admin in the local DB (prompts for a password)
+# run pending ledger scripts (asks first if the target is not dev)
+db_migrate:
+    {{run}} bun run scripts/migrate.ts up
+
+# create the admin-panel super admin (prompts for a password)
 seed_admin *args:
-    bun run scripts/seed-admin.ts {{args}}
+    {{run}} bun run scripts/seed-admin.ts {{args}}
 
-# psql shell into the local DB
+# psql shell into the local container
 psql:
     {{compose}} exec postgres psql -U amigo -d amigo_test
 
-# redis-cli into the local Redis
+# redis-cli into the local container
 redis:
     {{compose}} exec redis redis-cli
